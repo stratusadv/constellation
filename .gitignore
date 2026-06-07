@@ -1,0 +1,26 @@
+# Rust build output
+/target
+
+# Generated graph indices (constellation indexing itself)
+.constellation/
+
+# SQLite databases and WAL/SHM sidecars
+*.db
+*.db-shm
+*.db-wal
+
+# Inno Setup installer output
+assets/Output/
+
+# Editors
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local environment / credentials
+.env
+.env.*

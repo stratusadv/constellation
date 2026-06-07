@@ -1,0 +1,24 @@
+[package]
+name = "constellation-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "constellation"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+constellation-graph = { path = "../graph" }
+constellation-index = { path = "../index" }
+constellation-mcp = { path = "../mcp" }
+constellation-store = { path = "../store" }
+dirs = "6.0.0"
+mimalloc = "0.1.52"
+serde_json = "1.0.150"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

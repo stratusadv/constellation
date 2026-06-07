@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/graph",
+    "crates/store",
+    "crates/extraction",
+    "crates/resolution",
+    "crates/linking",
+    "crates/index",
+    "crates/mcp",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# unwind, not abort: the MCP server catches a panicking handler or watcher
+# re-index and stays up, instead of one bad file or query taking down serve.
+panic = "unwind"
+strip = "symbols"

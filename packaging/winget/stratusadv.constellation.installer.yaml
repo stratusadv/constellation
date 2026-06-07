@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+
+PackageIdentifier: stratusadv.constellation
+PackageVersion: 0.1.0
+InstallerLocale: en-US
+InstallerType: inno
+Scope: user
+UpgradeBehavior: install
+ProductCode: '{B7E4B0A2-9C3D-4F1E-A6D8-2F5C1E9A4D3B}_is1'
+AppsAndFeaturesEntries:
+- DisplayName: constellation
+  Publisher: Stratus Advanced Technologies
+  ProductCode: '{B7E4B0A2-9C3D-4F1E-A6D8-2F5C1E9A4D3B}_is1'
+InstallationMetadata:
+  DefaultInstallLocation: '%LocalAppData%\Programs\constellation'
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/stratusadv/constellation/releases/download/v0.1.0/constellation-setup-0.1.0.exe
+  InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+ManifestType: installer
+ManifestVersion: 1.12.0

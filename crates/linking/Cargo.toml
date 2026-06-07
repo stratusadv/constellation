@@ -1,0 +1,10 @@
+[package]
+name = "constellation-linking"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+constellation-graph = { path = "../graph" }
+
+[lints]
+workspace = true

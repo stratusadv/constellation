@@ -1,0 +1,17 @@
+[package]
+name = "constellation-resolution"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+constellation-graph = { path = "../graph" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+divan = "0.1.21"
+
+[[bench]]
+name = "resolve"
+harness = false
