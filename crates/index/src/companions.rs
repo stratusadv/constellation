@@ -14,17 +14,31 @@
 //!
 //! Discovery is on by default and additive: a repository with no virtual
 //! environment, or none of these packages installed, registers nothing and indexes
-//! exactly as before. A `.constellation/config.toml` may disable it or override the
-//! package list:
+//! exactly as before. A `.constellation/config.toml` may disable it, override the
+//! package list, and name extra versions to index side by side for comparison:
 //!
 //! ```toml
 //! [companions]
 //! enabled = true
 //! packages = ["django-spire", "django-glue", "robit"]
 //! # venv = ".venv"
+//!
+//! # Each "package@ref" indexes that git ref of an installed companion as its own
+//! # project (id "django-spire@refactor/next"), rooted exactly like the `.venv`
+//! # copy so only the version suffix differs. The repository is found from the
+//! # install itself (an editable checkout, or the git url pip recorded), so nothing
+//! # else is specified. Reference-only: clients still link to the installed copy.
+//! versions = ["django-spire@refactor/next", "django-glue@v1.2.0"]
 //! ```
+//!
+//! A local working copy takes precedence over the `.venv`: if the portal's
+//! `pyproject.toml` pins a package to a path under `[tool.uv.sources]`, or a
+//! `development.env`/`.env` sets `PYTHONPATH_APPEND` to a directory holding it,
+//! that directory is indexed (and is the repository version refs are taken from)
+//! in place of the installed copy, because it is what actually runs.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 use constellation_store::Store;
 use rustc_hash::FxHashSet;
@@ -43,12 +57,26 @@ const COMPANION_COUNT_MAX: u32 = 64;
 /// The fail-fast bound on directory entries scanned while locating a package.
 const SCAN_ENTRIES_MAX: u32 = 1_000_000;
 
+/// The fail-fast bound on a sanitized directory segment's length: one path
+/// component on Windows and most filesystems.
+const SEGMENT_LEN_MAX: u32 = 255;
+
+/// The fail-fast bound on ancestor directories walked while locating a git root.
+const GIT_ROOT_DEPTH_MAX: u32 = 6;
+
+/// The fail-fast bound on override candidate directories considered per package.
+const OVERRIDE_PATHS_MAX: u32 = 4_096;
+
 /// A companion located on disk: the project id to register it as, and the
 /// package directory to index as that project's root.
 #[derive(Clone, Debug)]
 pub struct CompanionTarget {
     pub project_id: String,
     pub package_root: PathBuf,
+    /// Whether this target indexes as a reference-only project, excluded from
+    /// cross-project link targets. False for a `.venv` companion (the canonical
+    /// version), true for a version copy taken at another ref.
+    pub reference_only: bool,
 }
 
 /// The `[companions]` section of `.constellation/config.toml`.
@@ -58,6 +86,7 @@ struct CompanionsConfig {
     enabled: bool,
     packages: Vec<String>,
     venv: Option<String>,
+    versions: Vec<String>,
 }
 
 impl Default for CompanionsConfig {
@@ -66,6 +95,7 @@ impl Default for CompanionsConfig {
             enabled: true,
             packages: COMPANIONS_DEFAULT.iter().map(|name| name.to_string()).collect(),
             venv: None,
+            versions: Vec::new(),
         }
     }
 }
@@ -77,10 +107,11 @@ struct ConfigFile {
     companions: CompanionsConfig,
 }
 
-/// The companion packages installed under `portal_root`'s virtual
-/// environment that are not already indexed, returning a target for each. Empty
-/// when discovery is disabled, no virtual environment is found, or every companion
-/// is already a project.
+/// The companion packages a portal uses, located for indexing and returned as a
+/// target each. A local override (a pyproject `[tool.uv.sources]` path, or a
+/// `PYTHONPATH_APPEND` directory) is preferred over the `.venv` copy, because it
+/// is what actually runs. Empty when discovery is disabled, nothing resolves, or
+/// every companion is already a project.
 ///
 /// Discovery only: the caller indexes each target as its own project (so it can
 /// draw progress), then runs [`crate::link_constellation`] so the portal's pending
@@ -98,11 +129,6 @@ pub fn discover_companions(
     }
 
     let roots = site_packages_roots(portal_root, &config);
-
-    if roots.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let existing = existing_project_ids(store)?;
 
     let mut targets: Vec<CompanionTarget> = Vec::with_capacity(config.packages.len());
@@ -117,13 +143,17 @@ pub fn discover_companions(
             continue;
         }
 
-        let package = id.replace('-', "_");
+        // A local override (pyproject `[tool.uv.sources]` or a `PYTHONPATH_APPEND`)
+        // is what actually runs, so it is indexed in preference to the `.venv` copy.
+        let package_root = resolve_override(portal_root, id)
+            .map(|dir| package_subdir(&dir, id))
+            .or_else(|| resolve_package(&roots, &id.replace('-', "_")));
 
-        let Some(package_root) = resolve_package(&roots, &package) else {
+        let Some(package_root) = package_root else {
             continue;
         };
 
-        targets.push(CompanionTarget { project_id: id.clone(), package_root });
+        targets.push(CompanionTarget { project_id: id.clone(), package_root, reference_only: false });
     }
 
     Ok(targets)
@@ -288,4 +318,799 @@ fn resolve_editable(site_packages: &Path, package: &str) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// A local source directory that overrides the `.venv` copy of `package`, from
+/// the portal's `pyproject.toml` `[tool.uv.sources]` or a `PYTHONPATH_APPEND` in
+/// `development.env`/`.env`. The returned directory actually holds the package
+/// (`<import>/__init__.py`, or is the package itself), so a stale entry that no
+/// longer contains it does not shadow the install. `None` falls back to the
+/// virtual environment.
+fn resolve_override(portal_root: &Path, package: &str) -> Option<PathBuf> {
+    let import = package.replace('-', "_");
+    let mut count: u32 = 0;
+
+    for candidate in override_candidates(portal_root, package) {
+        count += 1;
+
+        assert!(count <= OVERRIDE_PATHS_MAX, "override candidate scan exceeded {OVERRIDE_PATHS_MAX}");
+
+        let resolved = if candidate.is_absolute() {
+            candidate
+        } else {
+            portal_root.join(candidate)
+        };
+
+        if contains_package(&resolved, &import) {
+            return Some(resolved);
+        }
+    }
+
+    None
+}
+
+/// The candidate override directories for `package`, most specific first: a
+/// `[tool.uv.sources]` path, then every `PYTHONPATH_APPEND`/`PYTHONPATH` entry.
+fn override_candidates(portal_root: &Path, package: &str) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(path) = uv_source_path(portal_root, package) {
+        candidates.push(path);
+    }
+
+    candidates.extend(pythonpath_dirs(portal_root));
+
+    candidates
+}
+
+/// The local path a portal's `pyproject.toml` pins `package` to under
+/// `[tool.uv.sources]` (`{ path = "..." }`), or `None` when the file, the section,
+/// the package, or a `path` key is absent. A git or workspace source has no local
+/// directory here and yields `None`, leaving the `.venv` copy in force.
+fn uv_source_path(portal_root: &Path, package: &str) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(portal_root.join("pyproject.toml")).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+
+    let sources = value.get("tool")?.get("uv")?.get("sources")?;
+    let underscore = package.replace('-', "_");
+    let entry = sources.get(package).or_else(|| sources.get(underscore.as_str()))?;
+
+    let path = match entry {
+        toml::Value::String(path) => path.clone(),
+        toml::Value::Table(table) => table.get("path")?.as_str()?.to_string(),
+        _ => return None,
+    };
+
+    Some(PathBuf::from(path))
+}
+
+/// Every directory named by a `PYTHONPATH_APPEND` or `PYTHONPATH` in the portal's
+/// `development.env` or `.env`, split on the platform path separator.
+fn pythonpath_dirs(portal_root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    for file in ["development.env", ".env"] {
+        let Ok(text) = std::fs::read_to_string(portal_root.join(file)) else {
+            continue;
+        };
+
+        for key in ["PYTHONPATH_APPEND", "PYTHONPATH"] {
+            if let Some(value) = env_value(&text, key) {
+                dirs.extend(std::env::split_paths(&value));
+            }
+        }
+    }
+
+    dirs
+}
+
+/// The value of `key` in a `KEY=VALUE` env file, trimmed of an optional `export`
+/// prefix and surrounding quotes, or `None` when the key is absent or empty.
+fn env_value(text: &str, key: &str) -> Option<String> {
+    let mut scanned: u32 = 0;
+
+    for line in text.lines() {
+        scanned += 1;
+
+        assert!(scanned <= SCAN_ENTRIES_MAX, "env scan exceeded {SCAN_ENTRIES_MAX}");
+
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        if name.trim() != key {
+            continue;
+        }
+
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+
+    None
+}
+
+/// Whether `dir` holds `import` at one of the layouts pip installs: the directory
+/// itself is the package, or it contains `<import>/` or `src/<import>/` with an
+/// `__init__.py`.
+fn contains_package(dir: &Path, import: &str) -> bool {
+    dir.join("__init__.py").is_file()
+        || dir.join(import).join("__init__.py").is_file()
+        || dir.join("src").join(import).join("__init__.py").is_file()
+}
+
+/// A git repository to take a version from: a local clone on disk (the common
+/// editable-install case, checked out cheaply via a worktree) or a remote URL to
+/// clone.
+#[derive(Clone, Debug)]
+enum RepoSource {
+    Local(PathBuf),
+    Remote(String),
+}
+
+/// The `direct_url.json` (PEP 610) a non-index install records in its dist-info,
+/// naming where the package came from.
+#[derive(Debug, Deserialize)]
+struct DirectUrl {
+    url: String,
+    #[serde(default)]
+    vcs_info: Option<VcsInfo>,
+}
+
+/// The VCS section of a `direct_url.json`, present only for a VCS install.
+#[derive(Debug, Deserialize)]
+struct VcsInfo {
+    vcs: String,
+}
+
+/// The extra versions configured under `[companions] versions = [...]`, each a
+/// `"package@ref"` spec, materialized to on-disk checkouts and returned as
+/// reference-only targets. The git ref is checked out of the repository the
+/// installed companion came from (an editable clone, or the url pip recorded in
+/// `direct_url.json`), rooted exactly like the `.venv` copy so only the project id
+/// differs by the `@ref` suffix.
+///
+/// Best-effort like [`discover_companions`]: a malformed spec, an unlocatable
+/// repository, a missing `git`, or a failed checkout is skipped with a message,
+/// never fatal. A spec already in the store, or repeated in the config, is skipped
+/// so a re-index neither duplicates nor re-checks-out. The caller indexes each
+/// target, marks it reference-only, then runs [`crate::link_constellation`].
+pub fn discover_versions(
+    store: &Store,
+    portal_root: &Path,
+) -> Result<Vec<CompanionTarget>, IndexError> {
+    assert!(portal_root.is_dir(), "portal root must be a directory: {portal_root:?}");
+
+    let config = load_config(portal_root);
+
+    if !config.enabled || config.versions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let roots = site_packages_roots(portal_root, &config);
+    let existing = existing_project_ids(store)?;
+
+    let mut targets: Vec<CompanionTarget> = Vec::with_capacity(config.versions.len());
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut count: u32 = 0;
+
+    for spec in &config.versions {
+        count += 1;
+
+        assert!(count <= COMPANION_COUNT_MAX, "version list exceeded {COMPANION_COUNT_MAX}");
+
+        if existing.contains(spec) || !seen.insert(spec.clone()) {
+            continue;
+        }
+
+        let Some((package, reference)) = split_version(spec) else {
+            eprintln!("constellation: skipping version '{spec}': expected the form package@ref");
+
+            continue;
+        };
+
+        let Some(repo) = locate_repo(portal_root, &roots, package) else {
+            eprintln!(
+                "constellation: skipping '{spec}': no git repository found for '{package}' in the \
+                 virtual environment (install it editable or from git to compare other refs)",
+            );
+
+            continue;
+        };
+
+        if let Some(package_root) = materialize_version(portal_root, spec, reference, &repo) {
+            targets.push(CompanionTarget {
+                project_id: spec.clone(),
+                package_root,
+                reference_only: true,
+            });
+        }
+    }
+
+    Ok(targets)
+}
+
+/// A `"package@ref"` spec split into its package name and git ref, or `None` when
+/// either side is empty or the spec carries the `::` id separator. The split is on
+/// the first `@`, so a ref may itself contain `/` (`v1/base`) or a later `@`.
+fn split_version(spec: &str) -> Option<(&str, &str)> {
+    let (package, reference) = spec.split_once('@')?;
+
+    if package.is_empty() || reference.is_empty() || spec.contains("::") {
+        return None;
+    }
+
+    Some((package, reference))
+}
+
+/// The git repository the `package` came from. A local override (a pyproject
+/// `[tool.uv.sources]` path, or a `PYTHONPATH_APPEND` directory) wins first, so
+/// other refs are taken from the working copy. Otherwise the installed copy's
+/// checkout on disk (editable or local-path install), else the git url recorded in
+/// `direct_url.json` for a VCS install. `None` for a plain index (wheel) install,
+/// which carries no repository to take another ref from.
+fn locate_repo(portal_root: &Path, roots: &[PathBuf], package: &str) -> Option<RepoSource> {
+    if let Some(dir) = resolve_override(portal_root, package)
+        && let Some(repo) = git_repo_root(&dir)
+    {
+        return Some(RepoSource::Local(repo));
+    }
+
+    let import = package.replace('-', "_");
+
+    let package_dir = resolve_package(roots, &import)?;
+    let in_site_packages = roots.iter().any(|root| package_dir.starts_with(root));
+
+    if in_site_packages {
+        repo_from_direct_url(roots, &import)
+    } else {
+        git_repo_root(&package_dir).map(RepoSource::Local)
+    }
+}
+
+/// The repository named by the package's `direct_url.json`: a `Remote` for a git
+/// VCS install, or a `Local` when the url is a `file://` path that is a git
+/// checkout. `None` when the file is absent (a plain index install) or names no
+/// usable repository.
+fn repo_from_direct_url(roots: &[PathBuf], import: &str) -> Option<RepoSource> {
+    let dist_info = find_dist_info(roots, import)?;
+
+    let text = std::fs::read_to_string(dist_info.join("direct_url.json")).ok()?;
+    let parsed: DirectUrl = serde_json::from_str(&text).ok()?;
+
+    if parsed.vcs_info.as_ref().is_some_and(|info| info.vcs == "git") {
+        let url = parsed.url.strip_prefix("git+").unwrap_or(&parsed.url);
+
+        return Some(RepoSource::Remote(url.to_string()));
+    }
+
+    let path = file_url_to_path(&parsed.url)?;
+
+    git_repo_root(&path).map(RepoSource::Local)
+}
+
+/// The `*.dist-info` directory for `import` among the site-packages roots, matched
+/// by the `<import>-` prefix, case-insensitively.
+fn find_dist_info(roots: &[PathBuf], import: &str) -> Option<PathBuf> {
+    let prefix = format!("{}-", import.to_ascii_lowercase());
+    let mut scanned: u32 = 0;
+
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+
+        for entry in entries {
+            scanned += 1;
+
+            assert!(scanned <= SCAN_ENTRIES_MAX, "dist-info scan exceeded {SCAN_ENTRIES_MAX}");
+
+            let Ok(entry) = entry else {
+                continue;
+            };
+
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_ascii_lowercase();
+
+            if name.ends_with(".dist-info") && name.starts_with(&prefix) {
+                return Some(entry.path());
+            }
+        }
+    }
+
+    None
+}
+
+/// The filesystem path of a `file://` url, or `None` for any other scheme. Strips
+/// the leading slash before a Windows drive (`file:///C:/x` -> `C:/x`) and decodes
+/// `%20` to a space; other percent escapes are left as-is (best-effort).
+fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+
+    let trimmed = match rest.strip_prefix('/') {
+        Some(tail) if is_windows_drive(tail) => tail,
+        _ => rest,
+    };
+
+    Some(PathBuf::from(trimmed.replace("%20", " ")))
+}
+
+/// Whether `text` begins with a Windows drive prefix such as `C:`.
+fn is_windows_drive(text: &str) -> bool {
+    let bytes = text.as_bytes();
+
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// The enclosing git repository of `start`: the nearest ancestor (including
+/// `start`) holding a `.git` entry, searched up to a bounded depth. `None` when
+/// none is found, so a package with no checkout on disk is skipped.
+fn git_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    let mut steps: u32 = 0;
+
+    while let Some(dir) = current {
+        steps += 1;
+
+        assert!(steps <= GIT_ROOT_DEPTH_MAX, "git root walk exceeded {GIT_ROOT_DEPTH_MAX} levels");
+
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+
+        if steps == GIT_ROOT_DEPTH_MAX {
+            break;
+        }
+
+        current = dir.parent();
+    }
+
+    None
+}
+
+/// The on-disk package directory for a version spec, checked out at `reference`
+/// under `<portal_root>/.constellation/sources/<sanitized-spec>/` with the `git`
+/// CLI. `None` when git is unavailable or the checkout fails, so the version is
+/// skipped rather than failing the index.
+fn materialize_version(
+    portal_root: &Path,
+    spec: &str,
+    reference: &str,
+    repo: &RepoSource,
+) -> Option<PathBuf> {
+    if !git_available() {
+        eprintln!("constellation: skipping '{spec}': git is not available");
+
+        return None;
+    }
+
+    let sources = portal_root.join(".constellation").join("sources");
+
+    std::fs::create_dir_all(&sources).ok()?;
+
+    let dest = sources.join(sanitize_segment(spec));
+
+    let checked_out = match repo {
+        RepoSource::Local(root) => checkout_local(root, &dest, reference),
+        RepoSource::Remote(url) => checkout_remote(url, &dest, reference),
+    };
+
+    if !checked_out {
+        eprintln!("constellation: skipping '{spec}': git checkout of '{reference}' failed");
+
+        return None;
+    }
+
+    Some(package_subdir(&dest, spec))
+}
+
+/// Whether `reference` is checked out at `dest` from the local repository `repo`.
+/// A fresh `dest` gets a detached worktree (cheap, sharing the object store and
+/// never touching the source working tree); an existing one is re-pointed at the
+/// ref. A ref that lives only on the clone's origin (a branch not checked out
+/// locally, the common case for `package@ref`) is fetched from origin first, then
+/// checked out, so comparing against an unfetched remote branch still works.
+fn checkout_local(repo: &Path, dest: &Path, reference: &str) -> bool {
+    if is_populated(dest) {
+        if run_git(Some(dest), &["checkout", "--force", "--detach", reference]).is_some() {
+            return true;
+        }
+
+        if run_git(Some(repo), &["fetch", "origin", reference]).is_none() {
+            return false;
+        }
+
+        return run_git(Some(dest), &["checkout", "--force", "--detach", "FETCH_HEAD"]).is_some();
+    }
+
+    let dest_arg = dest.to_string_lossy();
+
+    let direct = run_git(
+        Some(repo),
+        &["worktree", "add", "--force", "--detach", dest_arg.as_ref(), reference],
+    );
+
+    if direct.is_some() {
+        return true;
+    }
+
+    if run_git(Some(repo), &["fetch", "origin", reference]).is_none() {
+        return false;
+    }
+
+    run_git(
+        Some(repo),
+        &["worktree", "add", "--force", "--detach", dest_arg.as_ref(), "FETCH_HEAD"],
+    )
+    .is_some()
+}
+
+/// Whether `reference` is checked out at `dest` from the remote `url`. A fresh
+/// `dest` is shallow-cloned at the branch or tag, falling back to a full clone and
+/// detached checkout for a commit; an existing one is fetched and re-pointed.
+fn checkout_remote(url: &str, dest: &Path, reference: &str) -> bool {
+    if is_populated(dest) {
+        if run_git(Some(dest), &["fetch", "--depth", "1", "origin", reference]).is_none() {
+            return true;
+        }
+
+        return run_git(Some(dest), &["checkout", "--force", "--detach", "FETCH_HEAD"]).is_some();
+    }
+
+    let dest_arg = dest.to_string_lossy();
+
+    let shallow = run_git(
+        None,
+        &["clone", "--depth", "1", "--branch", reference, url, dest_arg.as_ref()],
+    );
+
+    if shallow.is_some() {
+        return true;
+    }
+
+    if run_git(None, &["clone", url, dest_arg.as_ref()]).is_none() {
+        return false;
+    }
+
+    run_git(Some(dest), &["checkout", "--force", "--detach", reference]).is_some()
+}
+
+/// Whether a usable `git` is on the PATH.
+fn git_available() -> bool {
+    run_git(None, &["--version"]).is_some()
+}
+
+/// The output of a `git` invocation, or `None` when git fails to spawn or exits
+/// non-zero. `current_dir` runs git inside that directory.
+fn run_git(current_dir: Option<&Path>, args: &[&str]) -> Option<Output> {
+    assert!(!args.is_empty(), "a git invocation needs at least one argument");
+
+    let mut command = Command::new("git");
+
+    if let Some(dir) = current_dir {
+        command.current_dir(dir);
+    }
+
+    let output = command.args(args).output().ok()?;
+
+    output.status.success().then_some(output)
+}
+
+/// Whether `dest` exists and holds at least one entry.
+fn is_populated(dest: &Path) -> bool {
+    std::fs::read_dir(dest).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// The directory holding the package's `__init__.py` within `dir`: the import
+/// package name (the spec's text before any `@`, hyphens to underscores) probed at
+/// `dir`, then `dir/<package>`, then `dir/src/<package>`. Falls back to `dir`
+/// itself, so a layout this does not recognize still indexes.
+fn package_subdir(dir: &Path, spec: &str) -> PathBuf {
+    assert!(!spec.is_empty(), "version spec must not be empty");
+
+    let bare = spec.split('@').next().unwrap_or(spec);
+    let package = bare.replace('-', "_");
+
+    assert!(!package.is_empty(), "package name must not be empty");
+
+    if dir.join("__init__.py").is_file() {
+        return dir.to_path_buf();
+    }
+
+    for candidate in [dir.join(&package), dir.join("src").join(&package)] {
+        if candidate.join("__init__.py").is_file() {
+            return candidate;
+        }
+    }
+
+    dir.to_path_buf()
+}
+
+/// A version spec reduced to one safe path segment: every character that is not
+/// ASCII alphanumeric, `-`, `_`, or `.` becomes `_`, so `django-spire@refactor/next`
+/// becomes `django-spire_refactor_next`. The project id keeps the raw spec; only
+/// the directory is sanitized.
+fn sanitize_segment(spec: &str) -> String {
+    assert!(!spec.is_empty(), "version spec must not be empty");
+
+    let mut out = String::with_capacity(spec.len());
+    let mut count: u32 = 0;
+
+    for character in spec.chars() {
+        count += 1;
+
+        assert!(count <= SEGMENT_LEN_MAX, "version spec exceeded {SEGMENT_LEN_MAX} chars");
+
+        let safe = character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.');
+
+        out.push(if safe { character } else { '_' });
+    }
+
+    assert!(!out.is_empty(), "a sanitized segment is never empty");
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_version_parses_package_and_ref() {
+        assert_eq!(split_version("django-spire@refactor/next"), Some(("django-spire", "refactor/next")));
+        assert_eq!(split_version("django-glue@v1.2.0"), Some(("django-glue", "v1.2.0")));
+        assert_eq!(split_version("pkg@a@b"), Some(("pkg", "a@b")), "splits on the first @ only");
+    }
+
+    #[test]
+    fn split_version_rejects_malformed_specs() {
+        assert_eq!(split_version("no-at-sign"), None, "a spec needs an @ref");
+        assert_eq!(split_version("@ref"), None, "an empty package is rejected");
+        assert_eq!(split_version("pkg@"), None, "an empty ref is rejected");
+        assert_eq!(split_version("a::b@ref"), None, "the id separator is rejected");
+    }
+
+    #[test]
+    fn sanitize_segment_replaces_unsafe_characters() {
+        assert_eq!(sanitize_segment("django-spire@refactor/next"), "django-spire_refactor_next");
+        assert_eq!(sanitize_segment("a/b:c"), "a_b_c", "path and drive separators become _");
+        assert_eq!(sanitize_segment("keep.dot-1"), "keep.dot-1", "dot, hyphen, and digits are kept");
+    }
+
+    #[test]
+    fn package_subdir_finds_the_package_init() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+
+        std::fs::create_dir(root.join("django_spire")).unwrap();
+        std::fs::write(root.join("django_spire").join("__init__.py"), "").unwrap();
+
+        let found = package_subdir(root, "django-spire@refactor/next");
+
+        assert!(found.ends_with("django_spire"), "the package subdir is located, got {found:?}");
+    }
+
+    #[test]
+    fn package_subdir_falls_back_to_the_directory() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let found = package_subdir(directory.path(), "mystery@v1");
+
+        assert_eq!(found, directory.path(), "an unrecognized layout indexes the directory as-is");
+    }
+
+    #[test]
+    fn file_url_to_path_handles_windows_and_posix() {
+        assert_eq!(file_url_to_path("file:///C:/code/spire"), Some(PathBuf::from("C:/code/spire")));
+        assert_eq!(file_url_to_path("file:///home/u/spire"), Some(PathBuf::from("/home/u/spire")));
+        assert_eq!(file_url_to_path("file:///a%20b/spire"), Some(PathBuf::from("/a b/spire")), "%20 decodes");
+        assert_eq!(file_url_to_path("https://example.com/x"), None, "a non-file url is rejected");
+    }
+
+    #[test]
+    fn git_repo_root_finds_the_enclosing_dot_git() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("src").join("pkg")).unwrap();
+
+        let found = git_repo_root(&root.join("src").join("pkg")).expect("walks up to the repo root");
+
+        assert_eq!(found, root, "the nearest ancestor with .git is the repo root");
+    }
+
+    #[test]
+    fn repo_from_direct_url_reads_a_git_vcs_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let roots = vec![directory.path().to_path_buf()];
+
+        let dist = directory.path().join("django_spire-1.0.dist-info");
+        std::fs::create_dir(&dist).unwrap();
+        std::fs::write(
+            dist.join("direct_url.json"),
+            "{\"url\": \"git+https://example.com/org/django-spire\", \"vcs_info\": {\"vcs\": \"git\"}}",
+        )
+        .unwrap();
+
+        match repo_from_direct_url(&roots, "django_spire") {
+            Some(RepoSource::Remote(url)) => {
+                assert_eq!(url, "https://example.com/org/django-spire", "the git+ prefix is stripped");
+            }
+            other => panic!("expected a remote repo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn locate_repo_finds_an_editable_clone() {
+        let clone = tempfile::tempdir().unwrap();
+        let clone_root = clone.path();
+
+        std::fs::create_dir(clone_root.join(".git")).unwrap();
+        std::fs::create_dir(clone_root.join("django_spire")).unwrap();
+        std::fs::write(clone_root.join("django_spire").join("__init__.py"), "").unwrap();
+
+        let site = tempfile::tempdir().unwrap();
+        std::fs::write(
+            site.path().join("__editable__.django_spire-1.0.pth"),
+            clone_root.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+
+        let roots = vec![site.path().to_path_buf()];
+
+        // A portal with no override, so resolution falls through to the .venv copy.
+        let portal = tempfile::tempdir().unwrap();
+
+        match locate_repo(portal.path(), &roots, "django-spire") {
+            Some(RepoSource::Local(root)) => assert_eq!(root, clone_root, "the editable clone is the repo root"),
+            other => panic!("expected the local editable clone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialize_version_checks_out_a_local_tag() {
+        if !git_available() {
+            return;
+        }
+
+        let origin = tempfile::tempdir().unwrap();
+        let origin_root = origin.path();
+
+        assert!(run_git(Some(origin_root), &["init", "-q"]).is_some(), "git init");
+        assert!(run_git(Some(origin_root), &["config", "user.email", "t@t.test"]).is_some(), "git email");
+        assert!(run_git(Some(origin_root), &["config", "user.name", "test"]).is_some(), "git name");
+
+        std::fs::create_dir(origin_root.join("django_spire")).unwrap();
+        std::fs::write(origin_root.join("django_spire").join("__init__.py"), "value = 1\n").unwrap();
+
+        assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add");
+        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "init"]).is_some(), "git commit");
+        assert!(run_git(Some(origin_root), &["tag", "v1"]).is_some(), "git tag");
+
+        let portal = tempfile::tempdir().unwrap();
+        std::fs::create_dir(portal.path().join(".constellation")).unwrap();
+
+        let repo = RepoSource::Local(origin_root.to_path_buf());
+
+        let package = materialize_version(portal.path(), "django-spire@v1", "v1", &repo)
+            .expect("a worktree is materialized from the local repo");
+
+        assert!(package.ends_with("django_spire"), "resolves to the package dir, got {package:?}");
+        assert!(package.join("__init__.py").is_file(), "the checked-out package init is present");
+    }
+
+    #[test]
+    fn env_value_reads_a_key_ignoring_quotes_and_export() {
+        let text = "# comment\nexport PYTHONPATH_APPEND=\"C:/code/django-spire\"\nOTHER=1\n";
+
+        assert_eq!(env_value(text, "PYTHONPATH_APPEND").as_deref(), Some("C:/code/django-spire"));
+        assert_eq!(env_value(text, "MISSING"), None, "an absent key yields nothing");
+    }
+
+    #[test]
+    fn uv_source_path_reads_a_local_path_dependency() {
+        let portal = tempfile::tempdir().unwrap();
+        std::fs::write(
+            portal.path().join("pyproject.toml"),
+            "[tool.uv.sources]\ndjango-spire = { path = \"../django-spire\", editable = true }\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            uv_source_path(portal.path(), "django-spire"),
+            Some(PathBuf::from("../django-spire")),
+            "the uv.sources path is read",
+        );
+
+        assert_eq!(uv_source_path(portal.path(), "absent-pkg"), None, "an unlisted package has none");
+    }
+
+    #[test]
+    fn resolve_override_prefers_a_pythonpath_append_directory() {
+        let portal = tempfile::tempdir().unwrap();
+
+        let clone = tempfile::tempdir().unwrap();
+        std::fs::create_dir(clone.path().join("django_spire")).unwrap();
+        std::fs::write(clone.path().join("django_spire").join("__init__.py"), "").unwrap();
+
+        std::fs::write(
+            portal.path().join("development.env"),
+            format!("PYTHONPATH_APPEND={}\n", clone.path().to_string_lossy()),
+        )
+        .unwrap();
+
+        let resolved = resolve_override(portal.path(), "django-spire").expect("the override resolves");
+
+        assert_eq!(resolved, clone.path(), "the PYTHONPATH_APPEND directory holding the package wins");
+    }
+
+    #[test]
+    fn resolve_override_ignores_a_directory_without_the_package() {
+        let portal = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+
+        std::fs::write(
+            portal.path().join("development.env"),
+            format!("PYTHONPATH_APPEND={}\n", empty.path().to_string_lossy()),
+        )
+        .unwrap();
+
+        assert!(
+            resolve_override(portal.path(), "django-spire").is_none(),
+            "a stale entry that no longer holds the package does not override",
+        );
+    }
+
+    #[test]
+    fn checkout_local_fetches_a_branch_only_on_origin() {
+        if !git_available() {
+            return;
+        }
+
+        let origin = tempfile::tempdir().unwrap();
+        let origin_root = origin.path();
+
+        assert!(run_git(Some(origin_root), &["init", "-q"]).is_some(), "git init");
+        assert!(run_git(Some(origin_root), &["config", "user.email", "t@t.test"]).is_some(), "git email");
+        assert!(run_git(Some(origin_root), &["config", "user.name", "test"]).is_some(), "git name");
+
+        std::fs::write(origin_root.join("seed.txt"), "seed\n").unwrap();
+        assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add seed");
+        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "seed"]).is_some(), "git commit seed");
+
+        // A slash-named branch with its own commit, then back to the default
+        // branch so a clone leaves v1/base only on origin.
+        assert!(run_git(Some(origin_root), &["checkout", "-q", "-b", "v1/base"]).is_some(), "branch v1/base");
+        std::fs::write(origin_root.join("base.txt"), "base\n").unwrap();
+        assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add base");
+        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "base"]).is_some(), "git commit base");
+        assert!(run_git(Some(origin_root), &["checkout", "-q", "-"]).is_some(), "back to the default branch");
+
+        let workspace = tempfile::tempdir().unwrap();
+        let clone_root = workspace.path().join("repo");
+
+        let origin_arg = origin_root.to_string_lossy();
+        let clone_arg = clone_root.to_string_lossy();
+
+        assert!(
+            run_git(None, &["clone", "-q", origin_arg.as_ref(), clone_arg.as_ref()]).is_some(),
+            "git clone",
+        );
+
+        // The clone has no local v1/base, only origin/v1/base.
+        let dest = workspace.path().join("worktree");
+
+        assert!(
+            checkout_local(&clone_root, &dest, "v1/base"),
+            "a remote-only branch is fetched from origin and checked out",
+        );
+
+        assert!(dest.join("base.txt").is_file(), "the worktree holds the branch content, got {dest:?}");
+    }
 }

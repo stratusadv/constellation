@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 /// registration covers every project.
 pub fn install() -> Result<()> {
     install_claude_code();
-    install_opencode()?;
+    install_opencode();
 
     println!("Then, in each project: `constellation init`");
 
@@ -22,7 +22,7 @@ pub fn install() -> Result<()> {
 /// the agent registrations are undone.
 pub fn uninstall() -> Result<()> {
     uninstall_claude_code();
-    uninstall_opencode()?;
+    uninstall_opencode();
 
     println!("Project indexes are kept; delete each `.constellation/` to remove them");
 
@@ -101,9 +101,27 @@ fn claude_command(arguments: &[&str]) -> Command {
     command
 }
 
-/// The merge of a `constellation` entry into OpenCode's global config, preserving any
-/// existing settings.
-fn install_opencode() -> Result<()> {
+/// The OpenCode registration, best-effort: a config that cannot be parsed (for
+/// example one with comments, which this strict reader will not rewrite without
+/// losing them) or written falls back to printed manual instructions, so a failure
+/// here never aborts the rest of `install`.
+fn install_opencode() {
+    match register_opencode() {
+        Ok(path) => println!("OpenCode: registered constellation in {}", path.display()),
+        Err(error) => {
+            eprintln!("OpenCode: could not update the config automatically: {error}");
+
+            print_opencode_manual();
+        }
+    }
+}
+
+/// The merge of a `constellation` entry into OpenCode's global config, preserving
+/// existing settings. OpenCode deep-merges its global files (`config.json`,
+/// `opencode.json`, `opencode.jsonc`) with project config, so this single
+/// `opencode.json` entry registers constellation for every project. Returns the
+/// config path on success.
+fn register_opencode() -> Result<PathBuf> {
     let path = opencode_config_path()?;
     let mut config = read_config(&path)?;
 
@@ -131,53 +149,84 @@ fn install_opencode() -> Result<()> {
 
     write_config(&path, &config)?;
 
-    println!("OpenCode: registered constellation in {}", path.display());
-
-    Ok(())
+    Ok(path)
 }
 
-/// The removal of the `constellation` entry from OpenCode's global config, preserving
-/// any other settings. A missing config file or entry is treated as already
-/// removed.
-fn uninstall_opencode() -> Result<()> {
+/// The manual `mcp` entry to merge into OpenCode's config, printed when automatic
+/// registration cannot proceed.
+fn print_opencode_manual() {
+    let executable = server_command();
+
+    println!("OpenCode: add this under \"mcp\" in your opencode.json:");
+    println!(
+        "  \"constellation\": {{ \"type\": \"local\", \"command\": [{executable:?}, \"serve\"], \"enabled\": true }}",
+    );
+}
+
+/// The OpenCode removal, best-effort and the inverse of [`install_opencode`].
+fn uninstall_opencode() {
+    match deregister_opencode() {
+        Ok(Some(path)) => println!("OpenCode: removed constellation from {}", path.display()),
+        Ok(None) => println!("OpenCode: constellation was not registered; nothing to remove"),
+        Err(error) => {
+            eprintln!("OpenCode: could not update the config automatically: {error}");
+
+            println!("OpenCode: remove the \"constellation\" entry under \"mcp\" by hand");
+        }
+    }
+}
+
+/// The removal of the `constellation` entry from OpenCode's global config,
+/// preserving other settings. Returns the config path when an entry was removed,
+/// `None` when there was nothing to remove (no config file, or no entry).
+fn deregister_opencode() -> Result<Option<PathBuf>> {
     let path = opencode_config_path()?;
 
     if !path.exists() {
-        println!("OpenCode: no config at {}; nothing to remove", path.display());
-
-        return Ok(());
+        return Ok(None);
     }
 
     let mut config = read_config(&path)?;
 
-    let root = config
+    let removed = config
         .as_object_mut()
-        .context("opencode config root is not a JSON object")?;
-
-    let removed = root
-        .get_mut("mcp")
+        .and_then(|root| root.get_mut("mcp"))
         .and_then(|servers| servers.as_object_mut())
         .is_some_and(|servers| servers.remove("constellation").is_some());
 
     if !removed {
-        println!(
-            "OpenCode: constellation not registered in {}; nothing to remove",
-            path.display(),
-        );
-
-        return Ok(());
+        return Ok(None);
     }
 
     write_config(&path, &config)?;
 
-    println!("OpenCode: removed constellation from {}", path.display());
-
-    Ok(())
+    Ok(Some(path))
 }
 
+/// OpenCode's global `opencode.json`. constellation writes to `opencode.json`
+/// specifically: it is strict JSON that round-trips without losing comments (unlike
+/// `opencode.jsonc`), and OpenCode merges it with its other global files anyway.
 fn opencode_config_path() -> Result<PathBuf> {
+    Ok(opencode_config_dir()?.join("opencode.json"))
+}
+
+/// OpenCode's global config directory, matching its `xdg-basedir` resolution:
+/// `$XDG_CONFIG_HOME/opencode` when that variable is set, else
+/// `<home>/.config/opencode` (the fallback on every OS, Windows included).
+fn opencode_config_dir() -> Result<PathBuf> {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok().filter(|value| !value.is_empty());
     let home = dirs::home_dir().context("could not determine the home directory")?;
-    Ok(home.join(".config").join("opencode").join("opencode.json"))
+
+    Ok(resolve_opencode_dir(xdg.as_deref(), &home))
+}
+
+/// The OpenCode config directory from an `XDG_CONFIG_HOME` value and the home
+/// directory, separated from the environment so it can be tested directly.
+fn resolve_opencode_dir(xdg_config_home: Option<&str>, home: &Path) -> PathBuf {
+    match xdg_config_home {
+        Some(xdg) => PathBuf::from(xdg).join("opencode"),
+        None => home.join(".config").join("opencode"),
+    }
 }
 
 /// The JSON config read from a file, returning an empty object when it does not exist.
@@ -206,9 +255,30 @@ fn write_config(path: &Path, config: &Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_command, opencode_config_path, read_config, server_command, write_config};
+    use super::{
+        claude_command, opencode_config_path, read_config, resolve_opencode_dir, server_command,
+        write_config,
+    };
+
+    use std::path::Path;
 
     use serde_json::json;
+
+    #[test]
+    fn resolve_opencode_dir_prefers_xdg_then_falls_back_to_home() {
+        let home = Path::new("/home/dev");
+
+        assert_eq!(
+            resolve_opencode_dir(Some("/custom/cfg"), home),
+            Path::new("/custom/cfg").join("opencode"),
+            "XDG_CONFIG_HOME wins when set, matching OpenCode's xdg-basedir resolution",
+        );
+        assert_eq!(
+            resolve_opencode_dir(None, home),
+            home.join(".config").join("opencode"),
+            "the home .config directory is the fallback on every OS",
+        );
+    }
 
     #[test]
     fn claude_command_forwards_its_arguments() {

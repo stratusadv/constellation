@@ -248,10 +248,10 @@ fn search_nodes_any_matches_when_not_all_terms_do() {
 }
 
 #[test]
-fn open_in_memory_reaches_a_migrated_schema() {
+fn open_in_memory_applies_the_schema() {
     let store = Store::open_in_memory().unwrap();
 
-    assert!(store.schema_version().unwrap() >= 1, "init applies migrations to at least version one");
+    assert!(store.schema_version().unwrap() != 0, "init stamps the schema fingerprint");
 }
 
 #[test]
@@ -415,6 +415,43 @@ fn an_on_disk_store_keeps_its_schema_and_data_across_a_reopen() {
 
     let store = Store::open(&path).unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), version, "reopening applies no further migration");
+    assert_eq!(store.schema_version().unwrap(), version, "reopening keeps the same schema fingerprint");
     assert_eq!(store.count_nodes(&project).unwrap(), 1, "the persisted node survives a reopen");
+}
+
+#[test]
+fn reference_only_round_trips_and_lists() {
+    let store = Store::open_in_memory().unwrap();
+    let canonical = ProjectId::new("django-spire");
+    let version = ProjectId::new("django-spire@next");
+
+    store.upsert_project(&canonical, "django-spire", "/tmp/spire").unwrap();
+    store.upsert_project(&version, "django-spire@next", "/tmp/spire-next").unwrap();
+
+    assert!(
+        store.reference_only_project_ids().unwrap().is_empty(),
+        "a fresh project defaults to not reference-only",
+    );
+
+    store.set_reference_only(&version, true).unwrap();
+
+    let ids = store.reference_only_project_ids().unwrap();
+
+    assert_eq!(ids, vec!["django-spire@next".to_string()], "only the flagged project is listed");
+
+    let flagged = store
+        .all_projects()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id.as_str() == "django-spire@next")
+        .expect("the version project row");
+
+    assert!(flagged.reference_only, "all_projects reports the reference-only flag");
+
+    store.set_reference_only(&version, false).unwrap();
+
+    assert!(
+        store.reference_only_project_ids().unwrap().is_empty(),
+        "clearing the flag removes it from the list",
+    );
 }

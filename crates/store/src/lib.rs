@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
 //! constellation-store: the SQLite persistence layer for the unified graph.
-//! Holds the schema, the migration runner, and the [`Store`] handle with its
-//! batched, idempotent per-file write path.
+//! Holds the schema and the [`Store`] handle with its batched, idempotent
+//! per-file write path. The schema is rebuilt from scratch when it changes
+//! (detected by a fingerprint), rather than migrated in place.
 
 mod error;
-mod migrations;
 mod store;
 mod time;
 

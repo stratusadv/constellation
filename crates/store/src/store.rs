@@ -9,7 +9,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 use rustc_hash::FxHashMap;
 
 use crate::error::StoreError;
-use crate::migrations;
 use crate::time::now_ms;
 
 /// The fail-fast bound on the rows written for a single file in one call.
@@ -17,6 +16,62 @@ const ROWS_PER_FILE_MAX: u32 = 5_000_000;
 
 /// The fail-fast bound on the rows materialized by a single read.
 const ROWS_LOADED_MAX: u32 = 50_000_000;
+
+/// The full schema and single source of truth; a change here changes the
+/// fingerprint, which rebuilds any database built under the old schema.
+const SCHEMA: &str = include_str!("schema.sql");
+
+/// A compile-time fingerprint of [`SCHEMA`] (FNV-1a, reduced to a positive 31-bit
+/// value for SQLite's `PRAGMA user_version`). It records the schema a database was
+/// built under; a mismatch on open means the schema changed, so the database is
+/// discarded and rebuilt from scratch rather than migrated. constellation
+/// re-indexes quickly, so the cost of a schema change is a re-index, not a
+/// hand-written migration.
+const SCHEMA_FINGERPRINT: i32 = schema_fingerprint();
+
+/// The FNV-1a hash of the schema, evaluated at compile time.
+const fn schema_fingerprint() -> i32 {
+    let bytes = SCHEMA.as_bytes();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += 1;
+    }
+
+    (hash & 0x7fff_ffff) as i32
+}
+
+/// Whether an existing database at `path` was built under a different schema than
+/// this binary's, and so must be discarded and rebuilt. A missing database is not
+/// stale: the next open creates it fresh.
+fn schema_is_stale(path: &Path) -> Result<bool, StoreError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let connection = Connection::open(path)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+
+    Ok(version != i64::from(SCHEMA_FINGERPRINT))
+}
+
+/// The stale database file and its WAL sidecars removed, so the next open rebuilds
+/// from the current schema. Best-effort: a failed delete leaves the next open to
+/// fail clearly rather than silently use an incompatible file.
+fn discard_database(path: &Path) {
+    let _ = std::fs::remove_file(path);
+
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+
+        sidecar.push(suffix);
+
+        let _ = std::fs::remove_file(sidecar);
+    }
+}
 
 /// The cap on how many rows a `LIMIT`-bounded read pre-allocates for, so a caller
 /// passing an enormous limit cannot reserve a huge Vec for a tiny result set.
@@ -85,13 +140,16 @@ fn node_columns(alias: &str) -> String {
     out
 }
 
-/// A project row: its id, display name, filesystem root, and the epoch-ms
-/// timestamp of its last index.
+/// A project row: its id, display name, filesystem root, the epoch-ms timestamp
+/// of its last index, and whether it is reference-only.
 pub struct ProjectRow {
     pub id: ProjectId,
     pub name: String,
     pub root_path: String,
     pub indexed_at: i64,
+    /// Whether this project is withheld from cross-project link targets: a
+    /// reference-only version copy, queryable but never linked into.
+    pub reference_only: bool,
 }
 
 /// A file row for the `files` listing: its path, language, symbol (node) count,
@@ -132,18 +190,23 @@ pub struct Store {
 }
 
 impl Store {
-    /// The store at `path`, created if absent, with any pending
-    /// migrations before returning.
+    /// The store at `path`, created if absent. A database built under a different
+    /// schema is discarded and rebuilt (see [`SCHEMA_FINGERPRINT`]); the pragmas
+    /// and the schema are then applied before returning.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         assert!(!path.as_os_str().is_empty(), "store path must not be empty");
+
+        if schema_is_stale(path)? {
+            discard_database(path);
+        }
 
         let connection = Connection::open(path)?;
 
         Self::init(connection)
     }
 
-    /// An ephemeral in-memory database, fully migrated. Intended for
-    /// tests and smoke checks.
+    /// An ephemeral in-memory database, fully initialized. Intended for tests and
+    /// smoke checks.
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
 
@@ -156,16 +219,21 @@ impl Store {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
 
-        let version = migrations::apply(&connection)?;
-
-        assert!(version >= 1, "store must reach schema version >= 1 after init");
+        connection.execute_batch(SCHEMA)?;
+        connection.pragma_update(None, "user_version", SCHEMA_FINGERPRINT)?;
 
         Ok(Self { connection })
     }
 
-    /// The schema version currently applied to this database.
+    /// The schema fingerprint stamped into this database, identifying the schema it
+    /// was built under.
     pub fn schema_version(&self) -> Result<u32, StoreError> {
-        migrations::current_version(&self.connection)
+        let version: i64 =
+            self.connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+
+        assert!(version >= 0, "user_version is non-negative");
+
+        Ok(u32::try_from(version).unwrap_or(0))
     }
 
     /// A project row, recorded or refreshed. Must run before any of the project's
@@ -221,6 +289,41 @@ impl Store {
         )?;
 
         Ok(())
+    }
+
+    /// A project marked reference-only (or not): its symbols are withheld from
+    /// cross-project link targets while it stays fully queryable. Set after a
+    /// version copy is indexed, from its config `reference` flag.
+    pub fn set_reference_only(&self, project: &ProjectId, reference_only: bool) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE projects SET reference_only = ?2 WHERE id = ?1",
+            params![project.as_str(), i64::from(reference_only)],
+        )?;
+
+        Ok(())
+    }
+
+    /// The ids of every reference-only project, the set the constellation linker
+    /// excludes from cross-project link targets.
+    pub fn reference_only_project_ids(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM projects WHERE reference_only != 0")?;
+
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+
+        let mut ids: Vec<String> = Vec::new();
+        let mut count: u32 = 0;
+
+        for row in rows {
+            count += 1;
+
+            assert!(count <= ROWS_LOADED_MAX, "reference-only load exceeded {ROWS_LOADED_MAX}");
+
+            ids.push(row?);
+        }
+
+        Ok(ids)
     }
 
     /// The atomic persist of one file's extracted graph: clear the file's prior
@@ -293,6 +396,11 @@ impl Store {
         count(&self.connection, "SELECT COUNT(*) FROM nodes WHERE project_id = ?1", project)
     }
 
+    /// The number of files recorded for a project.
+    pub fn count_files(&self, project: &ProjectId) -> Result<u32, StoreError> {
+        count(&self.connection, "SELECT COUNT(*) FROM files WHERE project_id = ?1", project)
+    }
+
     /// The number of references still awaiting resolution for a project.
     pub fn count_unresolved(&self, project: &ProjectId) -> Result<u32, StoreError> {
         count(
@@ -316,7 +424,7 @@ impl Store {
     pub fn all_projects(&self) -> Result<Vec<ProjectRow>, StoreError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, name, root_path, indexed_at FROM projects")?;
+            .prepare("SELECT id, name, root_path, indexed_at, reference_only FROM projects")?;
 
         let rows = statement.query_map([], |row| {
             Ok((
@@ -324,6 +432,7 @@ impl Store {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
 
@@ -335,7 +444,7 @@ impl Store {
 
             assert!(count <= ROWS_LOADED_MAX, "project load exceeded {ROWS_LOADED_MAX}");
 
-            let (id, name, root_path, indexed_at) = row?;
+            let (id, name, root_path, indexed_at, reference_only) = row?;
 
             if id.is_empty() || id.contains("::") {
                 continue;
@@ -346,6 +455,7 @@ impl Store {
                 name,
                 root_path,
                 indexed_at,
+                reference_only: reference_only != 0,
             });
         }
 
@@ -1945,4 +2055,44 @@ fn fts_prefix_query(query: &str) -> String {
 /// for multi-word, natural-language queries an AND match would miss entirely.
 fn fts_any_query(query: &str) -> String {
     fts_query(query, " OR ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_database_under_a_different_schema_is_rebuilt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("index.db");
+        let project = ProjectId::new("blog");
+
+        {
+            let store = Store::open(&path).unwrap();
+
+            store.upsert_project(&project, "blog", "/tmp/blog").unwrap();
+
+            assert_eq!(store.all_projects().unwrap().len(), 1, "the project is seeded");
+        }
+
+        // Stamp a foreign fingerprint into the file header, as a database built by
+        // a different schema would carry.
+        {
+            let connection = Connection::open(&path).unwrap();
+
+            connection.pragma_update(None, "user_version", 1_i32).unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+
+        assert!(
+            store.all_projects().unwrap().is_empty(),
+            "a database under a different schema is discarded and rebuilt empty",
+        );
+        assert_eq!(
+            store.schema_version().unwrap(),
+            u32::try_from(SCHEMA_FINGERPRINT).unwrap(),
+            "the rebuilt database carries the current fingerprint",
+        );
+    }
 }

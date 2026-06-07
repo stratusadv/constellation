@@ -1,4 +1,4 @@
--- Constellation SQLite schema, version 1.
+-- Constellation SQLite schema.
 --
 -- One database holds every project's graph plus the cross-project edges that
 -- connect them. project_id partitions the per-project graphs; an edge whose
@@ -13,7 +13,11 @@ CREATE TABLE IF NOT EXISTS projects (
     -- with the running binary forces a full re-extraction (the per-file
     -- content-hash skip is bypassed), so an extractor change lands without
     -- deleting the database. Empty until the first successful index.
-    index_version TEXT NOT NULL DEFAULT ''
+    index_version TEXT NOT NULL DEFAULT '',
+    -- A reference-only project is a full, queryable project whose nodes are
+    -- excluded from cross-project link targets, so two indexed versions of one
+    -- library never compete to win an ambiguous import. 0 = canonical.
+    reference_only INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS files (

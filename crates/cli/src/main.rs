@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! constellation CLI: index, watch, link, and serve the cross-project knowledge graph.
+//! constellation CLI: index, sync, link, and serve the cross-project knowledge graph.
 
 mod bootstrap;
 mod progress;
@@ -10,30 +10,31 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use constellation_graph::ProjectId;
 use constellation_index::{
-    discover_companions, index_project_reporting, link_constellation, watch_project,
+    discover_companions, discover_versions, index_project_reporting, link_constellation,
+    refresh_constellation,
 };
 use constellation_store::Store;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const NAME: &str = env!("CARGO_PKG_NAME");
+const NAME: &str = "constellation";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A fail-fast bound on directory levels walked while discovering the database.
 const DISCOVER_DEPTH_MAX: u32 = 4_096;
 
-/// The dispatch of a subcommand (`init`, `watch`, `link`, `serve`, `install`,
-/// `uninstall`). A bare path argument indexes that repository; with no
-/// argument, run an in-memory smoke check.
+/// The dispatch of a subcommand (`init`, `sync`, `link`, `serve`, `install`,
+/// `uninstall`). A bare path argument indexes that repository; with no argument,
+/// run an in-memory smoke check.
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
 
     match arguments.split_first() {
         Some((command, rest)) if command == "init" => init_command(rest),
+        Some((command, rest)) if command == "sync" => sync_command(rest),
         Some((command, rest)) if command == "link" => link_command(rest),
         Some((command, rest)) if command == "serve" => serve_command(rest),
-        Some((command, rest)) if command == "watch" => watch_command(rest),
         Some((command, _)) if command == "install" => bootstrap::install(),
         Some((command, _)) if command == "uninstall" => bootstrap::uninstall(),
         Some((root, _)) => index_command(root),
@@ -42,7 +43,8 @@ fn main() -> Result<()> {
 }
 
 /// The `constellation init [path]` command creates `<path>/.constellation/index.db`
-/// (defaulting to the current directory) and indexes the project.
+/// (defaulting to the current directory), scaffolds a starter config, indexes the
+/// project and its companions, and links them.
 fn init_command(rest: &[String]) -> Result<()> {
     let root_owned = match rest.iter().find(|argument| !argument.starts_with('-')) {
         Some(path) => PathBuf::from(path),
@@ -61,79 +63,60 @@ fn init_command(rest: &[String]) -> Result<()> {
     let root = canonical.as_path();
 
     let database = create_index_directory(root)?;
+    scaffold_config(root);
+
     let store = Store::open(&database)?;
 
     let name = project_name(root);
     let project = ProjectId::new(name.as_str());
-    let mut progress = progress::Progress::new("indexing");
 
-    let stats = index_project_reporting(&store, &project, &name, root, |phase| {
-        progress.on_phase(phase);
-    })?;
-
-    progress.finish();
-
-    println!(
-        "{NAME} {VERSION} initialized and indexed {}: {} files, {} nodes",
-        root.display(),
-        stats.files_indexed,
-        stats.nodes,
-    );
-
-    let companions = index_companions(&store, root)?;
-
-    if companions > 0 {
-        let linked = link_constellation(&store)?;
-
-        println!("linked {linked} cross-project edge(s) to {companions} companion package(s)");
-    }
-
-    Ok(())
+    index_and_report(&store, &project, &name, root)
 }
 
-/// The `constellation watch <repo>` command indexes the repository, then re-indexes it
-/// incrementally whenever its files change, until interrupted.
-fn watch_command(rest: &[String]) -> Result<()> {
-    let Some(root_argument) = rest.first() else {
-        bail!("usage: constellation watch <repo>");
+/// The `constellation sync [database]` command re-indexes every project in the
+/// constellation from disk (incrementally, skipping unchanged files), re-links it,
+/// and prints the summary. A one-shot catch-up: a running `serve` already does this
+/// in the background on every change, so `sync` is for refreshing the graph when no
+/// server is attached. The database is discovered as for `serve`.
+fn sync_command(rest: &[String]) -> Result<()> {
+    let database = match rest.first() {
+        Some(path) => PathBuf::from(path),
+        None => discover_database()?,
     };
 
-    let root = Path::new(root_argument);
-
-    if !root.is_dir() {
-        bail!("not a directory: {root_argument}");
+    if !database.is_file() {
+        bail!(
+            "no constellation database at {}; run `constellation init` first",
+            database.display(),
+        );
     }
 
-    let canonical = resolve_root(root)?;
-    let root = canonical.as_path();
-
-    let name = project_name(root);
-    let project = ProjectId::new(name.as_str());
-
-    let database = create_index_directory(root)?;
     let store = Store::open(&database)?;
 
-    println!("{NAME} {VERSION}: watching {} (Ctrl-C to stop)", root.display());
+    refresh_constellation(&store)?;
 
-    watch_project(&store, &project, &name, root, |stats| {
-        println!(
-            "  reindexed: {} changed, {} unchanged, {} removed; {} nodes, {} resolved",
-            stats.files_indexed,
-            stats.files_unchanged,
-            stats.files_removed,
-            stats.nodes,
-            stats.resolved_edges,
-        );
-    })?;
+    // Pick up companions or versions newly added to the config since the last
+    // index, then bind them. The portal root is the directory that holds the
+    // discovered `.constellation/`.
+    if let Some(portal_root) = database.parent().and_then(Path::parent)
+        && portal_root.is_dir()
+    {
+        index_companions(&store, portal_root)?;
+    }
 
-    Ok(())
+    if store.all_projects()?.len() > 1 {
+        link_constellation(&store)?;
+    }
+
+    print_store_summary(&store, &database)
 }
 
-/// The `constellation serve [database]` command serves the constellation graph to an agent
-/// over MCP (stdio). With no argument it discovers the database from the
-/// `CONSTELLATION_DB` environment variable, or by walking up from the working
-/// directory for a `.constellation/index.db`, so one registration serves
-/// every project.
+/// The `constellation serve [database]` command serves the constellation graph to an
+/// agent over MCP (stdio) and, in the background, watches every indexed project and
+/// re-indexes and re-links on each change, so the graph stays current mid-session.
+/// With no argument it discovers the database from the `CONSTELLATION_DB`
+/// environment variable, or by walking up from the working directory for a
+/// `.constellation/index.db`, so one registration serves every project.
 fn serve_command(rest: &[String]) -> Result<()> {
     let database = match rest.first() {
         Some(path) => PathBuf::from(path),
@@ -192,6 +175,36 @@ fn create_index_directory(root: &Path) -> Result<PathBuf> {
     Ok(index_directory.join("index.db"))
 }
 
+/// A commented starter `.constellation/config.toml`, written only when none
+/// exists, so a developer discovers where to enable companion packages and add
+/// extra version sources. Best-effort: a write failure is reported, never fatal,
+/// and an existing config is never clobbered.
+fn scaffold_config(root: &Path) {
+    let path = root.join(".constellation").join("config.toml");
+
+    if path.exists() {
+        return;
+    }
+
+    let starter = "\
+# Constellation configuration.
+[companions]
+enabled = true
+# packages = [\"django-spire\", \"django-glue\", \"robit\"]
+# venv = \".venv\"
+
+# Index other git refs of an installed companion to compare side by side while
+# refactoring. Each \"package@ref\" becomes its own project (django-spire@refactor/next),
+# rooted like the .venv copy; the repository is found from the install itself.
+# Clients still link to the installed version.
+# versions = [\"django-spire@refactor/next\"]
+";
+
+    if let Err(error) = std::fs::write(&path, starter) {
+        eprintln!("constellation: could not write starter config: {error}");
+    }
+}
+
 /// A project name from a repository root directory. Resolves `.`, `..`, and a
 /// trailing-slash root (whose `file_name()` is empty) to the real directory
 /// name by canonicalizing, so `constellation .` names the project after the
@@ -230,40 +243,161 @@ fn resolve_root(root: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(cleaned))
 }
 
-/// The companion libraries discovered under `root`'s virtual environment,
-/// indexing each new one as its own project, drawing a progress bar per companion.
-/// Returns the number of companions indexed this call.
-fn index_companions(store: &Store, root: &Path) -> Result<usize> {
-    let targets = discover_companions(store, root)?;
+/// The portal indexed, its companions and versions discovered and indexed, the
+/// constellation linked, and the compact summary printed. Shared by `init` and the
+/// bare-path index so both produce the same output.
+fn index_and_report(store: &Store, project: &ProjectId, name: &str, root: &Path) -> Result<()> {
+    let mut progress = progress::Progress::new("indexing");
+
+    index_project_reporting(store, project, name, root, |phase| {
+        progress.on_phase(phase);
+    })?;
+
+    progress.finish();
+
+    let companions = index_companions(store, root)?;
+
+    // Relink whenever more than the portal is present, so a re-index of changed
+    // portal code rebinds to the existing companions, not only when a new one
+    // was just added.
+    if store.all_projects()?.len() > 1 {
+        link_constellation(store)?;
+    }
+
+    let mut rows = vec![SummaryRow {
+        label: name.to_string(),
+        files: store.count_files(project)?,
+        nodes: store.count_nodes(project)?,
+        source: "",
+    }];
+
+    rows.extend(companions);
+
+    print_constellation_summary(&rows, store.count_links()?);
+
+    Ok(())
+}
+
+/// The companions and version copies discovered under `portal_root`, each indexed
+/// as its own project (drawing a progress bar) and returned as a summary row. A
+/// version copy is marked reference-only in the store after indexing.
+fn index_companions(store: &Store, portal_root: &Path) -> Result<Vec<SummaryRow>> {
+    let mut targets = discover_companions(store, portal_root)?;
+    targets.extend(discover_versions(store, portal_root)?);
+
+    let mut rows: Vec<SummaryRow> = Vec::with_capacity(targets.len());
 
     for target in &targets {
         let project = ProjectId::new(target.project_id.as_str());
         let mut progress = progress::Progress::new(&format!("indexing {}", target.project_id));
 
-        let stats = index_project_reporting(
-            store,
-            &project,
-            &target.project_id,
-            &target.package_root,
-            |phase| progress.on_phase(phase),
-        )?;
+        index_project_reporting(store, &project, &target.project_id, &target.package_root, |phase| {
+            progress.on_phase(phase);
+        })?;
 
         progress.finish();
 
-        println!(
-            "  + companion {}: {} files, {} nodes from {}",
-            target.project_id,
-            stats.files_indexed,
-            stats.nodes,
-            target.package_root.display(),
-        );
+        if target.reference_only {
+            store.set_reference_only(&project, true)?;
+        }
+
+        rows.push(SummaryRow {
+            label: target.project_id.clone(),
+            files: store.count_files(&project)?,
+            nodes: store.count_nodes(&project)?,
+            source: project_source(&target.package_root, portal_root, target.reference_only),
+        });
     }
 
-    Ok(targets.len())
+    Ok(rows)
 }
 
-/// The `constellation link <database> <repo> [repo ...]` command indexes every repository
-/// into one shared constellation database, then links imports across them.
+/// One row of the index summary: a project, its file and node totals, and a short
+/// tag for where its source lives.
+struct SummaryRow {
+    label: String,
+    files: u32,
+    nodes: u32,
+    source: &'static str,
+}
+
+/// A short source tag for a project's root, relative to the portal: empty for the
+/// portal itself, `.venv` for an installed copy, `ref` for a version checkout, and
+/// `local` for a working copy that overrides the install.
+fn project_source(root: &Path, portal_root: &Path, reference_only: bool) -> &'static str {
+    if root == portal_root {
+        return "";
+    }
+
+    if root.components().any(|part| part.as_os_str() == "site-packages") {
+        return ".venv";
+    }
+
+    if reference_only {
+        return "ref";
+    }
+
+    "local"
+}
+
+/// The number of decimal digits in `value`, at least one, for column alignment.
+fn digits(value: u32) -> usize {
+    value.to_string().len()
+}
+
+/// The compact constellation summary: a version header, one aligned row per
+/// project (name, file and node totals, source tag), and the cross-project link
+/// total. Columns are sized to the rows, so it stays readable on a narrow terminal.
+fn print_constellation_summary(rows: &[SummaryRow], links: u32) {
+    let name_width = rows.iter().map(|row| row.label.len()).max().unwrap_or(0);
+    let files_width = rows.iter().map(|row| digits(row.files)).max().unwrap_or(1);
+    let nodes_width = rows.iter().map(|row| digits(row.nodes)).max().unwrap_or(1);
+
+    println!("{NAME} {VERSION}");
+
+    for row in rows {
+        let label = &row.label;
+        let files = row.files;
+        let nodes = row.nodes;
+        let source = row.source;
+
+        let line = format!(
+            "  {label:<name_width$}  {files:>files_width$} files  {nodes:>nodes_width$} nodes  {source}",
+        );
+
+        println!("{}", line.trim_end());
+    }
+
+    if links > 0 {
+        println!("  {links} cross-project links");
+    }
+}
+
+/// The summary built from every project already in `store`, used after a sync or a
+/// link. The portal root is inferred from the database location
+/// (`<portal>/.constellation/index.db`) to tag the portal row distinctly.
+fn print_store_summary(store: &Store, database: &Path) -> Result<()> {
+    let portal_root = database.parent().and_then(Path::parent).unwrap_or(database);
+
+    let mut rows: Vec<SummaryRow> = Vec::new();
+
+    for project in store.all_projects()? {
+        rows.push(SummaryRow {
+            label: project.id.as_str().to_string(),
+            files: store.count_files(&project.id)?,
+            nodes: store.count_nodes(&project.id)?,
+            source: project_source(Path::new(&project.root_path), portal_root, project.reference_only),
+        });
+    }
+
+    print_constellation_summary(&rows, store.count_links()?);
+
+    Ok(())
+}
+
+/// The `constellation link <database> <repo> [repo ...]` command indexes every
+/// repository into one shared constellation database, links imports across them,
+/// and prints the summary.
 fn link_command(rest: &[String]) -> Result<()> {
     let Some((database, repositories)) = rest.split_first() else {
         bail!("usage: constellation link <database> <repo> [repo ...]");
@@ -290,29 +424,22 @@ fn link_command(rest: &[String]) -> Result<()> {
 
         let mut progress = progress::Progress::new(&format!("indexing {name}"));
 
-        let stats = index_project_reporting(&store, &project, &name, root, |phase| {
+        index_project_reporting(&store, &project, &name, root, |phase| {
             progress.on_phase(phase);
         })?;
 
         progress.finish();
 
-        println!(
-            "  {name}: {} nodes, {} resolved, {} pending",
-            stats.nodes, stats.resolved_edges, stats.unresolved_remaining,
-        );
-
         index_companions(&store, root)?;
     }
 
-    let linked = link_constellation(&store)?;
+    link_constellation(&store)?;
 
-    println!("linked {linked} cross-project edges across {} projects", repositories.len());
-    println!("constellation written to {database}");
-
-    Ok(())
+    print_store_summary(&store, Path::new(database))
 }
 
-/// The indexing of a repository given as a positional argument, without creating the index directory first.
+/// The indexing of a repository given as a positional argument, reusing the
+/// existing `.constellation/` if present.
 fn index_command(root_argument: &str) -> Result<()> {
     let root = Path::new(root_argument);
 
@@ -329,51 +456,17 @@ fn index_command(root_argument: &str) -> Result<()> {
     let database = create_index_directory(root)?;
     let store = Store::open(&database)?;
 
-    let mut progress = progress::Progress::new("indexing");
-
-    let stats = index_project_reporting(&store, &project, &name, root, |phase| {
-        progress.on_phase(phase);
-    })?;
-
-    progress.finish();
-
-    println!(
-        "{NAME} {VERSION}: indexed {} files ({} unchanged, {} removed, {} skipped): {} nodes, {} structural edges",
-        stats.files_indexed,
-        stats.files_unchanged,
-        stats.files_removed,
-        stats.files_skipped,
-        stats.nodes,
-        stats.edges,
-    );
-    println!(
-        "resolved {} of {} references into edges ({} still pending cross-project linking)",
-        stats.resolved_edges, stats.unresolved_refs, stats.unresolved_remaining,
-    );
-    println!("synthesized {} event edge(s) from JS/Alpine dispatch+listener pairs", stats.synthesized_edges);
-    println!("synthesized {} external edge(s) into third-party/stdlib symbols", stats.external_edges);
-
-    let companions = index_companions(&store, root)?;
-
-    if companions > 0 {
-        let linked = link_constellation(&store)?;
-
-        println!("linked {linked} cross-project edge(s) to {companions} companion package(s)");
-    }
-
-    println!("graph written to {}", database.display());
-
-    Ok(())
+    index_and_report(&store, &project, &name, root)
 }
 
 /// The smoke check that verifies the binary links correctly by opening an in-memory store and printing the schema version.
 fn smoke_check() -> Result<()> {
     let store = Store::open_in_memory()?;
-    let version = store.schema_version()?;
+    let fingerprint = store.schema_version()?;
 
-    assert!(version >= 1, "store must initialize to schema version >= 1");
+    assert!(fingerprint != 0, "an initialized store carries a schema fingerprint");
 
-    println!("{NAME} {VERSION}: in-memory store ready at schema v{version}");
+    println!("{NAME} {VERSION}: in-memory store ready (schema {fingerprint:#010x})");
     println!("pass a repository path to index it");
 
     Ok(())
@@ -381,7 +474,7 @@ fn smoke_check() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{project_name, resolve_root};
+    use super::{digits, project_name, project_source, resolve_root};
 
     use std::path::Path;
 
@@ -427,5 +520,34 @@ mod tests {
         let missing = directory.path().join("does-not-exist");
 
         assert!(resolve_root(&missing).is_err(), "canonicalizing an absent path fails");
+    }
+
+    #[test]
+    fn project_source_tags_each_origin() {
+        let portal = Path::new("/code/portal");
+
+        assert_eq!(project_source(portal, portal, false), "", "the portal itself has no tag");
+        assert_eq!(
+            project_source(Path::new("/code/portal/.venv/Lib/site-packages/robit"), portal, false),
+            ".venv",
+            "a site-packages path is the installed copy",
+        );
+        assert_eq!(
+            project_source(Path::new("/code/.constellation/sources/x/pkg"), portal, true),
+            "ref",
+            "a reference-only checkout is a version ref",
+        );
+        assert_eq!(
+            project_source(Path::new("/code/django-spire/django_spire"), portal, false),
+            "local",
+            "a working copy outside the venv is a local override",
+        );
+    }
+
+    #[test]
+    fn digits_counts_decimal_places() {
+        assert_eq!(digits(0), 1, "zero is one digit");
+        assert_eq!(digits(7), 1);
+        assert_eq!(digits(9477), 4);
     }
 }

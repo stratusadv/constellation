@@ -33,7 +33,7 @@ use thiserror::Error;
 
 mod companions;
 
-pub use companions::{CompanionTarget, discover_companions};
+pub use companions::{CompanionTarget, discover_companions, discover_versions};
 
 /// The fail-fast bound on the number of filesystem entries one walk may visit.
 pub const FILE_COUNT_MAX: u32 = 5_000_000;
@@ -1425,10 +1425,14 @@ fn make_external_node(project: &ProjectId, target: &ExternalTarget) -> Node {
 /// number of cross-project edges written.
 pub fn link_constellation(store: &Store) -> Result<u32, IndexError> {
     let nodes = store.all_nodes(None)?;
-    let redirects = external_redirects(&nodes);
-    let template_overrides = template_override_edges(&nodes);
 
-    let context = ConstellationContext::new(nodes);
+    let reference_only: FxHashSet<String> =
+        store.reference_only_project_ids()?.into_iter().collect();
+
+    let redirects = external_redirects(&nodes, &reference_only);
+    let template_overrides = template_override_edges(&nodes, &reference_only);
+
+    let context = ConstellationContext::new(nodes, &reference_only);
     let pending = store.load_unresolved(None)?;
     let linker = ImportLinker;
 
@@ -1489,11 +1493,13 @@ pub fn link_constellation(store: &Store) -> Result<u32, IndexError> {
 /// `OverridesTemplate` edge from each non-owner copy to the canonical original, so
 /// `callers` on the original shows which projects override it. A name with no
 /// canonical owner is left alone: no false edge.
-fn template_override_edges(nodes: &[Node]) -> Vec<Edge> {
+fn template_override_edges(nodes: &[Node], reference_only: &FxHashSet<String>) -> Vec<Edge> {
     let mut by_name: FxHashMap<&str, Vec<&Node>> = FxHashMap::default();
 
     for node in nodes {
-        if node.kind == NodeKind::Template {
+        // A reference-only version copy is for direct comparison, not a target of
+        // cross-project override synthesis, so it joins neither side.
+        if node.kind == NodeKind::Template && !reference_only.contains(node.project_id.as_str()) {
             by_name.entry(node.name.as_str()).or_default().push(node);
         }
     }
@@ -1580,12 +1586,20 @@ fn cross_project_relation(reference: &UnresolvedRef, context: &dyn LinkContext) 
 /// linkable definition of the same simple name in another project whose file path
 /// agrees with the stub's module, the same module-path evidence the import linker
 /// requires. An ambiguous stub (two projects define the name) is left alone.
-fn external_redirects(nodes: &[Node]) -> Vec<(NodeId, NodeId)> {
+fn external_redirects(nodes: &[Node], reference_only: &FxHashSet<String>) -> Vec<(NodeId, NodeId)> {
     let mut definitions: FxHashMap<&str, Vec<&Node>> = FxHashMap::default();
     let mut templates: FxHashMap<&str, Vec<&Node>> = FxHashMap::default();
 
     for node in nodes {
         if node.kind == NodeKind::External {
+            continue;
+        }
+
+        // A reference-only version is never the canonical definition a stub
+        // resolves to; excluding it here keeps unification from retargeting an
+        // external stub onto an arbitrary version copy. Reference-only stubs
+        // themselves still redirect outward: the stub loop below is unfiltered.
+        if reference_only.contains(node.project_id.as_str()) {
             continue;
         }
 
@@ -2486,11 +2500,19 @@ struct ConstellationContext {
 }
 
 impl ConstellationContext {
-    fn new(nodes: Vec<Node>) -> Self {
+    /// The cross-project export index over `nodes`, excluding any node whose
+    /// project is in `reference_only`: a reference-only version is queryable and
+    /// links out, but its symbols are never cross-project link targets, so two
+    /// indexed versions of one library cannot compete to win an ambiguous import.
+    fn new(nodes: Vec<Node>, reference_only: &FxHashSet<String>) -> Self {
         let mut by_name: FxHashMap<String, Vec<Arc<Node>>> =
             FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
 
         for node in nodes {
+            if reference_only.contains(node.project_id.as_str()) {
+                continue;
+            }
+
             by_name.entry(node.name.clone()).or_default().push(Arc::new(node));
         }
 

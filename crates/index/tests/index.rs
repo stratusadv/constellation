@@ -2240,3 +2240,116 @@ fn namespace_chain_disambiguates_reused_inner_namespace() {
 
     assert_eq!(namespace_chain("app.unincluded.urls", &includes), None);
 }
+
+#[test]
+fn reference_only_versions_are_not_link_targets_but_stay_queryable() {
+    let store = Store::open_in_memory().unwrap();
+
+    // The canonical library (what the client actually installs) and a second copy
+    // indexed as a reference-only version, both exporting the same symbol from the
+    // same module path, so an unfiltered linker would pick one arbitrarily.
+    let canonical = tempfile::tempdir().unwrap();
+    std::fs::create_dir(canonical.path().join("accounts")).unwrap();
+    std::fs::write(canonical.path().join("accounts").join("models.py"), "class User:\n    pass\n").unwrap();
+    index_project(&store, &ProjectId::new("django-spire"), "django-spire", canonical.path()).unwrap();
+
+    let next = tempfile::tempdir().unwrap();
+    std::fs::create_dir(next.path().join("accounts")).unwrap();
+    std::fs::write(next.path().join("accounts").join("models.py"), "class User:\n    pass\n").unwrap();
+
+    let next_project = ProjectId::new("django-spire@next");
+
+    index_project(&store, &next_project, "django-spire@next", next.path()).unwrap();
+    store.set_reference_only(&next_project, true).unwrap();
+
+    let client = tempfile::tempdir().unwrap();
+    std::fs::write(
+        client.path().join("service.py"),
+        "from accounts.models import User\n\n\ndef build():\n    return User()\n",
+    )
+    .unwrap();
+    index_project(&store, &ProjectId::new("client"), "client", client.path()).unwrap();
+
+    link_constellation(&store).unwrap();
+
+    let importers_of = |project: &ProjectId| -> Vec<String> {
+        let user = store
+            .all_nodes(Some(project))
+            .unwrap()
+            .into_iter()
+            .find(|node| node.name == "User" && node.kind == NodeKind::Class)
+            .expect("a User class in the project");
+
+        store
+            .callers(&user.id)
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, _)| *kind == EdgeKind::Imports)
+            .map(|(_, node)| node.project_id.as_str().to_string())
+            .collect()
+    };
+
+    assert!(
+        importers_of(&ProjectId::new("django-spire")).iter().any(|project| project == "client"),
+        "the client import binds to the canonical version",
+    );
+
+    assert!(
+        importers_of(&next_project).is_empty(),
+        "the reference-only version is never a cross-project link target",
+    );
+
+    assert!(
+        store.all_nodes(Some(&next_project)).unwrap().iter().any(|node| node.name == "User"),
+        "the reference-only version's symbols remain queryable",
+    );
+}
+
+#[test]
+fn a_reference_only_version_still_links_out_to_canonical() {
+    let store = Store::open_in_memory().unwrap();
+
+    // The canonical library defines a base class.
+    let canonical = tempfile::tempdir().unwrap();
+    std::fs::create_dir(canonical.path().join("core")).unwrap();
+    std::fs::write(canonical.path().join("core").join("base.py"), "class BaseThing:\n    pass\n").unwrap();
+    index_project(&store, &ProjectId::new("lib"), "lib", canonical.path()).unwrap();
+
+    // A reference-only consumer imports that base; as a link source (not target)
+    // its import must still resolve across the boundary.
+    let next = tempfile::tempdir().unwrap();
+    std::fs::write(
+        next.path().join("consumer.py"),
+        "from core.base import BaseThing\n\n\ndef use():\n    return BaseThing()\n",
+    )
+    .unwrap();
+
+    let next_project = ProjectId::new("consumer@next");
+
+    index_project(&store, &next_project, "consumer@next", next.path()).unwrap();
+    store.set_reference_only(&next_project, true).unwrap();
+
+    let linked = link_constellation(&store).unwrap();
+
+    assert!(linked >= 1, "a reference-only project still links out to a canonical target");
+
+    let base = store
+        .all_nodes(Some(&ProjectId::new("lib")))
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "BaseThing")
+        .expect("BaseThing in the canonical lib");
+
+    let importers: Vec<String> = store
+        .callers(&base.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Imports)
+        .map(|(_, node)| node.project_id.as_str().to_string())
+        .collect();
+
+    assert!(
+        importers.iter().any(|project| project == "consumer@next"),
+        "the reference-only consumer's import resolves to the canonical base, got {importers:?}",
+    );
+}

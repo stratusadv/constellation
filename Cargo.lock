@@ -191,6 +191,7 @@ dependencies = [
  "rayon",
  "rustc-hash",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",
