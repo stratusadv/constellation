@@ -16,8 +16,8 @@ pub use framework::{FrameworkExtractionResult, FrameworkResolver};
 pub use frameworks::DjangoResolver;
 pub use refs::{ResolvedBy, ResolvedRef, UnresolvedRef};
 pub use resolver::{
-    COLLECTION_CONTEXT, QUERYSET_DISPATCH, SERVICE_DISPATCH, TYPED_RECEIVER, edge_from_resolved,
-    resolve_reference,
+    COLLECTION_CONTEXT, QUERYSET_BUILTINS, QUERYSET_DISPATCH, SERVICE_DISPATCH, TYPED_RECEIVER,
+    edge_from_resolved, resolve_reference,
 };
 
 #[doc(hidden)]

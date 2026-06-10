@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use constellation_graph::{
     Edge, EdgeKind, Language, Node, NodeId, NodeIdentity, NodeKind, ProjectId, Span,
 };
@@ -18,23 +20,71 @@ const CHILDREN_MAX: u32 = 1_000_000;
 /// The provenance tag on edges this extractor produces for Alpine component methods.
 const ALPINE_PROVENANCE: &str = "alpine";
 
+/// Django's built-in template tags (and the `{% end... %}` closers and clause
+/// words a leaf/block tag node can surface), none of which a project defines, so a
+/// `UsesTag` reference to one would only be permanent noise. A tag not listed is a
+/// custom `{% my_tag %}` from a `{% load %}`-ed library, resolved to its
+/// `@register.simple_tag`/`inclusion_tag` function by name.
+const TEMPLATE_BUILTIN_TAGS: &[&str] = &[
+    "autoescape", "block", "blocktrans", "blocktranslate", "comment", "csrf_token", "cycle",
+    "debug", "elif", "else", "empty", "endautoescape", "endblock", "endblocktrans",
+    "endblocktranslate", "endcomment", "endfilter", "endfor", "endif", "endifchanged",
+    "endspaceless", "endverbatim", "endwith", "extends", "filter", "firstof", "for", "if",
+    "ifchanged", "include", "load", "lorem", "now", "plural", "regroup", "resetcycle", "spaceless",
+    "static", "templatetag", "trans", "translate", "url", "verbatim", "widthratio", "with",
+];
+
+/// Django's built-in template filters plus the `humanize` contrib set, excluded
+/// from `UsesTag` references for the same reason as the built-in tags. A filter not
+/// listed is a custom `@register.filter`.
+const TEMPLATE_BUILTIN_FILTERS: &[&str] = &[
+    "add", "addslashes", "apnumber", "capfirst", "center", "cut", "date", "default",
+    "default_if_none", "dictsort", "dictsortreversed", "divisibleby", "escape", "escapejs",
+    "filesizeformat", "first", "floatformat", "force_escape", "get_digit", "intcomma", "intword",
+    "iriencode", "join", "json_script", "last", "length", "length_is", "linebreaks",
+    "linebreaksbr", "linenumbers", "ljust", "lower", "make_list", "naturalday", "naturaltime",
+    "ordinal", "phone2numeric", "pluralize", "pprint", "random", "rjust", "safe", "safeseq",
+    "slice", "slugify", "stringformat", "striptags", "time", "timesince", "timeuntil", "title",
+    "truncatechars", "truncatechars_html", "truncatewords", "truncatewords_html", "unordered_list",
+    "upper", "urlencode", "urlize", "urlizetrunc", "wordcount", "wordwrap", "yesno",
+];
+
 /// An extractor of Django templates across three proper parsers, replacing the former
 /// hand-rolled byte scanners: the `django` front end reads `{% extends %}` /
 /// `{% include %}` / `{% url %}` into cross-template references; tree-sitter-html
 /// reads element attributes (`class`, `src`, `href`, and Alpine directives); and
 /// `AlpineExpr` reads the JavaScript embedded in those Alpine attribute values.
-pub struct TemplateExtractor {
-    html_language: tree_sitter::Language,
+pub struct TemplateExtractor;
+
+thread_local! {
+    /// The per-thread HTML parser, reused across template files so each file pays
+    /// only for its parse, not for parser construction. One parser per rayon
+    /// worker thread, no cross-thread sharing. The embedded Alpine expressions go
+    /// through a separate per-thread JavaScript parser in [`crate::jsexpr`].
+    static PARSER: RefCell<Parser> = RefCell::new(new_parser());
+}
+
+/// An HTML parser with the grammar loaded. It panics only on a grammar against
+/// tree-sitter ABI mismatch, a build error that cannot arise at runtime in a
+/// correctly linked binary.
+fn new_parser() -> Parser {
+    let html_language: tree_sitter::Language = tree_sitter_html::LANGUAGE.into();
+
+    assert!(html_language.node_kind_count() > 0, "html grammar must expose node kinds");
+
+    let mut parser = Parser::new();
+
+    parser
+        .set_language(&html_language)
+        .expect("the bundled html grammar is ABI-compatible with tree-sitter");
+
+    parser
 }
 
 impl TemplateExtractor {
-    /// The extractor, with the HTML grammar loaded.
+    /// The extractor; the grammar loads per worker thread on first use.
     pub fn new() -> Self {
-        let html_language: tree_sitter::Language = tree_sitter_html::LANGUAGE.into();
-
-        assert!(html_language.node_kind_count() > 0, "html grammar must expose node kinds");
-
-        Self { html_language }
+        Self
     }
 }
 
@@ -192,9 +242,78 @@ fn collect_template_links(
                 }
             }
 
+            for (name, line) in template_tag_filter_uses(node) {
+                output.unresolved_refs.push(UnresolvedRef::new(
+                    template_id.clone(),
+                    name,
+                    EdgeKind::UsesTag,
+                    line,
+                    0,
+                    file_path,
+                    Language::HtmlDjango,
+                ));
+            }
+
             node.push_child_slices(&mut stack);
         }
     }
+}
+
+/// The custom template-tag and filter names a node invokes that are not Django
+/// built-ins: a leaf/block `{% my_tag %}`, a `{% filter my_filter %}` block, or the
+/// `|my_filter` segments of a `{{ value|my_filter }}` variable. Each resolves to its
+/// `@register.simple_tag`/`filter` function by name. Built-ins are excluded so a
+/// `{% if %}` or a `|date` never becomes a dangling reference. Tag/block nodes carry
+/// no line, so those reference line 1.
+fn template_tag_filter_uses(node: &AstNode<'_>) -> Vec<(String, u32)> {
+    let mut uses: Vec<(String, u32)> = Vec::new();
+
+    match node {
+        AstNode::Tag { name, .. } | AstNode::Container { name, .. } => {
+            let name = *name;
+
+            if !name.is_empty() && !TEMPLATE_BUILTIN_TAGS.contains(&name) {
+                uses.push((name.to_string(), 1));
+            }
+        }
+        AstNode::Filter { specification, .. } => {
+            let name = specification.split([':', ' ']).next().unwrap_or(specification);
+
+            if !name.is_empty() && !TEMPLATE_BUILTIN_FILTERS.contains(&name) {
+                uses.push((name.to_string(), 1));
+            }
+        }
+        AstNode::Variable { expression, line } => {
+            for name in filter_names(expression) {
+                if !TEMPLATE_BUILTIN_FILTERS.contains(&name) {
+                    uses.push((name.to_string(), *line));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    uses
+}
+
+/// The filter names applied in a variable expression: each `|`-separated segment
+/// after the variable itself, truncated at its argument
+/// (`value|truncatewords:30|money` -> `["truncatewords", "money"]`).
+fn filter_names(expression: &str) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut segments = expression.split('|');
+
+    segments.next();
+
+    for segment in segments {
+        let name = segment.trim().split([':', ' ']).next().unwrap_or("").trim();
+
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+
+    names
 }
 
 /// The cross-template reference a node carries, if any: a literal `extends`
@@ -237,13 +356,7 @@ impl TemplateExtractor {
     /// references, Alpine `Handles` references, dispatch/listen event records,
     /// and a function node per Alpine `x-data` method.
     fn scan_html(&self, context: &HtmlContext<'_>, source: &str, output: &mut ExtractionOutput) {
-        let mut parser = Parser::new();
-
-        if parser.set_language(&self.html_language).is_err() {
-            return;
-        }
-
-        let Some(tree) = parser.parse(source, None) else {
+        let Some(tree) = PARSER.with(|parser| parser.borrow_mut().parse(source, None)) else {
             return;
         };
 

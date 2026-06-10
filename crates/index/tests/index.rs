@@ -186,11 +186,11 @@ fn links_cross_project_template_inheritance() {
     )
     .unwrap();
 
-    let portal = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(portal.path().join("templates").join("portal")).unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(workspace.path().join("templates").join("workspace")).unwrap();
 
     std::fs::write(
-        portal.path().join("templates").join("portal").join("page.html"),
+        workspace.path().join("templates").join("workspace").join("page.html"),
         "{% extends 'spire/base.html' %}\n",
     )
     .unwrap();
@@ -199,7 +199,7 @@ fn links_cross_project_template_inheritance() {
     let spire_project = ProjectId::new("django-spire");
 
     index_project(&store, &spire_project, "django-spire", spire.path()).unwrap();
-    index_project(&store, &ProjectId::new("portal"), "portal", portal.path()).unwrap();
+    index_project(&store, &ProjectId::new("workspace"), "workspace", workspace.path()).unwrap();
     link_constellation(&store).unwrap();
 
     let base = store
@@ -213,9 +213,9 @@ fn links_cross_project_template_inheritance() {
 
     assert!(
         extenders.iter().any(|(kind, node)| {
-            *kind == EdgeKind::ExtendsTemplate && node.project_id.as_str() == "portal"
+            *kind == EdgeKind::ExtendsTemplate && node.project_id.as_str() == "workspace"
         }),
-        "portal page extends the spire base template across projects, got {extenders:?}",
+        "workspace page extends the spire base template across projects, got {extenders:?}",
     );
 }
 
@@ -229,10 +229,10 @@ fn links_cross_project_model_relation() {
     )
     .unwrap();
 
-    let portal = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
 
     std::fs::write(
-        portal.path().join("models.py"),
+        workspace.path().join("models.py"),
         "from django.db import models\n\n\nclass Audit(models.Model):\n    event = models.ForeignKey('HistoryEvent', on_delete=models.CASCADE)\n",
     )
     .unwrap();
@@ -241,7 +241,7 @@ fn links_cross_project_model_relation() {
     let spire_project = ProjectId::new("django-spire");
 
     index_project(&store, &spire_project, "django-spire", spire.path()).unwrap();
-    index_project(&store, &ProjectId::new("portal"), "portal", portal.path()).unwrap();
+    index_project(&store, &ProjectId::new("workspace"), "workspace", workspace.path()).unwrap();
     link_constellation(&store).unwrap();
 
     let event = store
@@ -255,9 +255,9 @@ fn links_cross_project_model_relation() {
 
     assert!(
         relaters.iter().any(|(kind, node)| {
-            *kind == EdgeKind::RelatesTo && node.project_id.as_str() == "portal"
+            *kind == EdgeKind::RelatesTo && node.project_id.as_str() == "workspace"
         }),
-        "portal Audit relates to spire HistoryEvent across projects, got {relaters:?}",
+        "workspace Audit relates to spire HistoryEvent across projects, got {relaters:?}",
     );
 }
 
@@ -813,6 +813,77 @@ fn synthesizes_external_edge_for_a_library_template() {
             .iter()
             .any(|node| node.kind == NodeKind::External && node.name.contains("_card.html")),
         "a first-party template include must not be externalized",
+    );
+}
+
+#[test]
+fn externalizes_instantiation_and_return_then_clears_satisfied_pending_rows() {
+    let directory = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        directory.path().join("views.py"),
+        "from django.http import JsonResponse\n\n\ndef view() -> JsonResponse:\n    return JsonResponse({})\n",
+    )
+    .unwrap();
+
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("proj");
+
+    index_project(&store, &project, "proj", directory.path()).unwrap();
+
+    let external = store
+        .all_nodes(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|node| node.kind == NodeKind::External && node.name == "JsonResponse")
+        .expect("external JsonResponse node from instantiation/return annotation");
+
+    assert_eq!(external.qualified_name, "django.http.JsonResponse");
+
+    link_constellation(&store).unwrap();
+
+    let pending = store.load_unresolved(Some(&project)).unwrap();
+
+    assert!(
+        !pending.iter().any(|(_, reference)| reference.reference_name == "JsonResponse"),
+        "externalized JsonResponse references must be cleared from the pending table after linking",
+    );
+}
+
+#[test]
+fn resolves_an_absolute_first_party_submodule_import_to_its_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let asset = directory.path().join("app").join("asset");
+    std::fs::create_dir_all(&asset).unwrap();
+
+    std::fs::write(asset.join("__init__.py"), "").unwrap();
+    std::fs::write(asset.join("models.py"), "class Inventory:\n    pass\n").unwrap();
+    std::fs::write(asset.join("forms.py"), "from app.asset import models\n").unwrap();
+
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("proj");
+
+    index_project(&store, &project, "proj", directory.path()).unwrap();
+
+    let models_file = store
+        .all_nodes(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|node| node.kind == NodeKind::File && node.file_path.ends_with("app/asset/models.py"))
+        .expect("models.py file node");
+
+    let callers = store.callers(&models_file.id).unwrap();
+
+    assert!(
+        callers.iter().any(|(kind, _)| *kind == EdgeKind::Imports),
+        "the absolute `from app.asset import models` must resolve to the models.py file",
+    );
+
+    let pending = store.load_unresolved(Some(&project)).unwrap();
+
+    assert!(
+        !pending.iter().any(|(_, reference)| reference.reference_name == "models"),
+        "the resolved submodule import must not linger in the pending table",
     );
 }
 
@@ -2187,7 +2258,7 @@ fn synthesizes_glue_js_field_member_access() {
 #[test]
 fn template_owner_maps_namespace_to_canonical_project() {
     // A namespaced template belongs to its leading segment's project, so a
-    // vendored copy under a portal cannot shadow the django-spire origin.
+    // vendored copy under a workspace cannot shadow the django-spire origin.
     assert_eq!(template_owner("django_spire/page/full_page.html"), "django-spire");
     assert_eq!(template_owner("django_glue/widget.html"), "django-glue");
     // A bare name maps to itself, matching no project id, so it stays ambiguous.
@@ -2203,33 +2274,35 @@ fn module_of_maps_files_and_packages() {
 
 #[test]
 fn namespace_chain_disambiguates_reused_inner_namespace() {
-    let mut includes: FxHashMap<String, (String, String)> = FxHashMap::default();
+    let mut includes: FxHashMap<String, (Option<String>, String)> = FxHashMap::default();
 
     // Root includes the partner app; partner includes its own page urls and,
     // deeper, an agreement->client_contact subtree that ALSO has `page` urls.
-    includes.insert("app.partner.urls".into(), ("partner".into(), "system.urls".into()));
-    includes.insert("app.partner.urls.page_urls".into(), ("page".into(), "app.partner.urls".into()));
-    includes.insert("app.partner.agreement.urls".into(), ("agreement".into(), "app.partner.urls".into()));
+    includes.insert("app.partner.urls".into(), (Some("partner".into()), "system.urls".into()));
+    includes.insert("app.partner.urls.page_urls".into(), (Some("page".into()), "app.partner.urls".into()));
+    includes.insert("app.partner.agreement.urls".into(), (Some("agreement".into()), "app.partner.urls".into()));
 
     includes.insert(
         "app.partner.agreement.client_contact.urls".into(),
-        ("client_contact".into(), "app.partner.agreement.urls".into()),
+        (Some("client_contact".into()), "app.partner.agreement.urls".into()),
     );
 
     includes.insert(
         "app.partner.agreement.client_contact.urls.page_urls".into(),
-        ("page".into(), "app.partner.agreement.client_contact.urls".into()),
+        (Some("page".into()), "app.partner.agreement.client_contact.urls".into()),
     );
+
+    let no_app_names: FxHashMap<String, String> = FxHashMap::default();
 
     // The same inner namespace `page` resolves to distinct chains, so a
     // `reverse('partner:page:detail')` can no longer hit the client_contact one.
     assert_eq!(
-        namespace_chain("app.partner.urls.page_urls", &includes),
+        namespace_chain("app.partner.urls.page_urls", &includes, &no_app_names),
         Some(vec!["partner".to_string(), "page".to_string()]),
     );
 
     assert_eq!(
-        namespace_chain("app.partner.agreement.client_contact.urls.page_urls", &includes),
+        namespace_chain("app.partner.agreement.client_contact.urls.page_urls", &includes, &no_app_names),
         Some(vec![
             "partner".to_string(),
             "agreement".to_string(),
@@ -2238,7 +2311,113 @@ fn namespace_chain_disambiguates_reused_inner_namespace() {
         ]),
     );
 
-    assert_eq!(namespace_chain("app.unincluded.urls", &includes), None);
+    assert_eq!(namespace_chain("app.unincluded.urls", &includes, &no_app_names), None);
+}
+
+#[test]
+fn reverse_names_carry_the_root_app_name_prefix() {
+    let directory = tempfile::tempdir().unwrap();
+    let sub = directory.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    std::fs::write(
+        directory.path().join("urls.py"),
+        "from django.urls import include, path\n\n\
+         app_name = 'myproj'\n\
+         urlpatterns = [path('sub/', include('sub.urls', namespace='sub'))]\n",
+    )
+    .unwrap();
+
+    std::fs::write(sub.join("__init__.py"), "").unwrap();
+    std::fs::write(
+        sub.join("urls.py"),
+        "from django.urls import path\n\nfrom . import views\n\n\
+         app_name = 'subapp'\n\
+         urlpatterns = [path('detail/', views.detail, name='detail')]\n",
+    )
+    .unwrap();
+
+    std::fs::write(sub.join("views.py"), "def detail(request):\n    return 1\n").unwrap();
+
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("proj");
+
+    index_project(&store, &project, "proj", directory.path()).unwrap();
+
+    let names: Vec<String> =
+        store.route_reverse_names().unwrap().into_iter().map(|(_, name, _)| name).collect();
+
+    assert!(
+        names.iter().any(|name| name == "myproj:sub:detail"),
+        "the route's reverse name carries the root app_name then the include namespace, got {names:?}",
+    );
+}
+
+#[test]
+fn reverse_names_get_root_prefix_even_when_the_root_include_is_dynamic() {
+    let directory = tempfile::tempdir().unwrap();
+    let sub = directory.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    // The root urlconf includes its apps dynamically (a comprehension), so no static
+    // include connects sub.urls to the root: the chain cannot walk up, and only the
+    // project-root app_name prefix can supply `myproj`.
+    std::fs::write(
+        directory.path().join("urls.py"),
+        "from django.apps import apps\nfrom django.urls import include, path\n\n\
+         app_name = 'myproj'\n\
+         urlpatterns = [path(f'{c}/', include(c.urls)) for c in apps.get_app_configs()]\n",
+    )
+    .unwrap();
+
+    std::fs::write(sub.join("__init__.py"), "").unwrap();
+    std::fs::write(
+        sub.join("urls.py"),
+        "from django.urls import path\n\nfrom . import views\n\n\
+         app_name = 'subapp'\n\
+         urlpatterns = [path('detail/', views.detail, name='detail')]\n",
+    )
+    .unwrap();
+
+    std::fs::write(sub.join("views.py"), "def detail(request):\n    return 1\n").unwrap();
+
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("proj");
+
+    index_project(&store, &project, "proj", directory.path()).unwrap();
+
+    let names: Vec<String> =
+        store.route_reverse_names().unwrap().into_iter().map(|(_, name, _)| name).collect();
+
+    assert!(
+        names.iter().any(|name| name == "myproj:subapp:detail"),
+        "the root app_name prefixes the reverse name even without a static include, got {names:?}",
+    );
+}
+
+#[test]
+fn namespace_chain_folds_in_app_name_at_the_root_and_for_unnamespaced_includes() {
+    // The root urlconf (`urls`) declares app_name='django_spire'; the auth include
+    // gives no namespace= kwarg, so its level comes from the auth module's app_name.
+    let mut includes: FxHashMap<String, (Option<String>, String)> = FxHashMap::default();
+    includes.insert("auth.urls".into(), (Some("auth".into()), "urls".into()));
+    includes.insert("auth.user.urls.page_urls".into(), (None, "auth.urls".into()));
+
+    let mut app_names: FxHashMap<String, String> = FxHashMap::default();
+    app_names.insert("urls".into(), "django_spire".into());
+
+    // A route in page_urls: the unnamespaced include adds no level, auth contributes
+    // `auth`, and the root app_name prepends `django_spire`.
+    assert_eq!(
+        namespace_chain("auth.user.urls.page_urls", &includes, &app_names),
+        Some(vec!["django_spire".to_string(), "auth".to_string()]),
+    );
+
+    // A route directly in the root urlconf reverses under the bare app_name.
+    assert_eq!(
+        namespace_chain("urls", &includes, &app_names),
+        Some(vec!["django_spire".to_string()]),
+    );
 }
 
 #[test]

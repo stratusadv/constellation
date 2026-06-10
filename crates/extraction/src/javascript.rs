@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use constellation_graph::{
@@ -48,18 +49,36 @@ const LISTEN_CALLEES: &[&str] = &["on", "once", "addEventListener"];
 /// An extractor of JavaScript (including Alpine.js component code) into graph nodes,
 /// containment edges, and the call/import/inheritance references resolution
 /// later turns into edges.
-pub struct JavaScriptExtractor {
-    language: tree_sitter::Language,
+pub struct JavaScriptExtractor;
+
+thread_local! {
+    /// The per-thread JavaScript parser, reused across files so each file pays
+    /// only for its parse, not for parser construction. One parser per rayon
+    /// worker thread, no cross-thread sharing.
+    static PARSER: RefCell<Parser> = RefCell::new(new_parser());
+}
+
+/// A JavaScript parser with the grammar loaded. It panics only on a grammar
+/// against tree-sitter ABI mismatch, a build error that cannot arise at runtime
+/// in a correctly linked binary.
+fn new_parser() -> Parser {
+    let language: tree_sitter::Language = tree_sitter_javascript::LANGUAGE.into();
+
+    assert!(language.node_kind_count() > 0, "javascript grammar must expose node kinds");
+
+    let mut parser = Parser::new();
+
+    parser
+        .set_language(&language)
+        .expect("the bundled javascript grammar is ABI-compatible with tree-sitter");
+
+    parser
 }
 
 impl JavaScriptExtractor {
-    /// The extractor, with the JavaScript grammar loaded.
+    /// The extractor; the grammar loads per worker thread on first use.
     pub fn new() -> Self {
-        let language: tree_sitter::Language = tree_sitter_javascript::LANGUAGE.into();
-
-        assert!(language.node_kind_count() > 0, "javascript grammar must expose node kinds");
-
-        Self { language }
+        Self
     }
 }
 
@@ -78,13 +97,8 @@ impl Extractor for JavaScriptExtractor {
         assert!(!file_path.is_empty(), "file_path must not be empty");
 
         let mut output = ExtractionOutput::empty();
-        let mut parser = Parser::new();
 
-        if parser.set_language(&self.language).is_err() {
-            return output;
-        }
-
-        let Some(tree) = parser.parse(source, None) else {
+        let Some(tree) = PARSER.with(|parser| parser.borrow_mut().parse(source, None)) else {
             return output;
         };
 

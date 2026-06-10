@@ -168,6 +168,19 @@ CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id);
 CREATE INDEX IF NOT EXISTS idx_events_file ON events(project_id, file_path);
 CREATE INDEX IF NOT EXISTS idx_events_name ON events(project_id, event_name);
 
+-- Each route's fully namespaced reverse name (`django_spire:auth:user:page:detail`),
+-- computed per project from its app_name + include(namespace=...) chain. Persisted
+-- so the cross-project linker can resolve a `{% url %}`/reverse() into another
+-- project's route by exact reverse name, the chain having been reconstructed during
+-- that project's own resolution pass. Replaced wholesale per project each index.
+CREATE TABLE IF NOT EXISTS route_reverse_name (
+    project_id   TEXT NOT NULL,
+    reverse_name TEXT NOT NULL,
+    route_id     TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_route_reverse_name ON route_reverse_name(reverse_name);
+
 -- Full-text index over each file's source content, so explore can seed its
 -- structural ranking from files whose body matches a query (a name or
 -- docstring search alone misses a symbol found only by an identifier in its
@@ -197,3 +210,54 @@ CREATE TRIGGER IF NOT EXISTS file_content_au AFTER UPDATE ON file_content BEGIN
     INSERT INTO file_content_fts(file_content_fts, rowid, content) VALUES ('delete', OLD.rowid, OLD.content);
     INSERT INTO file_content_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
 END;
+
+-- Per-project git commit history (Tier 1): one row per commit, and one per file
+-- it touched with that file's line churn, so the graph can be read over time
+-- (when a file or app appeared, churned, or went quiet) and joined to nodes by
+-- file_path. Populated by the `history` command, separate from the graph
+-- extraction pass.
+CREATE TABLE IF NOT EXISTS git_commit (
+    project_id   TEXT NOT NULL,
+    commit_hash  TEXT NOT NULL,
+    author       TEXT NOT NULL,
+    committed_at INTEGER NOT NULL,
+    summary      TEXT NOT NULL,
+    PRIMARY KEY (project_id, commit_hash),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS git_commit_file (
+    project_id  TEXT NOT NULL,
+    commit_hash TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    insertions  INTEGER NOT NULL,
+    deletions   INTEGER NOT NULL,
+    FOREIGN KEY (project_id, commit_hash)
+        REFERENCES git_commit(project_id, commit_hash) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_git_commit_time        ON git_commit(project_id, committed_at);
+CREATE INDEX IF NOT EXISTS idx_git_commit_file_path   ON git_commit_file(project_id, file_path);
+CREATE INDEX IF NOT EXISTS idx_git_commit_file_commit ON git_commit_file(project_id, commit_hash);
+
+-- Per-project symbol-level history (Tier 2): one row per symbol added, modified
+-- (signature changed), or removed in a commit, derived by diffing each touched
+-- file's trackable symbols against its prior revision. Populated by
+-- `history --symbols`. Cascades away with its commit, so re-ingesting Tier-1
+-- history clears it until the symbol pass is rerun.
+CREATE TABLE IF NOT EXISTS git_symbol_revision (
+    project_id     TEXT NOT NULL,
+    commit_hash    TEXT NOT NULL,
+    file_path      TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    change_kind    TEXT NOT NULL,
+    signature      TEXT,
+    FOREIGN KEY (project_id, commit_hash)
+        REFERENCES git_commit(project_id, commit_hash) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_git_symbol_revision_qualified ON git_symbol_revision(project_id, qualified_name);
+CREATE INDEX IF NOT EXISTS idx_git_symbol_revision_name      ON git_symbol_revision(project_id, name);
+CREATE INDEX IF NOT EXISTS idx_git_symbol_revision_commit    ON git_symbol_revision(project_id, commit_hash);

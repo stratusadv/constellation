@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use constellation_graph::{
     Edge, EdgeKind, Language, Node, NodeId, NodeIdentity, NodeKind, ProjectId, Span, Visibility,
 };
-use constellation_resolution::{EventRecord, EventRole, ImportMapping, UnresolvedRef};
+use constellation_resolution::{EventRecord, EventRole, ImportMapping, QUERYSET_BUILTINS, UnresolvedRef};
 use rusqlite::{Connection, OptionalExtension, params};
 use rustc_hash::FxHashMap;
 
@@ -152,6 +152,98 @@ pub struct ProjectRow {
     pub reference_only: bool,
 }
 
+/// One commit from a project's git history: its hash, author name, committer
+/// timestamp (epoch seconds), subject line, and the files it touched.
+pub struct CommitRecord {
+    pub commit_hash: String,
+    pub author: String,
+    pub committed_at: i64,
+    pub summary: String,
+    pub files: Vec<CommitFile>,
+}
+
+/// One file a commit touched, with its line churn (both zero for a binary file
+/// or a pure rename, which git reports as `-`).
+pub struct CommitFile {
+    pub file_path: String,
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
+/// One row of a history timeline: a commit that touched the queried path, with
+/// its churn aggregated over only the files matching that path.
+pub struct HistoryHit {
+    pub project_id: String,
+    pub commit_hash: String,
+    pub author: String,
+    pub committed_at: i64,
+    pub summary: String,
+    pub files_changed: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
+/// The kind of change a symbol underwent between two consecutive revisions of its
+/// file, as recorded in `git_symbol_revision`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymbolChange {
+    Added,
+    Modified,
+    Removed,
+}
+
+impl SymbolChange {
+    /// The lowercase label stored for this change.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SymbolChange::Added => "added",
+            SymbolChange::Modified => "modified",
+            SymbolChange::Removed => "removed",
+        }
+    }
+}
+
+/// One symbol-level change to record: a trackable symbol added, modified, or
+/// removed in a commit, identified within its file by qualified name.
+pub struct SymbolRevision {
+    pub commit_hash: String,
+    pub file_path: String,
+    pub qualified_name: String,
+    pub name: String,
+    pub kind: String,
+    pub change: SymbolChange,
+    pub signature: Option<String>,
+}
+
+/// One commit that touched a file, used to drive symbol diffing in commit order.
+pub struct FileTouch {
+    pub file_path: String,
+    pub commit_hash: String,
+}
+
+/// One row of a symbol's change history: when it changed (commit, time, subject),
+/// how (`added`/`modified`/`removed`), and its kind and signature at that point.
+pub struct SymbolHistoryHit {
+    pub project_id: String,
+    pub commit_hash: String,
+    pub committed_at: i64,
+    pub qualified_name: String,
+    pub kind: String,
+    pub change: String,
+    pub signature: Option<String>,
+    pub summary: String,
+}
+
+/// One symbol alive at a reconstructed point in time: its file, qualified name,
+/// kind, and the signature in effect then.
+pub struct AsOfSymbol {
+    pub project_id: String,
+    pub file_path: String,
+    pub qualified_name: String,
+    pub kind: String,
+    pub signature: Option<String>,
+}
+
 /// A file row for the `files` listing: its path, language, symbol (node) count,
 /// and size in bytes.
 pub struct FileRow {
@@ -286,6 +378,36 @@ impl Store {
         self.connection.execute(
             "UPDATE projects SET index_version = ?2 WHERE id = ?1",
             params![project.as_str(), version],
+        )?;
+
+        Ok(())
+    }
+
+    /// The stamp recorded the last time `project`'s git history was ingested (its
+    /// HEAD commit plus the extractor fingerprint), or `None` when never ingested.
+    /// A caller compares it to the current state to skip re-ingesting unchanged
+    /// history.
+    pub fn git_ingest_stamp(&self, project: &ProjectId) -> Result<Option<String>, StoreError> {
+        let key = format!("git_ingest:{}", project.as_str());
+
+        let stamp: Option<String> = self
+            .connection
+            .query_row("SELECT value FROM project_metadata WHERE key = ?1", params![key], |row| row.get(0))
+            .optional()?;
+
+        Ok(stamp)
+    }
+
+    /// The git-history ingest stamp for `project` recorded, so the next run can
+    /// detect that nothing changed and skip re-ingesting.
+    pub fn set_git_ingest_stamp(&self, project: &ProjectId, stamp: &str) -> Result<(), StoreError> {
+        assert!(!stamp.is_empty(), "ingest stamp must not be empty");
+
+        let key = format!("git_ingest:{}", project.as_str());
+
+        self.connection.execute(
+            "INSERT OR REPLACE INTO project_metadata (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            params![key, stamp, now_ms()?],
         )?;
 
         Ok(())
@@ -460,6 +582,400 @@ impl Store {
         }
 
         Ok(projects)
+    }
+
+    /// A project's git history, replacing any previously recorded for it: the
+    /// commit rows and the per-file churn each touched, written in one
+    /// transaction (so a failed ingest leaves the prior history intact). Returns
+    /// the number of commits stored.
+    pub fn replace_history(
+        &self,
+        project: &ProjectId,
+        commits: &[CommitRecord],
+    ) -> Result<u32, StoreError> {
+        assert!(!project.as_str().is_empty(), "project id must not be empty");
+
+        let transaction = self.connection.unchecked_transaction()?;
+
+        transaction.execute(
+            "DELETE FROM git_commit WHERE project_id = ?1",
+            params![project.as_str()],
+        )?;
+
+        let mut stored: u32 = 0;
+
+        for commit in commits {
+            assert!(stored < u32::MAX, "commit count must not overflow");
+
+            transaction.execute(
+                "INSERT OR REPLACE INTO git_commit
+                     (project_id, commit_hash, author, committed_at, summary)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    project.as_str(),
+                    commit.commit_hash,
+                    commit.author,
+                    commit.committed_at,
+                    commit.summary,
+                ],
+            )?;
+
+            for file in &commit.files {
+                transaction.execute(
+                    "INSERT INTO git_commit_file
+                         (project_id, commit_hash, file_path, insertions, deletions)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        project.as_str(),
+                        commit.commit_hash,
+                        file.file_path,
+                        file.insertions,
+                        file.deletions,
+                    ],
+                )?;
+            }
+
+            stored += 1;
+        }
+
+        transaction.commit()?;
+
+        Ok(stored)
+    }
+
+    /// The number of commits recorded in `project`'s history, zero until
+    /// [`Store::replace_history`] has run for it.
+    pub fn count_history_commits(&self, project: &ProjectId) -> Result<u32, StoreError> {
+        count(
+            &self.connection,
+            "SELECT COUNT(*) FROM git_commit WHERE project_id = ?1",
+            project,
+        )
+    }
+
+    /// The commits touching files whose path matches `path_like` (a SQL `LIKE`
+    /// pattern), newest first, with churn aggregated over only the matching
+    /// files. `project` scopes the search to one project when given. The timeline
+    /// behind `constellation_history`.
+    pub fn history_for_path(
+        &self,
+        project: Option<&ProjectId>,
+        path_like: &str,
+        limit: u32,
+    ) -> Result<Vec<HistoryHit>, StoreError> {
+        assert!(!path_like.is_empty(), "path pattern must not be empty");
+
+        let project_filter = project.map(|project| project.as_str().to_string());
+
+        let mut statement = self.connection.prepare(
+            "SELECT c.project_id, c.commit_hash, c.author, c.committed_at, c.summary,
+                    COUNT(f.file_path), COALESCE(SUM(f.insertions), 0), COALESCE(SUM(f.deletions), 0)
+             FROM git_commit c
+             JOIN git_commit_file f
+                 ON f.project_id = c.project_id AND f.commit_hash = c.commit_hash
+             WHERE f.file_path LIKE ?1
+               AND (?2 IS NULL OR c.project_id = ?2)
+             GROUP BY c.project_id, c.commit_hash
+             ORDER BY c.committed_at DESC, c.commit_hash
+             LIMIT ?3",
+        )?;
+
+        let rows = statement.query_map(params![path_like, project_filter, limit], |row| {
+            Ok(HistoryHit {
+                project_id: row.get(0)?,
+                commit_hash: row.get(1)?,
+                author: row.get(2)?,
+                committed_at: row.get(3)?,
+                summary: row.get(4)?,
+                files_changed: u32::try_from(row.get::<_, i64>(5)?).unwrap_or(u32::MAX),
+                insertions: u32::try_from(row.get::<_, i64>(6)?).unwrap_or(u32::MAX),
+                deletions: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(u32::MAX),
+            })
+        })?;
+
+        let mut hits: Vec<HistoryHit> = Vec::new();
+        let mut count: u32 = 0;
+
+        for row in rows {
+            count += 1;
+
+            assert!(count <= ROWS_LOADED_MAX, "history load exceeded {ROWS_LOADED_MAX}");
+
+            hits.push(row?);
+        }
+
+        Ok(hits)
+    }
+
+    /// A project's symbol-level history, replacing any previously recorded for it:
+    /// the per-commit added/modified/removed rows from diffing each file's
+    /// trackable symbols across revisions, written in one transaction. Returns the
+    /// number of rows stored. Requires the commit rows ([`Store::replace_history`])
+    /// to exist; the rows cascade away with their commit.
+    pub fn replace_symbol_revisions(
+        &self,
+        project: &ProjectId,
+        revisions: &[SymbolRevision],
+    ) -> Result<u32, StoreError> {
+        assert!(!project.as_str().is_empty(), "project id must not be empty");
+
+        let transaction = self.connection.unchecked_transaction()?;
+
+        transaction.execute(
+            "DELETE FROM git_symbol_revision WHERE project_id = ?1",
+            params![project.as_str()],
+        )?;
+
+        let mut stored: u32 = 0;
+
+        for revision in revisions {
+            assert!(stored < u32::MAX, "revision count must not overflow");
+
+            transaction.execute(
+                "INSERT INTO git_symbol_revision
+                     (project_id, commit_hash, file_path, qualified_name, name, kind, change_kind, signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    project.as_str(),
+                    revision.commit_hash,
+                    revision.file_path,
+                    revision.qualified_name,
+                    revision.name,
+                    revision.kind,
+                    revision.change.as_str(),
+                    revision.signature,
+                ],
+            )?;
+
+            stored += 1;
+        }
+
+        transaction.commit()?;
+
+        Ok(stored)
+    }
+
+    /// The number of symbol-change rows recorded for `project`.
+    pub fn count_symbol_revisions(&self, project: &ProjectId) -> Result<u32, StoreError> {
+        count(
+            &self.connection,
+            "SELECT COUNT(*) FROM git_symbol_revision WHERE project_id = ?1",
+            project,
+        )
+    }
+
+    /// Whether any symbol-revision rows exist (optionally scoped to one project):
+    /// whether the `history --symbols` pass has populated the timeline at all. Lets
+    /// the empty-result hint tell "the symbol pass never ran" apart from "it ran but
+    /// nothing matches this query".
+    pub fn has_symbol_revisions(&self, project: Option<&ProjectId>) -> Result<bool, StoreError> {
+        let project_filter = project.map(|project| project.as_str().to_string());
+
+        let present: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM git_symbol_revision WHERE (?1 IS NULL OR project_id = ?1))",
+            params![project_filter],
+            |row| row.get(0),
+        )?;
+
+        Ok(present != 0)
+    }
+
+    /// Every commit that touched a file in `project`, ordered by file then commit
+    /// time, so a caller can diff each file's revisions in chronological order.
+    /// Capped at `max` touches.
+    pub fn history_file_touches(
+        &self,
+        project: &ProjectId,
+        max: u32,
+    ) -> Result<Vec<FileTouch>, StoreError> {
+        assert!(max > 0, "touch cap must be positive");
+
+        let mut statement = self.connection.prepare(
+            "SELECT f.file_path, f.commit_hash
+             FROM git_commit_file f
+             JOIN git_commit c
+                 ON c.project_id = f.project_id AND c.commit_hash = f.commit_hash
+             WHERE f.project_id = ?1
+             ORDER BY f.file_path, c.committed_at, f.commit_hash
+             LIMIT ?2",
+        )?;
+
+        let rows = statement.query_map(params![project.as_str(), max], |row| {
+            Ok(FileTouch { file_path: row.get(0)?, commit_hash: row.get(1)? })
+        })?;
+
+        let mut touches: Vec<FileTouch> = Vec::new();
+        let mut count: u32 = 0;
+
+        for row in rows {
+            count += 1;
+
+            assert!(count <= max, "touch load exceeded the cap {max}");
+
+            touches.push(row?);
+        }
+
+        Ok(touches)
+    }
+
+    /// A symbol's recorded change history, newest first: the commits where a
+    /// definition matching `symbol` (by exact name, exact qualified name, a longer
+    /// qualified name ending in `.symbol`, or an `Owner.member` path sitting just
+    /// past the `file_path::` prefix) was added, modified, or removed. The `.`-suffix
+    /// match targets a nested member (`Order.total` finds `shipping.Order.total`); the
+    /// `::`-suffix match targets a member of a top-level owner (`Order.total` finds
+    /// `models.py::Order.total`, and `Order` finds `models.py::Order`) without matching
+    /// a deeper same-named member. `project` scopes it. The timeline behind
+    /// `constellation_symbol_history`.
+    pub fn symbol_history(
+        &self,
+        project: Option<&ProjectId>,
+        symbol: &str,
+        limit: u32,
+    ) -> Result<Vec<SymbolHistoryHit>, StoreError> {
+        assert!(!symbol.is_empty(), "symbol must not be empty");
+
+        let project_filter = project.map(|project| project.as_str().to_string());
+        let member_suffix = format!("%.{symbol}");
+        let owner_suffix = format!("%::{symbol}");
+
+        let mut statement = self.connection.prepare(
+            "SELECT s.project_id, s.commit_hash, c.committed_at, s.qualified_name, s.kind,
+                    s.change_kind, s.signature, c.summary
+             FROM git_symbol_revision s
+             JOIN git_commit c
+                 ON c.project_id = s.project_id AND c.commit_hash = s.commit_hash
+             WHERE (s.qualified_name = ?1 OR s.name = ?1
+                    OR s.qualified_name LIKE ?2 OR s.qualified_name LIKE ?3)
+               AND (?4 IS NULL OR s.project_id = ?4)
+             ORDER BY c.committed_at DESC, s.commit_hash, s.qualified_name
+             LIMIT ?5",
+        )?;
+
+        let rows = statement.query_map(
+            params![symbol, member_suffix, owner_suffix, project_filter, limit],
+            |row| {
+            Ok(SymbolHistoryHit {
+                project_id: row.get(0)?,
+                commit_hash: row.get(1)?,
+                committed_at: row.get(2)?,
+                qualified_name: row.get(3)?,
+                kind: row.get(4)?,
+                change: row.get(5)?,
+                signature: row.get(6)?,
+                summary: row.get(7)?,
+            })
+        })?;
+
+        let mut hits: Vec<SymbolHistoryHit> = Vec::new();
+        let mut count: u32 = 0;
+
+        for row in rows {
+            count += 1;
+
+            assert!(count <= ROWS_LOADED_MAX, "symbol history load exceeded {ROWS_LOADED_MAX}");
+
+            hits.push(row?);
+        }
+
+        Ok(hits)
+    }
+
+    /// The symbols alive as of `at_committed_at` (epoch seconds), reconstructed
+    /// from the symbol-revision log: a symbol counts as alive when its latest
+    /// change at or before that time was an add or a modify (not a removal), and
+    /// the signature returned is the one in effect then. `path_like` (a SQL `LIKE`
+    /// pattern) scopes to matching files, `project` to one project. The state
+    /// behind `constellation_as_of`. Only symbols that changed within the indexed
+    /// history window appear: one added before the earliest indexed commit, and
+    /// untouched since, is not in the log and so is not reported.
+    pub fn symbols_as_of(
+        &self,
+        project: Option<&ProjectId>,
+        at_committed_at: i64,
+        path_like: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AsOfSymbol>, StoreError> {
+        let project_filter = project.map(|project| project.as_str().to_string());
+
+        let mut statement = self.connection.prepare(
+            "WITH events AS (
+                 SELECT s.project_id, s.file_path, s.qualified_name, s.kind, s.change_kind, s.signature,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY s.project_id, s.file_path, s.qualified_name
+                            ORDER BY c.committed_at DESC, s.commit_hash DESC
+                        ) AS rank
+                 FROM git_symbol_revision s
+                 JOIN git_commit c
+                     ON c.project_id = s.project_id AND c.commit_hash = s.commit_hash
+                 WHERE c.committed_at <= ?1
+                   AND (?2 IS NULL OR s.project_id = ?2)
+                   AND (?3 IS NULL OR s.file_path LIKE ?3)
+             )
+             SELECT project_id, file_path, qualified_name, kind, signature
+             FROM events
+             WHERE rank = 1 AND change_kind <> 'removed'
+             ORDER BY project_id, file_path, qualified_name
+             LIMIT ?4",
+        )?;
+
+        let rows = statement.query_map(
+            params![at_committed_at, project_filter, path_like, limit],
+            |row| {
+                Ok(AsOfSymbol {
+                    project_id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    qualified_name: row.get(2)?,
+                    kind: row.get(3)?,
+                    signature: row.get(4)?,
+                })
+            },
+        )?;
+
+        let mut symbols: Vec<AsOfSymbol> = Vec::new();
+        let mut count: u32 = 0;
+
+        for row in rows {
+            count += 1;
+
+            assert!(count <= ROWS_LOADED_MAX, "as-of load exceeded {ROWS_LOADED_MAX}");
+
+            symbols.push(row?);
+        }
+
+        assert!(symbols.len() as u32 <= limit, "as-of result respects the limit");
+
+        Ok(symbols)
+    }
+
+    /// The committer time (epoch seconds) of the commit whose hash matches
+    /// `hash_prefix` (the newest, if a short prefix is ambiguous), or `None` when
+    /// none matches. `project` scopes the lookup. Resolves an as-of point given a
+    /// commit hash rather than a date.
+    pub fn commit_committed_at(
+        &self,
+        project: Option<&ProjectId>,
+        hash_prefix: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        assert!(!hash_prefix.is_empty(), "hash prefix must not be empty");
+
+        let project_filter = project.map(|project| project.as_str().to_string());
+        let prefix = format!("{hash_prefix}%");
+
+        let result = self.connection.query_row(
+            "SELECT committed_at FROM git_commit
+             WHERE commit_hash LIKE ?1 AND (?2 IS NULL OR project_id = ?2)
+             ORDER BY committed_at DESC
+             LIMIT 1",
+            params![prefix, project_filter],
+            |row| row.get::<_, i64>(0),
+        );
+
+        match result {
+            Ok(time) => Ok(Some(time)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Every recorded file path mapped to its stored content hash, for a project.
@@ -991,6 +1507,59 @@ impl Store {
         Ok(u32::try_from(removed).unwrap_or(u32::MAX))
     }
 
+    /// The replacement of a project's route reverse-name index: every prior row for
+    /// the project is cleared, then the freshly computed `(reverse_name, route_id)`
+    /// pairs are written, so each index re-derives the project's reverse names from
+    /// scratch. Read across projects by [`Store::route_reverse_names`] for
+    /// cross-project `{% url %}`/reverse resolution.
+    pub fn replace_route_reverse_names(
+        &self,
+        project: &ProjectId,
+        names: &[(String, String)],
+    ) -> Result<u32, StoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+
+        transaction.execute(
+            "DELETE FROM route_reverse_name WHERE project_id = ?1",
+            params![project.as_str()],
+        )?;
+
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO route_reverse_name (project_id, reverse_name, route_id) VALUES (?1, ?2, ?3)",
+            )?;
+
+            for (reverse_name, route_id) in names {
+                insert.execute(params![project.as_str(), reverse_name, route_id])?;
+            }
+        }
+
+        transaction.commit()?;
+
+        Ok(u32::try_from(names.len()).unwrap_or(u32::MAX))
+    }
+
+    /// Every route reverse name across all projects, as `(project_id, reverse_name,
+    /// route_id)`, for the cross-project linker to resolve a namespaced reverse into
+    /// the route another project defines.
+    pub fn route_reverse_names(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare_cached("SELECT project_id, reverse_name, route_id FROM route_reverse_name")?;
+
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+
+        let mut names: Vec<(String, String, String)> = Vec::new();
+
+        for row in rows {
+            names.push(row?);
+        }
+
+        Ok(names)
+    }
+
     /// The replacement of the project's synthesized External symbol nodes and the edges into
     /// them. External nodes (kind `external`) are cleared first (deleting a node
     /// cascades to its edges) then re-created, so each index re-derives the
@@ -1082,6 +1651,56 @@ impl Store {
         transaction.commit()?;
 
         Ok(written)
+    }
+
+    /// The deletion of every pending reference that now has a satisfying edge.
+    /// External synthesis and the synthesis passes write their edges in bulk
+    /// (`replace_external`, `replace_synthesized_edges`) rather than through
+    /// [`Store::commit_resolved`], so the reference rows they satisfy are never
+    /// deleted by id and linger as false pending rows. Run once after every
+    /// resolution, linking, and synthesis pass has emitted its edges, this clears
+    /// those now-resolved rows so the pending table holds only references that bind
+    /// to nothing. Returns the number of rows removed.
+    ///
+    /// Two clauses, both safe against deleting a genuinely-unresolved reference:
+    /// - A location match (same source, kind, line, column): the precise key, so a
+    ///   reference is never dropped because a same-named sibling on its line
+    ///   resolved (`f(g(x))`).
+    /// - A name match to a template or external target (same source and kind, target
+    ///   node named the reference). External synthesis deduplicates its edges by
+    ///   (source, target, kind), so an `{% include %}` repeated down a card, or a
+    ///   library symbol called on many lines, yields one edge at the first line and
+    ///   leaves the later locations unmatched by the first clause. Template names are
+    ///   globally namespaced and an external node is named for the very symbol the
+    ///   reference imports/calls, so a name match to one of those kinds is the same
+    ///   resolution, not a collision.
+    pub fn delete_satisfied_unresolved(&self) -> Result<u32, StoreError> {
+        let by_location = self.connection.execute(
+            "DELETE FROM unresolved_refs
+             WHERE EXISTS (
+                 SELECT 1 FROM edges e
+                 WHERE e.source = unresolved_refs.from_node_id
+                   AND e.kind = unresolved_refs.reference_kind
+                   AND e.line = unresolved_refs.line
+                   AND e.column = unresolved_refs.column
+             )",
+            [],
+        )?;
+
+        let by_name = self.connection.execute(
+            "DELETE FROM unresolved_refs
+             WHERE EXISTS (
+                 SELECT 1 FROM edges e
+                 JOIN nodes n ON n.id = e.target
+                 WHERE e.source = unresolved_refs.from_node_id
+                   AND e.kind = unresolved_refs.reference_kind
+                   AND n.name = unresolved_refs.reference_name
+                   AND n.kind IN ('template', 'external')
+             )",
+            [],
+        )?;
+
+        Ok(u32::try_from(by_location + by_name).unwrap_or(u32::MAX))
     }
 
     /// The collapse of each external stub into the real cross-project definition it
@@ -1376,6 +1995,154 @@ impl Store {
     /// The nodes (and edge kinds) the source node references.
     pub fn callees(&self, source: &NodeId) -> Result<Vec<(EdgeKind, Node)>, StoreError> {
         self.edges_join(&CALLEES_SQL, source)
+    }
+
+    /// The unbound call sites naming `name`: `Calls` references the resolver could
+    /// not tie to a definition (an overloaded or base service method reached through
+    /// a `Model.services.x()` descriptor, a builtin like `save_model_obj`, or any
+    /// untyped receiver), joined to the enclosing node they sit in, with the call
+    /// line. Dropped from the precise edge set to avoid a false edge; surfaced here by
+    /// name so a caller listing can show them as unproven, the recall a text search
+    /// gives without inventing an edge. Bounded by `limit`.
+    pub fn unresolved_callers_of(&self, name: &str, limit: u32) -> Result<Vec<(Node, u32)>, StoreError> {
+        assert!(!name.is_empty(), "name must not be empty");
+
+        let sql = format!(
+            "SELECT {NODE_COLUMNS_PREFIXED}, u.line
+             FROM unresolved_refs u
+             JOIN nodes n ON n.id = u.from_node_id
+             WHERE u.reference_name = ?1 AND u.reference_kind = 'calls'
+             ORDER BY n.project_id, n.file_path, u.line
+             LIMIT ?2",
+        );
+
+        let mut statement = self.connection.prepare_cached(&sql)?;
+
+        let rows = statement.query_map(params![name, limit], |row| {
+            let raw = node_row(row)?;
+            let line: i64 = row.get(20)?;
+
+            Ok((raw, line))
+        })?;
+
+        let mut out: Vec<(Node, u32)> = Vec::new();
+
+        for row in rows {
+            let (raw, line) = row?;
+
+            if let Some(node) = node_from_row(raw) {
+                out.push((node, line.max(1) as u32));
+            }
+        }
+
+        assert!(out.len() as u32 <= limit, "unresolved caller load respects its limit");
+
+        Ok(out)
+    }
+
+    /// The unbound callee names a definition invokes: `Calls` references originating
+    /// in `from_id` that the resolver could not tie to a target, each with its call
+    /// line. The callee counterpart of [`unresolved_callers_of`]; disjoint from the
+    /// resolved callees, since a bound call leaves this table. The Django
+    /// QuerySet/Manager builtins (`all`, `filter`, `select_related`, ...) are excluded:
+    /// dynamically dispatched with no project definition to bind to, they are incidental
+    /// noise in this view, not a dropped project call. Excluded in SQL so `limit` still
+    /// yields real callees. Bounded by `limit`.
+    pub fn unresolved_callees_of(
+        &self,
+        from_id: &NodeId,
+        limit: u32,
+    ) -> Result<Vec<(String, u32)>, StoreError> {
+        // The builtin names are compile-time constant identifiers (no quotes or
+        // separators), so formatting them into the `NOT IN` list cannot inject.
+        let exclusions =
+            QUERYSET_BUILTINS.iter().map(|name| format!("'{name}'")).collect::<Vec<_>>().join(", ");
+
+        let sql = format!(
+            "SELECT reference_name, line FROM unresolved_refs
+             WHERE from_node_id = ?1 AND reference_kind = 'calls'
+               AND reference_name NOT IN ({exclusions})
+             ORDER BY line LIMIT ?2",
+        );
+
+        let mut statement = self.connection.prepare_cached(&sql)?;
+
+        let rows = statement.query_map(params![from_id.as_str(), limit], |row| {
+            let name: String = row.get(0)?;
+            let line: i64 = row.get(1)?;
+
+            Ok((name, line))
+        })?;
+
+        let mut out: Vec<(String, u32)> = Vec::new();
+
+        for row in rows {
+            let (name, line) = row?;
+
+            out.push((name, line.max(1) as u32));
+        }
+
+        assert!(out.len() as u32 <= limit, "unresolved callee load respects its limit");
+
+        Ok(out)
+    }
+
+    /// The definition nodes in `project` with no incoming edge other than structural
+    /// containment: nothing calls, imports, instantiates, tests, relates to, or
+    /// extends them. Candidate dead code (an LLM should verify: a symbol reached only
+    /// by a framework convention - a management command's `handle`, a signal receiver,
+    /// a serialized name - has no static edge and surfaces here too, so the caller
+    /// filters those by path/name). Functions, methods, classes, and models only;
+    /// ordered by location, bounded by `limit`.
+    pub fn orphan_definitions(&self, project: &ProjectId, limit: u32) -> Result<Vec<Node>, StoreError> {
+        let sql = format!(
+            "SELECT {NODE_COLUMNS_PREFIXED} FROM nodes n
+             WHERE n.project_id = ?1
+               AND n.kind IN ('function', 'method', 'class', 'model')
+               AND NOT EXISTS (
+                   SELECT 1 FROM edges e WHERE e.target = n.id AND e.kind != 'contains'
+               )
+             ORDER BY n.file_path, n.start_line
+             LIMIT ?2",
+        );
+
+        let mut statement = self.connection.prepare_cached(&sql)?;
+
+        let rows = statement.query_map(params![project.as_str(), limit], node_row)?;
+
+        collect_nodes(rows)
+    }
+
+    /// The definition nodes in `project`'s `file_path` whose source span overlaps the
+    /// 1-based line range `[start_line, end_line]`: the symbols a diff hunk touched.
+    /// Innermost (smallest span) first, so the tightest enclosing definition leads.
+    /// Functions, methods, classes, models, and properties, the editable units.
+    pub fn nodes_in_range(
+        &self,
+        project: &ProjectId,
+        file_path: &str,
+        start_line: u32,
+        end_line: u32,
+    ) -> Result<Vec<Node>, StoreError> {
+        assert!(start_line >= 1, "start_line is 1-based");
+        assert!(start_line <= end_line, "start_line must not exceed end_line");
+
+        let normalized = file_path.replace('\\', "/");
+
+        let sql = format!(
+            "SELECT {NODE_COLUMNS_PREFIXED} FROM nodes n
+             WHERE n.project_id = ?1 AND n.file_path = ?2
+               AND n.start_line <= ?4 AND n.end_line >= ?3
+               AND n.kind IN ('function', 'method', 'class', 'model', 'property')
+             ORDER BY (n.end_line - n.start_line) ASC",
+        );
+
+        let mut statement = self.connection.prepare_cached(&sql)?;
+
+        let rows = statement
+            .query_map(params![project.as_str(), normalized, start_line, end_line], node_row)?;
+
+        collect_nodes(rows)
     }
 
     /// The target ids this node relates to through a *reverse* relation: the

@@ -1,6 +1,6 @@
-//! Companion-library discovery: when a Django portal is indexed, locate the
+//! Companion-library discovery: when a Django workspace is indexed, locate the
 //! company packages it installs (`django-spire`, `django-glue`, `robit`) inside
-//! its virtual environment and register each as its own project, so the portal's
+//! its virtual environment and register each as its own project, so the workspace's
 //! imports of them resolve across a project boundary instead of dead-ending at an
 //! external stub.
 //!
@@ -23,20 +23,20 @@
 //! packages = ["django-spire", "django-glue", "robit"]
 //! # venv = ".venv"
 //!
-//! # Each "package@ref" indexes that git ref of an installed companion as its own
-//! # project (id "django-spire@refactor/next"), rooted exactly like the `.venv`
-//! # copy so only the version suffix differs. The repository is found from the
-//! # install itself (an editable checkout, or the git url pip recorded), so nothing
-//! # else is specified. Reference-only: clients still link to the installed copy.
-//! versions = ["django-spire@refactor/next", "django-glue@v1.2.0"]
+//! # Each package -> ref entry indexes that git ref of a companion as its own
+//! # read-only project (id "django-spire@refactor/next"), rooted like the `.venv`
+//! # copy so only the ref suffix differs. The repository is the companion's
+//! # configured `repositories` url, or its editable/VCS install.
+//! versions = { django-spire = "refactor/next", django-glue = "v1.2.0" }
 //! ```
 //!
-//! A local working copy takes precedence over the `.venv`: if the portal's
+//! A local working copy takes precedence over the `.venv`: if the workspace's
 //! `pyproject.toml` pins a package to a path under `[tool.uv.sources]`, or a
 //! `development.env`/`.env` sets `PYTHONPATH_APPEND` to a directory holding it,
 //! that directory is indexed (and is the repository version refs are taken from)
 //! in place of the installed copy, because it is what actually runs.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -50,6 +50,16 @@ use crate::IndexError;
 /// a project id (hyphenated); the import package name is the id with hyphens
 /// replaced by underscores (`django-spire` -> `django_spire`).
 const COMPANIONS_DEFAULT: &[&str] = &["django-spire", "django-glue", "robit"];
+
+/// The default git repository for each default companion, used to fetch its
+/// history (at the tag matching the installed version) when `[companions]
+/// repositories` is not set, so companion history works with no configuration.
+/// The config key overrides this.
+const COMPANION_REPOSITORIES_DEFAULT: &[(&str, &str)] = &[
+    ("django-spire", "https://github.com/stratusadv/django-spire"),
+    ("django-glue", "https://github.com/stratusadv/django-glue"),
+    ("robit", "https://github.com/stratusadv/robit"),
+];
 
 /// The fail-fast bound on companions resolved in one discovery pass.
 const COMPANION_COUNT_MAX: u32 = 64;
@@ -85,8 +95,10 @@ pub struct CompanionTarget {
 struct CompanionsConfig {
     enabled: bool,
     packages: Vec<String>,
+    exclude: Vec<String>,
+    repositories: BTreeMap<String, String>,
     venv: Option<String>,
-    versions: Vec<String>,
+    versions: BTreeMap<String, String>,
 }
 
 impl Default for CompanionsConfig {
@@ -94,41 +106,79 @@ impl Default for CompanionsConfig {
         Self {
             enabled: true,
             packages: COMPANIONS_DEFAULT.iter().map(|name| name.to_string()).collect(),
+            exclude: Vec::new(),
+            repositories: COMPANION_REPOSITORIES_DEFAULT
+                .iter()
+                .map(|(package, url)| (package.to_string(), url.to_string()))
+                .collect(),
             venv: None,
-            versions: Vec::new(),
+            versions: BTreeMap::new(),
         }
     }
 }
 
-/// The whole config file; only its `[companions]` section is read here.
+/// The `[history]` section of `.constellation/config.toml`: the knobs
+/// `constellation history` reads. The defaults preserve the prior behavior
+/// (enabled, the same commit cap, companions included), so a workspace without the
+/// section is unaffected.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// Whether `constellation history` indexes this workspace at all.
+    pub enabled: bool,
+    /// Whether to record per-symbol changes (the Tier-2 pass); on by default. The
+    /// `--symbols` flag forces it on for a single run even when this is set false.
+    pub symbols: bool,
+    /// Whether the companion/library projects get their history indexed too, not
+    /// just this workspace's own code. Their histories are large, so set false to
+    /// index only your own.
+    pub companions: bool,
+    /// The per-repository commit cap for the history read.
+    pub commits_max: u32,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            symbols: true,
+            companions: true,
+            commits_max: crate::history::HISTORY_COMMITS_MAX,
+        }
+    }
+}
+
+/// The whole config file: its `[companions]` and `[history]` sections.
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
     companions: CompanionsConfig,
+    #[serde(default)]
+    history: HistoryConfig,
 }
 
-/// The companion packages a portal uses, located for indexing and returned as a
+/// The companion packages a workspace uses, located for indexing and returned as a
 /// target each. A local override (a pyproject `[tool.uv.sources]` path, or a
 /// `PYTHONPATH_APPEND` directory) is preferred over the `.venv` copy, because it
 /// is what actually runs. Empty when discovery is disabled, nothing resolves, or
 /// every companion is already a project.
 ///
 /// Discovery only: the caller indexes each target as its own project (so it can
-/// draw progress), then runs [`crate::link_constellation`] so the portal's pending
+/// draw progress), then runs [`crate::link_constellation`] so the workspace's pending
 /// imports bind to what was added.
 pub fn discover_companions(
     store: &Store,
-    portal_root: &Path,
+    workspace_root: &Path,
 ) -> Result<Vec<CompanionTarget>, IndexError> {
-    assert!(portal_root.is_dir(), "portal root must be a directory: {portal_root:?}");
+    assert!(workspace_root.is_dir(), "workspace root must be a directory: {workspace_root:?}");
 
-    let config = load_config(portal_root);
+    let config = load_config(workspace_root);
 
     if !config.enabled {
         return Ok(Vec::new());
     }
 
-    let roots = site_packages_roots(portal_root, &config);
+    let roots = site_packages_roots(workspace_root, &config);
     let existing = existing_project_ids(store)?;
 
     let mut targets: Vec<CompanionTarget> = Vec::with_capacity(config.packages.len());
@@ -139,13 +189,13 @@ pub fn discover_companions(
 
         assert!(count <= COMPANION_COUNT_MAX, "companion list exceeded {COMPANION_COUNT_MAX}");
 
-        if id.is_empty() || existing.contains(id) {
+        if id.is_empty() || existing.contains(id) || config.exclude.contains(id) {
             continue;
         }
 
         // A local override (pyproject `[tool.uv.sources]` or a `PYTHONPATH_APPEND`)
         // is what actually runs, so it is indexed in preference to the `.venv` copy.
-        let package_root = resolve_override(portal_root, id)
+        let package_root = resolve_override(workspace_root, id)
             .map(|dir| package_subdir(&dir, id))
             .or_else(|| resolve_package(&roots, &id.replace('-', "_")));
 
@@ -162,20 +212,116 @@ pub fn discover_companions(
 /// The `[companions]` section read from `.constellation/config.toml`. A missing file
 /// yields the defaults (discovery on, the three company packages); a malformed file
 /// also yields the defaults: an optional config must never fail an index.
-fn load_config(portal_root: &Path) -> CompanionsConfig {
-    let path = portal_root.join(".constellation").join("config.toml");
+fn load_config(workspace_root: &Path) -> CompanionsConfig {
+    read_config_file(workspace_root).companions
+}
+
+/// The `[history]` configuration for the workspace at `workspace_root`, or the defaults
+/// when the config file is absent or omits the section.
+pub fn load_history_config(workspace_root: &Path) -> HistoryConfig {
+    read_config_file(workspace_root).history
+}
+
+/// The parsed `.constellation/config.toml`, or the defaults when it is absent or
+/// does not parse (a malformed file falls back to defaults rather than failing).
+fn read_config_file(workspace_root: &Path) -> ConfigFile {
+    let path = workspace_root.join(".constellation").join("config.toml");
 
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return CompanionsConfig::default();
+        return ConfigFile::default();
     };
 
-    toml::from_str::<ConfigFile>(&text)
-        .map(|file| file.companions)
-        .unwrap_or_default()
+    toml::from_str::<ConfigFile>(&text).unwrap_or_default()
+}
+
+/// The `[companions] repositories` map (package -> git url) for the workspace: the
+/// remotes companion git history is fetched from, since a `.venv` wheel records
+/// none. Empty when unconfigured.
+pub fn load_companion_repositories(workspace_root: &Path) -> BTreeMap<String, String> {
+    read_config_file(workspace_root).companions.repositories
+}
+
+/// The full-history checkout of `package`'s repository at the installed version,
+/// fetched from `url` into `.constellation/sources/` (cached after the first
+/// fetch), so its git history can be read without a local clone or a `.git` in the
+/// `.venv` install. `None` when the package is not installed, no tag matches the
+/// installed version, or the clone fails, in which case the companion's history is
+/// skipped rather than shown at a mismatched version.
+pub fn fetch_companion_history_repo(
+    workspace_root: &Path,
+    package: &str,
+    url: &str,
+) -> Option<PathBuf> {
+    assert!(!package.is_empty(), "package must not be empty");
+    assert!(!url.is_empty(), "repository url must not be empty");
+
+    let config = load_config(workspace_root);
+    let roots = site_packages_roots(workspace_root, &config);
+
+    let version = installed_version(&roots, package)?;
+
+    clone_full_at_tag(workspace_root, package, url, &version)
+}
+
+/// The installed version of `package` from its `*.dist-info` directory name among
+/// the site-packages `roots` (`django_spire-0.32.3` -> "0.32.3"), or `None` when
+/// the package is not installed.
+fn installed_version(roots: &[PathBuf], package: &str) -> Option<String> {
+    let import = package.replace('-', "_");
+    let dist_info = find_dist_info(roots, &import)?;
+
+    let name = dist_info.file_name()?.to_str()?;
+    let version = name.strip_suffix(".dist-info")?.rsplit_once('-')?.1;
+
+    if version.is_empty() {
+        return None;
+    }
+
+    Some(version.to_string())
+}
+
+/// A full clone of `url` at the tag matching `version` (trying `v{version}` then
+/// `{version}`) under `.constellation/sources/`, returning the checkout root so its
+/// whole history is readable. Reused when already present for that version, so the
+/// network is hit only the first time. `None` when git is unavailable, neither tag
+/// exists, or the clone fails.
+fn clone_full_at_tag(
+    workspace_root: &Path,
+    package: &str,
+    url: &str,
+    version: &str,
+) -> Option<PathBuf> {
+    if !git_available() {
+        return None;
+    }
+
+    let sources = workspace_root.join(".constellation").join("sources");
+
+    std::fs::create_dir_all(&sources).ok()?;
+
+    let dest = sources.join(sanitize_segment(&format!("{package}@{version}")));
+
+    if is_populated(&dest) {
+        return Some(dest);
+    }
+
+    let destination = dest.to_string_lossy().into_owned();
+
+    for tag in [format!("v{version}"), version.to_string()] {
+        if run_git(None, &["clone", "--branch", tag.as_str(), url, destination.as_str()]).is_some() {
+            return Some(dest);
+        }
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    eprintln!("constellation: no tag v{version} or {version} in {url} for '{package}'; skipping its history");
+
+    None
 }
 
 /// The set of project ids already in the store, so a companion shared across
-/// portals (or one a user indexed explicitly) is indexed once, not repointed.
+/// workspaces (or one a user indexed explicitly) is indexed once, not repointed.
 fn existing_project_ids(store: &Store) -> Result<FxHashSet<String>, IndexError> {
     let mut ids: FxHashSet<String> = FxHashSet::default();
 
@@ -188,16 +334,16 @@ fn existing_project_ids(store: &Store) -> Result<FxHashSet<String>, IndexError> 
 
 /// The candidate `site-packages` directories to search: the configured (or default
 /// `.venv`) virtual environment, plus an active `VIRTUAL_ENV` if one is set.
-fn site_packages_roots(portal_root: &Path, config: &CompanionsConfig) -> Vec<PathBuf> {
+fn site_packages_roots(workspace_root: &Path, config: &CompanionsConfig) -> Vec<PathBuf> {
     let mut venvs: Vec<PathBuf> = Vec::new();
 
     match &config.venv {
         Some(venv) => {
             let path = Path::new(venv);
 
-            venvs.push(if path.is_absolute() { path.to_path_buf() } else { portal_root.join(path) });
+            venvs.push(if path.is_absolute() { path.to_path_buf() } else { workspace_root.join(path) });
         }
-        None => venvs.push(portal_root.join(".venv")),
+        None => venvs.push(workspace_root.join(".venv")),
     }
 
     if let Ok(active) = std::env::var("VIRTUAL_ENV")
@@ -321,16 +467,16 @@ fn resolve_editable(site_packages: &Path, package: &str) -> Option<PathBuf> {
 }
 
 /// A local source directory that overrides the `.venv` copy of `package`, from
-/// the portal's `pyproject.toml` `[tool.uv.sources]` or a `PYTHONPATH_APPEND` in
+/// the workspace's `pyproject.toml` `[tool.uv.sources]` or a `PYTHONPATH_APPEND` in
 /// `development.env`/`.env`. The returned directory actually holds the package
 /// (`<import>/__init__.py`, or is the package itself), so a stale entry that no
 /// longer contains it does not shadow the install. `None` falls back to the
 /// virtual environment.
-fn resolve_override(portal_root: &Path, package: &str) -> Option<PathBuf> {
+fn resolve_override(workspace_root: &Path, package: &str) -> Option<PathBuf> {
     let import = package.replace('-', "_");
     let mut count: u32 = 0;
 
-    for candidate in override_candidates(portal_root, package) {
+    for candidate in override_candidates(workspace_root, package) {
         count += 1;
 
         assert!(count <= OVERRIDE_PATHS_MAX, "override candidate scan exceeded {OVERRIDE_PATHS_MAX}");
@@ -338,7 +484,7 @@ fn resolve_override(portal_root: &Path, package: &str) -> Option<PathBuf> {
         let resolved = if candidate.is_absolute() {
             candidate
         } else {
-            portal_root.join(candidate)
+            workspace_root.join(candidate)
         };
 
         if contains_package(&resolved, &import) {
@@ -351,24 +497,24 @@ fn resolve_override(portal_root: &Path, package: &str) -> Option<PathBuf> {
 
 /// The candidate override directories for `package`, most specific first: a
 /// `[tool.uv.sources]` path, then every `PYTHONPATH_APPEND`/`PYTHONPATH` entry.
-fn override_candidates(portal_root: &Path, package: &str) -> Vec<PathBuf> {
+fn override_candidates(workspace_root: &Path, package: &str) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
-    if let Some(path) = uv_source_path(portal_root, package) {
+    if let Some(path) = uv_source_path(workspace_root, package) {
         candidates.push(path);
     }
 
-    candidates.extend(pythonpath_dirs(portal_root));
+    candidates.extend(pythonpath_dirs(workspace_root));
 
     candidates
 }
 
-/// The local path a portal's `pyproject.toml` pins `package` to under
+/// The local path a workspace's `pyproject.toml` pins `package` to under
 /// `[tool.uv.sources]` (`{ path = "..." }`), or `None` when the file, the section,
 /// the package, or a `path` key is absent. A git or workspace source has no local
 /// directory here and yields `None`, leaving the `.venv` copy in force.
-fn uv_source_path(portal_root: &Path, package: &str) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(portal_root.join("pyproject.toml")).ok()?;
+fn uv_source_path(workspace_root: &Path, package: &str) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(workspace_root.join("pyproject.toml")).ok()?;
     let value: toml::Value = toml::from_str(&text).ok()?;
 
     let sources = value.get("tool")?.get("uv")?.get("sources")?;
@@ -384,13 +530,13 @@ fn uv_source_path(portal_root: &Path, package: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
-/// Every directory named by a `PYTHONPATH_APPEND` or `PYTHONPATH` in the portal's
+/// Every directory named by a `PYTHONPATH_APPEND` or `PYTHONPATH` in the workspace's
 /// `development.env` or `.env`, split on the platform path separator.
-fn pythonpath_dirs(portal_root: &Path) -> Vec<PathBuf> {
+fn pythonpath_dirs(workspace_root: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
 
     for file in ["development.env", ".env"] {
-        let Ok(text) = std::fs::read_to_string(portal_root.join(file)) else {
+        let Ok(text) = std::fs::read_to_string(workspace_root.join(file)) else {
             continue;
         };
 
@@ -468,64 +614,64 @@ struct VcsInfo {
     vcs: String,
 }
 
-/// The extra versions configured under `[companions] versions = [...]`, each a
-/// `"package@ref"` spec, materialized to on-disk checkouts and returned as
-/// reference-only targets. The git ref is checked out of the repository the
-/// installed companion came from (an editable clone, or the url pip recorded in
-/// `direct_url.json`), rooted exactly like the `.venv` copy so only the project id
-/// differs by the `@ref` suffix.
+/// The extra versions configured under `[companions] versions` (a map of package
+/// to git ref, the same shape as `repositories`), each checked out on disk and
+/// returned as a reference-only target. The ref is taken from the repository the
+/// companion resolves to (a local override, the installed checkout, or the
+/// configured `repositories` url), rooted like the `.venv` copy so only the project
+/// id differs by the `@ref` suffix.
 ///
-/// Best-effort like [`discover_companions`]: a malformed spec, an unlocatable
-/// repository, a missing `git`, or a failed checkout is skipped with a message,
-/// never fatal. A spec already in the store, or repeated in the config, is skipped
-/// so a re-index neither duplicates nor re-checks-out. The caller indexes each
-/// target, marks it reference-only, then runs [`crate::link_constellation`].
+/// Best-effort like [`discover_companions`]: an unlocatable repository, a missing
+/// `git`, or a failed checkout is skipped with a message, never fatal. A version
+/// already in the store is skipped so a re-index neither duplicates nor
+/// re-checks-out. The caller indexes each target, marks it reference-only, then
+/// runs [`crate::link_constellation`].
 pub fn discover_versions(
     store: &Store,
-    portal_root: &Path,
+    workspace_root: &Path,
 ) -> Result<Vec<CompanionTarget>, IndexError> {
-    assert!(portal_root.is_dir(), "portal root must be a directory: {portal_root:?}");
+    assert!(workspace_root.is_dir(), "workspace root must be a directory: {workspace_root:?}");
 
-    let config = load_config(portal_root);
+    let config = load_config(workspace_root);
 
     if !config.enabled || config.versions.is_empty() {
         return Ok(Vec::new());
     }
 
-    let roots = site_packages_roots(portal_root, &config);
+    let roots = site_packages_roots(workspace_root, &config);
     let existing = existing_project_ids(store)?;
 
     let mut targets: Vec<CompanionTarget> = Vec::with_capacity(config.versions.len());
     let mut seen: FxHashSet<String> = FxHashSet::default();
     let mut count: u32 = 0;
 
-    for spec in &config.versions {
+    for (package, reference) in &config.versions {
         count += 1;
 
-        assert!(count <= COMPANION_COUNT_MAX, "version list exceeded {COMPANION_COUNT_MAX}");
+        assert!(count <= COMPANION_COUNT_MAX, "version map exceeded {COMPANION_COUNT_MAX}");
 
-        if existing.contains(spec) || !seen.insert(spec.clone()) {
+        if package.is_empty() || reference.is_empty() {
             continue;
         }
 
-        let Some((package, reference)) = split_version(spec) else {
-            eprintln!("constellation: skipping version '{spec}': expected the form package@ref");
+        let spec = format!("{package}@{reference}");
 
+        if existing.contains(&spec) || !seen.insert(spec.clone()) {
             continue;
-        };
+        }
 
-        let Some(repo) = locate_repo(portal_root, &roots, package) else {
+        let Some(repo) = locate_repo(workspace_root, &roots, package) else {
             eprintln!(
-                "constellation: skipping '{spec}': no git repository found for '{package}' in the \
-                 virtual environment (install it editable or from git to compare other refs)",
+                "constellation: skipping '{spec}': no repository for '{package}' (set its \
+                 [companions] repositories url, or install it editable or from git)",
             );
 
             continue;
         };
 
-        if let Some(package_root) = materialize_version(portal_root, spec, reference, &repo) {
+        if let Some(package_root) = materialize_version(workspace_root, &spec, reference, &repo) {
             targets.push(CompanionTarget {
-                project_id: spec.clone(),
+                project_id: spec,
                 package_root,
                 reference_only: true,
             });
@@ -535,27 +681,16 @@ pub fn discover_versions(
     Ok(targets)
 }
 
-/// A `"package@ref"` spec split into its package name and git ref, or `None` when
-/// either side is empty or the spec carries the `::` id separator. The split is on
-/// the first `@`, so a ref may itself contain `/` (`v1/base`) or a later `@`.
-fn split_version(spec: &str) -> Option<(&str, &str)> {
-    let (package, reference) = spec.split_once('@')?;
-
-    if package.is_empty() || reference.is_empty() || spec.contains("::") {
-        return None;
-    }
-
-    Some((package, reference))
-}
-
 /// The git repository the `package` came from. A local override (a pyproject
 /// `[tool.uv.sources]` path, or a `PYTHONPATH_APPEND` directory) wins first, so
 /// other refs are taken from the working copy. Otherwise the installed copy's
 /// checkout on disk (editable or local-path install), else the git url recorded in
-/// `direct_url.json` for a VCS install. `None` for a plain index (wheel) install,
-/// which carries no repository to take another ref from.
-fn locate_repo(portal_root: &Path, roots: &[PathBuf], package: &str) -> Option<RepoSource> {
-    if let Some(dir) = resolve_override(portal_root, package)
+/// `direct_url.json` for a VCS install, else the configured (or default)
+/// `[companions] repositories` url for the package, the same remote companion
+/// history uses, so a plain wheel install can still check out other refs. `None`
+/// only when none of those names a repository.
+fn locate_repo(workspace_root: &Path, roots: &[PathBuf], package: &str) -> Option<RepoSource> {
+    if let Some(dir) = resolve_override(workspace_root, package)
         && let Some(repo) = git_repo_root(&dir)
     {
         return Some(RepoSource::Local(repo));
@@ -563,14 +698,24 @@ fn locate_repo(portal_root: &Path, roots: &[PathBuf], package: &str) -> Option<R
 
     let import = package.replace('-', "_");
 
-    let package_dir = resolve_package(roots, &import)?;
-    let in_site_packages = roots.iter().any(|root| package_dir.starts_with(root));
+    if let Some(package_dir) = resolve_package(roots, &import) {
+        let in_site_packages = roots.iter().any(|root| package_dir.starts_with(root));
 
-    if in_site_packages {
-        repo_from_direct_url(roots, &import)
-    } else {
-        git_repo_root(&package_dir).map(RepoSource::Local)
+        let from_install = if in_site_packages {
+            repo_from_direct_url(roots, &import)
+        } else {
+            git_repo_root(&package_dir).map(RepoSource::Local)
+        };
+
+        if from_install.is_some() {
+            return from_install;
+        }
     }
+
+    load_config(workspace_root)
+        .repositories
+        .get(package)
+        .map(|url| RepoSource::Remote(url.clone()))
 }
 
 /// The repository named by the package's `direct_url.json`: a `Remote` for a git
@@ -674,11 +819,11 @@ fn git_repo_root(start: &Path) -> Option<PathBuf> {
 }
 
 /// The on-disk package directory for a version spec, checked out at `reference`
-/// under `<portal_root>/.constellation/sources/<sanitized-spec>/` with the `git`
+/// under `<workspace_root>/.constellation/sources/<sanitized-spec>/` with the `git`
 /// CLI. `None` when git is unavailable or the checkout fails, so the version is
 /// skipped rather than failing the index.
 fn materialize_version(
-    portal_root: &Path,
+    workspace_root: &Path,
     spec: &str,
     reference: &str,
     repo: &RepoSource,
@@ -689,7 +834,7 @@ fn materialize_version(
         return None;
     }
 
-    let sources = portal_root.join(".constellation").join("sources");
+    let sources = workspace_root.join(".constellation").join("sources");
 
     std::fs::create_dir_all(&sources).ok()?;
 
@@ -861,18 +1006,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_version_parses_package_and_ref() {
-        assert_eq!(split_version("django-spire@refactor/next"), Some(("django-spire", "refactor/next")));
-        assert_eq!(split_version("django-glue@v1.2.0"), Some(("django-glue", "v1.2.0")));
-        assert_eq!(split_version("pkg@a@b"), Some(("pkg", "a@b")), "splits on the first @ only");
+    fn config_defaults_when_the_file_is_empty() {
+        let config: ConfigFile = toml::from_str("").unwrap();
+
+        assert!(config.companions.enabled);
+        assert_eq!(config.companions.packages.len(), COMPANIONS_DEFAULT.len());
+        assert!(config.companions.exclude.is_empty());
+        assert_eq!(config.companions.repositories.len(), COMPANION_REPOSITORIES_DEFAULT.len());
+        assert!(config.companions.repositories.contains_key("django-spire"));
+        assert!(config.history.enabled);
+        assert!(config.history.symbols);
+        assert!(config.history.companions);
+        assert_eq!(config.history.commits_max, crate::history::HISTORY_COMMITS_MAX);
     }
 
     #[test]
-    fn split_version_rejects_malformed_specs() {
-        assert_eq!(split_version("no-at-sign"), None, "a spec needs an @ref");
-        assert_eq!(split_version("@ref"), None, "an empty package is rejected");
-        assert_eq!(split_version("pkg@"), None, "an empty ref is rejected");
-        assert_eq!(split_version("a::b@ref"), None, "the id separator is rejected");
+    fn config_parses_exclude_and_history_overrides() {
+        let text = "\
+[companions]
+exclude = [\"robit\"]
+
+[history]
+enabled = false
+symbols = true
+companions = false
+commits_max = 5
+";
+        let config: ConfigFile = toml::from_str(text).unwrap();
+
+        assert_eq!(config.companions.exclude, vec!["robit".to_string()]);
+        assert!(config.companions.enabled, "untouched fields keep their defaults");
+        assert!(!config.history.enabled);
+        assert!(config.history.symbols);
+        assert!(!config.history.companions);
+        assert_eq!(config.history.commits_max, 5);
+    }
+
+    #[test]
+    fn config_parses_companion_repositories() {
+        let text = "[companions.repositories]\ndjango-spire = \"https://example.com/django-spire\"\n";
+        let config: ConfigFile = toml::from_str(text).unwrap();
+
+        assert_eq!(
+            config.companions.repositories.get("django-spire").map(String::as_str),
+            Some("https://example.com/django-spire"),
+        );
+    }
+
+    #[test]
+    fn installed_version_reads_the_dist_info_name() {
+        let site = tempfile::tempdir().unwrap();
+        std::fs::create_dir(site.path().join("django_spire-0.32.3.dist-info")).unwrap();
+
+        let roots = vec![site.path().to_path_buf()];
+
+        assert_eq!(installed_version(&roots, "django-spire").as_deref(), Some("0.32.3"));
+        assert_eq!(installed_version(&roots, "missing"), None);
+    }
+
+    #[test]
+    fn locate_repo_falls_back_to_the_configured_repository() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".constellation")).unwrap();
+        std::fs::write(
+            workspace.path().join(".constellation").join("config.toml"),
+            "[companions.repositories]\ndjango-spire = \"https://example.com/spire\"\n",
+        )
+        .unwrap();
+
+        let repo = locate_repo(workspace.path(), &[], "django-spire");
+
+        assert!(
+            matches!(repo, Some(RepoSource::Remote(url)) if url == "https://example.com/spire"),
+            "a wheel-only package falls back to its configured repository url",
+        );
+    }
+
+    #[test]
+    fn config_parses_versions_map() {
+        let text = "[companions.versions]\ndjango-spire = \"v1/base\"\n";
+        let config: ConfigFile = toml::from_str(text).unwrap();
+
+        assert_eq!(config.companions.versions.get("django-spire").map(String::as_str), Some("v1/base"));
     }
 
     #[test]
@@ -964,10 +1179,10 @@ mod tests {
 
         let roots = vec![site.path().to_path_buf()];
 
-        // A portal with no override, so resolution falls through to the .venv copy.
-        let portal = tempfile::tempdir().unwrap();
+        // A workspace with no override, so resolution falls through to the .venv copy.
+        let workspace = tempfile::tempdir().unwrap();
 
-        match locate_repo(portal.path(), &roots, "django-spire") {
+        match locate_repo(workspace.path(), &roots, "django-spire") {
             Some(RepoSource::Local(root)) => assert_eq!(root, clone_root, "the editable clone is the repo root"),
             other => panic!("expected the local editable clone, got {other:?}"),
         }
@@ -993,12 +1208,12 @@ mod tests {
         assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "init"]).is_some(), "git commit");
         assert!(run_git(Some(origin_root), &["tag", "v1"]).is_some(), "git tag");
 
-        let portal = tempfile::tempdir().unwrap();
-        std::fs::create_dir(portal.path().join(".constellation")).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".constellation")).unwrap();
 
         let repo = RepoSource::Local(origin_root.to_path_buf());
 
-        let package = materialize_version(portal.path(), "django-spire@v1", "v1", &repo)
+        let package = materialize_version(workspace.path(), "django-spire@v1", "v1", &repo)
             .expect("a worktree is materialized from the local repo");
 
         assert!(package.ends_with("django_spire"), "resolves to the package dir, got {package:?}");
@@ -1015,54 +1230,54 @@ mod tests {
 
     #[test]
     fn uv_source_path_reads_a_local_path_dependency() {
-        let portal = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
         std::fs::write(
-            portal.path().join("pyproject.toml"),
+            workspace.path().join("pyproject.toml"),
             "[tool.uv.sources]\ndjango-spire = { path = \"../django-spire\", editable = true }\n",
         )
         .unwrap();
 
         assert_eq!(
-            uv_source_path(portal.path(), "django-spire"),
+            uv_source_path(workspace.path(), "django-spire"),
             Some(PathBuf::from("../django-spire")),
             "the uv.sources path is read",
         );
 
-        assert_eq!(uv_source_path(portal.path(), "absent-pkg"), None, "an unlisted package has none");
+        assert_eq!(uv_source_path(workspace.path(), "absent-pkg"), None, "an unlisted package has none");
     }
 
     #[test]
     fn resolve_override_prefers_a_pythonpath_append_directory() {
-        let portal = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
 
         let clone = tempfile::tempdir().unwrap();
         std::fs::create_dir(clone.path().join("django_spire")).unwrap();
         std::fs::write(clone.path().join("django_spire").join("__init__.py"), "").unwrap();
 
         std::fs::write(
-            portal.path().join("development.env"),
+            workspace.path().join("development.env"),
             format!("PYTHONPATH_APPEND={}\n", clone.path().to_string_lossy()),
         )
         .unwrap();
 
-        let resolved = resolve_override(portal.path(), "django-spire").expect("the override resolves");
+        let resolved = resolve_override(workspace.path(), "django-spire").expect("the override resolves");
 
         assert_eq!(resolved, clone.path(), "the PYTHONPATH_APPEND directory holding the package wins");
     }
 
     #[test]
     fn resolve_override_ignores_a_directory_without_the_package() {
-        let portal = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
         let empty = tempfile::tempdir().unwrap();
 
         std::fs::write(
-            portal.path().join("development.env"),
+            workspace.path().join("development.env"),
             format!("PYTHONPATH_APPEND={}\n", empty.path().to_string_lossy()),
         )
         .unwrap();
 
         assert!(
-            resolve_override(portal.path(), "django-spire").is_none(),
+            resolve_override(workspace.path(), "django-spire").is_none(),
             "a stale entry that no longer holds the package does not override",
         );
     }

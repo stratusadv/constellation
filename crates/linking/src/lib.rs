@@ -48,6 +48,13 @@ impl ProjectLink {
 pub trait LinkContext {
     /// The nodes with the given simple name, across all indexed projects.
     fn exports_by_name(&self, name: &str) -> Vec<Arc<Node>>;
+
+    /// The project a top-level import package resolves to, mapping the installed
+    /// package name an import spells (`django_spire`) to the companion project
+    /// indexed from it (`django-spire`), or `None` when no indexed project owns
+    /// that package. Lets a re-exported or package-rooted import link to the right
+    /// project when the defining file path alone gives no module-path evidence.
+    fn project_for_package(&self, package: &str) -> Option<&str>;
 }
 
 /// The linker that ties pending imports to symbols exported by other projects.
@@ -86,15 +93,39 @@ impl ImportLinker {
             return None;
         }
 
-        let index = candidates
-            .iter()
-            .position(|node| module_matches(&pending.module, &node.file_path))?;
+        if let Some(index) =
+            candidates.iter().position(|node| module_matches(&pending.module, &node.file_path))
+        {
+            assert!(index < candidates.len(), "matched index stays within candidates");
 
-        assert!(index < candidates.len(), "matched index stays within candidates");
+            let node = candidates.swap_remove(index);
 
-        let node = candidates.swap_remove(index);
+            return Some(make_link(pending, &node, 0.85));
+        }
 
-        Some(make_link(pending, &node, 0.85))
+        // Without a defining-file path match, fall back to package-to-project
+        // evidence: the import's top-level package names a companion project
+        // directly (`django_spire.contrib.seeding` -> the django-spire project). A
+        // re-export (the symbol re-exported from a module deeper than the imported
+        // package) or a stripped package root leaves no path-suffix overlap for
+        // `module_matches`, yet the package identity still pins the project. Scope
+        // candidates to that project and link a sole export; more than one stays
+        // unlinked, the same no-false-edge discipline the path match keeps.
+        let package = pending.module.split('.').next().unwrap_or("");
+
+        if !package.is_empty()
+            && let Some(project) = context.project_for_package(package)
+        {
+            candidates.retain(|node| node.project_id.as_str() == project);
+
+            if candidates.len() == 1 {
+                let node = candidates.swap_remove(0);
+
+                return Some(make_link(pending, &node, 0.8));
+            }
+        }
+
+        None
     }
 }
 

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use constellation_graph::{EdgeKind, Node, NodeId, NodeKind, ProjectId};
+use constellation_graph::{EdgeKind, Language, Node, NodeId, NodeKind, ProjectId};
 use constellation_store::{FileRow, LinkEdge, ProjectRow, Store, StoreError};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
@@ -45,6 +45,14 @@ const SEARCH_FETCH_MIN: u32 = 64;
 /// The default number of callers/callees listed per symbol.
 const RELATED_LIMIT_DEFAULT: u32 = 25;
 
+/// The breadth-first hop bound when walking incoming `Extends` edges for
+/// `constellation_subclasses`, far past any real inheritance depth.
+const SUBCLASS_HOPS_MAX: u32 = 16;
+
+/// The number of definition seeds `constellation_explore` checks for test coverage
+/// before flagging the uncovered ones, kept small so the note stays cheap.
+const EXPLORE_COVERAGE_CHECK_MAX: usize = 8;
+
 /// The innermost-symbol results `constellation_at` shows for one file:line.
 const AT_RESULTS_MAX: usize = 5;
 
@@ -53,6 +61,13 @@ const CALL_SITE_SNIPPET_CHARS_MAX: usize = 160;
 
 /// The default number of cross-project link edges `links` lists before truncating.
 const LINKS_LIMIT_DEFAULT: u32 = 100;
+
+/// The default number of commits `history` lists (newest first) before truncating.
+const HISTORY_LIMIT_DEFAULT: u32 = 40;
+
+/// The default number of symbols `as_of` lists before truncating: a whole app's
+/// surface at a point in time, so larger than the per-commit limit.
+const AS_OF_LIMIT_DEFAULT: u32 = 200;
 
 /// A hard cap on link edges fetched for one `links` call.
 const LINKS_FETCH_MAX: u32 = 2_000;
@@ -93,6 +108,46 @@ const IMPACT_LINES_MAX: usize = 200;
 /// traversal still counts every caller past this; only the L1 listing is
 /// sampled, with the remainder rolled into the "(+N more)" tail.
 const IMPACT_LEVEL_LINES_MAX: usize = 40;
+
+/// The method names dispatched dynamically across the whole codebase (Django
+/// queryset/manager builtins, model lifecycle hooks, and dict/list/str methods),
+/// for which the name-global dark-caller count is workspace-wide dispatch noise,
+/// not hidden callers of any one definition. `qs.filter()` / `obj.save()` /
+/// `data.get()` appear thousands of times with no statically-bound receiver, so a
+/// model method named `save` would otherwise report every `.save()` in the
+/// constellation as its dark callers.
+const DISPATCH_METHOD_NAMES: &[&str] = &[
+    "add", "aggregate", "all", "annotate", "append", "bulk_create", "bulk_update", "clean",
+    "clean_fields", "count", "create", "defer", "delete", "distinct", "exclude", "exists",
+    "extend", "filter", "first", "full_clean", "get", "get_or_create", "items", "keys", "last",
+    "latest", "none", "only", "order_by", "pop", "prefetch_related", "refresh_from_db", "remove",
+    "save", "select_related", "setdefault", "update", "update_or_create", "values", "values_list",
+];
+
+/// Whether a symbol name is a codebase-wide dynamic-dispatch method, so its
+/// name-global unresolved count is noise rather than a dark-caller signal.
+fn is_dispatch_method_name(name: &str) -> bool {
+    DISPATCH_METHOD_NAMES.contains(&name)
+}
+
+#[cfg(test)]
+mod dispatch_name_tests {
+    use super::is_dispatch_method_name;
+
+    #[test]
+    fn common_dispatch_methods_are_recognized() {
+        for name in ["get", "save", "filter", "create", "delete", "all", "values", "refresh_from_db"] {
+            assert!(is_dispatch_method_name(name), "{name:?} is a codebase-wide dispatch method");
+        }
+    }
+
+    #[test]
+    fn distinctive_names_are_not_dispatch() {
+        for name in ["recalculate_totals", "generate_po_number", "Inventory", "PurchaseOrder"] {
+            assert!(!is_dispatch_method_name(name), "{name:?} is distinctive, a real dark-caller signal");
+        }
+    }
+}
 
 /// The default number of distinct files explore includes source from.
 const EXPLORE_FILES_DEFAULT: u32 = 8;
@@ -296,7 +351,7 @@ pub struct FilesArgs {
     pub project: Option<String>,
     /// List the files whose path contains this substring (case-insensitive),
     /// instead of the aggregated package summary (e.g. "models.py" for every
-    /// models file, "harvest/" for one app). Combine with `project` to scope it.
+    /// models file, "billing/" for one app). Combine with `project` to scope it.
     pub pattern: Option<String>,
 }
 
@@ -339,6 +394,48 @@ pub struct PathArgs {
     pub to: String,
 }
 
+/// The arguments for `constellation_history`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct HistoryArgs {
+    /// The file or app to trace over time, as a path substring (e.g.
+    /// "orders/models.py" for one file, "orders/" for an app, "models.py" for
+    /// every models file). Omit to list the most recent commits across the
+    /// whole constellation.
+    pub target: Option<String>,
+    /// Restrict to one project by its id or display name.
+    pub project: Option<String>,
+    /// Maximum commits to list, newest first.
+    pub limit: Option<u32>,
+}
+
+/// The arguments for `constellation_symbol_history`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SymbolHistoryArgs {
+    /// The symbol to trace: a bare name ("Order", "list_orders") or a qualified
+    /// name ("orders.Order.total"). Matches a definition's name or qualified name,
+    /// or a longer qualified name ending in it (so "Order" finds "orders.Order").
+    pub symbol: String,
+    /// Restrict to one project by its id or display name.
+    pub project: Option<String>,
+    /// Maximum change rows to list, newest first.
+    pub limit: Option<u32>,
+}
+
+/// The arguments for `constellation_as_of`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AsOfArgs {
+    /// The point in time to reconstruct: a commit hash (full or a prefix) or a
+    /// date "YYYY-MM-DD". The symbols alive at that point are returned.
+    pub at: String,
+    /// Restrict to one project by its id or display name. Recommended with a
+    /// commit hash, which is only meaningful within its own repository.
+    pub project: Option<String>,
+    /// Restrict to files whose path contains this substring (a file or an app).
+    pub path: Option<String>,
+    /// Maximum symbols to list.
+    pub limit: Option<u32>,
+}
+
 /// The arguments for `constellation_at`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AtArgs {
@@ -347,6 +444,26 @@ pub struct AtArgs {
     pub file: String,
     /// 1-based line number (e.g. from a traceback frame or a grep hit).
     pub line: u32,
+}
+
+/// The arguments for `constellation_orphans`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OrphansArgs {
+    /// The project to scan (its id or display name). Required: dead-code candidates
+    /// are scoped to one project so the scan stays bounded and meaningful.
+    pub project: Option<String>,
+    /// Maximum candidates to list.
+    pub limit: Option<u32>,
+}
+
+/// The arguments for `constellation_changed`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChangedArgs {
+    /// The git base to diff the working tree against. Defaults to `HEAD` (uncommitted
+    /// and staged edits); pass a branch or ref (e.g. `main`) for a whole-branch diff.
+    pub base: Option<String>,
+    /// Maximum changed symbols to list per project.
+    pub limit: Option<u32>,
 }
 
 /// The in-process cache for `explore`: the node list plus the undirected adjacency
@@ -405,9 +522,18 @@ impl ExploreCache {
 /// starves the runtime's event loop, and a panicking handler is caught instead
 /// of left to hang the client. The explore cache sits behind its own lock,
 /// invalidated by a monotonic generation counter the re-indexing watcher bumps.
+/// The reply every tool returns when the server has no database, i.e. it was
+/// launched (typically via a global MCP registration) outside any indexed
+/// project: a clear "nothing here" message instead of a hard failure to connect.
+const NO_INDEX_MESSAGE: &str =
+    "no constellation index for this working directory (not an indexed Django project). \
+     Run `constellation init` here, or open a project that has a .constellation/index.db.";
+
 #[derive(Clone)]
 pub struct ConstellationServer {
-    store: Arc<Mutex<Store>>,
+    /// The graph database, or `None` when serving outside any indexed project
+    /// (an unavailable server): every tool then returns [`NO_INDEX_MESSAGE`].
+    store: Arc<Mutex<Option<Store>>>,
     explore_cache: Arc<Mutex<Option<ExploreCache>>>,
     generation: Arc<AtomicU64>,
 }
@@ -416,7 +542,19 @@ impl ConstellationServer {
     /// A new server wrapping the given store.
     pub fn new(store: Store) -> Self {
         Self {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(Mutex::new(Some(store))),
+            explore_cache: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// A server with no database: it completes the MCP handshake and answers
+    /// every tool with [`NO_INDEX_MESSAGE`], rather than failing to start. Built by
+    /// [`serve_unavailable`] when `serve` is launched outside any indexed project,
+    /// so a global registration stays quiet in non-Django repos instead of erroring.
+    pub fn unavailable() -> Self {
+        Self {
+            store: Arc::new(Mutex::new(None)),
             explore_cache: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
         }
@@ -429,15 +567,23 @@ impl ConstellationServer {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn with_store<T>(
+    /// The result text of `action` against the store, contained so a panic becomes
+    /// an error response and store work never starves the runtime. Returns
+    /// [`NO_INDEX_MESSAGE`] unchanged when the server has no database (an
+    /// unavailable server), so every text tool degrades to a clear message rather
+    /// than erroring.
+    fn with_store(
         &self,
-        action: impl FnOnce(&Store) -> Result<T, StoreError>,
-    ) -> Result<T, ErrorData> {
+        action: impl FnOnce(&Store) -> Result<String, StoreError>,
+    ) -> Result<String, ErrorData> {
         run_blocking(|| {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 let store = lock_recover(&self.store);
 
-                action(&store)
+                match store.as_ref() {
+                    Some(store) => action(store),
+                    None => Ok(NO_INDEX_MESSAGE.to_string()),
+                }
             }));
 
             match result {
@@ -475,9 +621,14 @@ impl ConstellationServer {
         let seed_positions: Vec<usize>;
         let roots: FxHashMap<String, String>;
         let node_count: usize;
+        let coverage_note: String;
 
         {
-            let store = lock_recover(&self.store);
+            let store_guard = lock_recover(&self.store);
+
+            let Some(store) = store_guard.as_ref() else {
+                return Ok(NO_INDEX_MESSAGE.to_string());
+            };
 
             let mut seeds = store
                 .search_nodes(query, EXPLORE_SYMBOLS_MAX)
@@ -490,7 +641,7 @@ impl ConstellationServer {
             }
 
             let content_seeds =
-                content_seed_nodes(&store, query).map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
+                content_seed_nodes(store, query).map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
 
             let mut seed_ids: FxHashSet<String> = seeds.iter().map(|node| node.id.as_str().to_string()).collect();
 
@@ -504,11 +655,13 @@ impl ConstellationServer {
                 return Ok(format!("no symbols matching {query:?}"));
             }
 
+            coverage_note = explore_coverage_note(store, &seeds);
+
             let generation = self.generation.load(Ordering::Relaxed);
             let fresh = cache_guard.as_ref().is_some_and(|cached| cached.generation == generation);
 
             if !fresh {
-                let built = ExploreCache::build(&store, generation)
+                let built = ExploreCache::build(store, generation)
                     .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
 
                 *cache_guard = Some(built);
@@ -523,7 +676,7 @@ impl ConstellationServer {
 
             node_count = cache.nodes.len();
 
-            roots = project_roots(&store)
+            roots = project_roots(store)
                 .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
         }
 
@@ -537,7 +690,7 @@ impl ConstellationServer {
         let flow = flow_section(&cache.nodes, &cache.out_edges, &seed_positions, query);
         let body = render_ranked(&cache.nodes, &ranked, &roots, max_files, budget, query, outline);
 
-        Ok(format!("{flow}{body}"))
+        Ok(format!("{flow}{coverage_note}{body}"))
     }
 
     /// The handler for one `path` query, contained like [`ConstellationServer::explore`] so
@@ -565,16 +718,20 @@ impl ConstellationServer {
         let to_ids: Vec<String>;
 
         {
-            let store = lock_recover(&self.store);
+            let store_guard = lock_recover(&self.store);
 
-            from_ids = seed_ids(&store, from)?;
-            to_ids = seed_ids(&store, to)?;
+            let Some(store) = store_guard.as_ref() else {
+                return Ok(NO_INDEX_MESSAGE.to_string());
+            };
+
+            from_ids = seed_ids(store, from)?;
+            to_ids = seed_ids(store, to)?;
 
             let generation = self.generation.load(Ordering::Relaxed);
             let fresh = cache_guard.as_ref().is_some_and(|cached| cached.generation == generation);
 
             if !fresh {
-                let built = ExploreCache::build(&store, generation)
+                let built = ExploreCache::build(store, generation)
                     .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
 
                 *cache_guard = Some(built);
@@ -624,6 +781,45 @@ impl ConstellationServer {
     #[tool(description = "Index health: project, node, edge, and cross-project link counts, plus working-tree staleness.")]
     fn constellation_status(&self) -> Result<CallToolResult, ErrorData> {
         let text = self.with_store(status_text)?;
+
+        Ok(text_result(text))
+    }
+
+    #[tool(description = "How a file or app changed over time, from indexed git history: the commits that touched a path (newest first) with per-commit churn (+lines/-lines, files changed) and author. Pass target=<path substring> (a file like \"orders/models.py\", or an app like \"orders/\"); omit target for recent activity across the constellation. project=<id or name> scopes it. Requires `constellation history` to have been run; empty otherwise.")]
+    fn constellation_history(
+        &self,
+        Parameters(args): Parameters<HistoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = args.limit.unwrap_or(HISTORY_LIMIT_DEFAULT);
+        let text = self.with_store(|store| {
+            history_text(store, args.target.as_deref(), args.project.as_deref(), limit)
+        })?;
+
+        Ok(text_result(text))
+    }
+
+    #[tool(description = "How a symbol changed over time, from indexed git history: each commit where the symbol (a function, method, class, Django model/view/route, or model field) was added, modified (signature changed), or removed, newest first, with date and signature. Pass symbol=<name or qualified name>. project=<id or name> scopes it. Requires `constellation history --symbols` to have been run; empty otherwise.")]
+    fn constellation_symbol_history(
+        &self,
+        Parameters(args): Parameters<SymbolHistoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = args.limit.unwrap_or(HISTORY_LIMIT_DEFAULT);
+        let text = self.with_store(|store| {
+            symbol_history_text(store, &args.symbol, args.project.as_deref(), limit)
+        })?;
+
+        Ok(text_result(text))
+    }
+
+    #[tool(description = "The symbols that existed at a point in the past, reconstructed from indexed symbol history: pass at=<commit hash or YYYY-MM-DD> to list the functions, methods, classes, Django models/views/routes, and fields alive then (with their signatures at that time), grouped by file. project=<id or name> scopes it (recommended for a commit hash); path=<substring> narrows to a file or app. Requires `constellation history --symbols`; answers \"what did this look like at version X\".")]
+    fn constellation_as_of(
+        &self,
+        Parameters(args): Parameters<AsOfArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = args.limit.unwrap_or(AS_OF_LIMIT_DEFAULT);
+        let text = self.with_store(|store| {
+            as_of_text(store, &args.at, args.project.as_deref(), args.path.as_deref(), limit)
+        })?;
 
         Ok(text_result(text))
     }
@@ -681,6 +877,50 @@ impl ConstellationServer {
         Ok(text_result(text))
     }
 
+    #[tool(description = "The tests that cover a symbol: TestCase classes bound to it by the XTestCase->X naming convention, plus test functions/methods that call it. '(no covering tests)' when none, so before a change you know what to run and whether the symbol is guarded. Pass a symbol name or Owner.member.")]
+    fn constellation_tests(
+        &self,
+        Parameters(args): Parameters<SymbolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = args.limit.unwrap_or(RELATED_LIMIT_DEFAULT);
+        let text = self.with_store(|store| tests_text(store, &args.symbol, limit))?;
+
+        Ok(text_result(text))
+    }
+
+    #[tool(description = "The transitive subclasses of a base class or mixin: every type that extends it, directly or through intermediate bases, across projects (e.g. every model using HistoryModelMixin, every BaseDjangoModelService subclass). Pass the base name.")]
+    fn constellation_subclasses(
+        &self,
+        Parameters(args): Parameters<SymbolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = args.limit.unwrap_or(RELATED_LIMIT_DEFAULT);
+        let text = self.with_store(|store| subclasses_text(store, &args.symbol, limit))?;
+
+        Ok(text_result(text))
+    }
+
+    #[tool(description = "Candidate dead code in one project: definitions (functions, methods, classes, models) nothing calls, imports, instantiates, tests, relates to, or extends. Framework-reached symbols (tests, migrations, __init__, dunder methods, app configs) are filtered out, but verify each before deleting - a symbol reached only by a runtime/string convention can still surface. Pass project=<id or name>.")]
+    fn constellation_orphans(
+        &self,
+        Parameters(args): Parameters<OrphansArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = args.limit.unwrap_or(RELATED_LIMIT_DEFAULT);
+        let text = self.with_store(|store| orphans_text(store, args.project.as_deref(), limit))?;
+
+        Ok(text_result(text))
+    }
+
+    #[tool(description = "What changed and its blast radius: the symbols overlapping the working-tree (plus staged) diff against a base (default HEAD; pass base=<ref> like base=main for a whole-branch diff), grouped by project, each with its direct caller count and a [no covering tests] flag. The edit-impact view git diff alone cannot give. Runs git in each indexed repo.")]
+    fn constellation_changed(
+        &self,
+        Parameters(args): Parameters<ChangedArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = args.limit.unwrap_or(RELATED_LIMIT_DEFAULT);
+        let text = self.with_store(|store| changed_text(store, args.base.as_deref(), limit))?;
+
+        Ok(text_result(text))
+    }
+
     #[tool(description = "Transitive callers of a symbol: its blast radius before a change, breadth-first to a depth.")]
     fn constellation_impact(
         &self,
@@ -706,7 +946,7 @@ impl ConstellationServer {
         self.explore(&args.query, max_files, outline)
     }
 
-    #[tool(description = "Project file layout. No argument → each project summarized by top-level package with file + symbol counts (aggregated, so a large repo doesn't flood the response). project=<id or name> → that project's package breakdown. pattern=<text> → list the files whose path contains that substring (e.g. \"models.py\", \"harvest/\"), source files first. Faster than globbing.")]
+    #[tool(description = "Project file layout. No argument → each project summarized by top-level package with file + symbol counts (aggregated, so a large repo doesn't flood the response). project=<id or name> → that project's package breakdown. pattern=<text> → list the files whose path contains that substring (e.g. \"models.py\", \"billing/\"), source files first. Faster than globbing.")]
     fn constellation_files(
         &self,
         Parameters(args): Parameters<FilesArgs>,
@@ -780,7 +1020,10 @@ impl ConstellationServer {
 #[tool_handler]
 impl ServerHandler for ConstellationServer {
     fn get_info(&self) -> ServerInfo {
-        let links = lock_recover(&self.store).count_links().unwrap_or(0);
+        let links = match lock_recover(&self.store).as_ref() {
+            Some(store) => store.count_links().unwrap_or(0),
+            None => 0,
+        };
 
         let mut instructions = String::from(
             "FIRST: before any Grep, Glob, Read, or other file search, for ANY question about \
@@ -823,7 +1066,18 @@ impl ServerHandler for ConstellationServer {
              a directory breakdown).\n\
              - constellation_links: the cross-project links themselves, imports in one repo \
              resolved to a definition in another, grouped by repo pair.\n\
-             - constellation_status: index health and working-tree staleness.\n\n\
+             - constellation_status: index health and working-tree staleness.\n\
+             - constellation_history: how a file or app changed over time from git \
+             history (the commits touching a path, newest first, with +/- line churn); \
+             run `constellation history` first to populate it.\n\
+             - constellation_symbol_history: how one symbol (function, method, class, \
+             Django model/view/route, or model field) changed over time, the commits \
+             that added, modified (signature change), or removed it; run \
+             `constellation history --symbols` first.\n\
+             - constellation_as_of: the symbols that existed at a past point \
+             (at=<commit hash or YYYY-MM-DD>), grouped by file, with their \
+             signatures as they were then: \"what did this look like at version \
+             X\". Needs `constellation history --symbols`.\n\n\
              Recall caveat: edges come from a static parse, scoped to imports (a cross-file call to \
              a symbol the file does not import is dropped, not guessed). Several dynamic patterns \
              are KNOWN-DARK: a low caller/impact count on these is NOT 'safe to change': (1) a \
@@ -857,6 +1111,22 @@ pub fn serve(database: &Path) -> Result<(), McpError> {
 
     start_watcher(database, server.clone());
 
+    serve_stdio(server)
+}
+
+/// The server run with no database (see [`ConstellationServer::unavailable`]): it
+/// completes the MCP handshake and answers every tool with [`NO_INDEX_MESSAGE`],
+/// with no watcher thread. Lets a global `serve` registration stay quiet when
+/// launched in a project that has no `.constellation/index.db` (a non-Django
+/// repo), instead of exiting and surfacing a connection failure to the client.
+pub fn serve_unavailable() -> Result<(), McpError> {
+    serve_stdio(ConstellationServer::unavailable())
+}
+
+/// The given server run over stdio until the client disconnects: the tokio
+/// runtime plus the rmcp serve-and-wait loop shared by [`serve`] and
+/// [`serve_unavailable`].
+fn serve_stdio(server: ConstellationServer) -> Result<(), McpError> {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
 
     runtime.block_on(async move {
@@ -912,11 +1182,15 @@ fn status_text(store: &Store) -> Result<String, StoreError> {
     let links = store.count_links()?;
 
     let mut node_total: u32 = 0;
+    let mut history_total: u32 = 0;
+    let mut symbol_total: u32 = 0;
     let mut lines = String::new();
 
     for row in &projects {
         let nodes = store.count_nodes(&row.id)?;
         node_total = node_total.saturating_add(nodes);
+        history_total = history_total.saturating_add(store.count_history_commits(&row.id)?);
+        symbol_total = symbol_total.saturating_add(store.count_symbol_revisions(&row.id)?);
 
         lines.push_str(&format!(
             "  - {} ({}): {nodes} nodes, indexed {}{}\n",
@@ -928,9 +1202,302 @@ fn status_text(store: &Store) -> Result<String, StoreError> {
     }
 
     Ok(format!(
-        "projects: {}\nnodes: {node_total}\nedges: {edges}\ncross-project links: {links}\n{lines}",
+        "projects: {}\nnodes: {node_total}\nedges: {edges}\ncross-project links: {links}\n\
+         history commits: {history_total}\nsymbol revisions: {symbol_total}\n{lines}",
         projects.len(),
     ))
+}
+
+/// A timeline for one `history` query: the commits touching `target` (a path
+/// substring; `None` lists recent activity across the whole constellation),
+/// newest first, each stamped with an absolute date, short hash, churn, and
+/// author. Reads the history the `history` command ingests; empty until then.
+fn history_text(
+    store: &Store,
+    target: Option<&str>,
+    project: Option<&str>,
+    limit: u32,
+) -> Result<String, StoreError> {
+    let project_id = match project {
+        Some(name) => match find_project(store, name)? {
+            Some(id) => Some(id),
+            None => return Ok(format!("no project named {name:?}")),
+        },
+        None => None,
+    };
+
+    let pattern = match target {
+        Some(target) if !target.is_empty() => format!("%{target}%"),
+        _ => "%".to_string(),
+    };
+
+    let hits = store.history_for_path(project_id.as_ref(), &pattern, limit)?;
+
+    if hits.is_empty() {
+        return Ok(history_empty_message(target));
+    }
+
+    assert!(hits.len() as u32 <= limit, "history query respects its limit");
+
+    let label = target.filter(|target| !target.is_empty()).unwrap_or("the constellation");
+
+    let mut out = format!("history of {label}: {} commits, newest first\n", hits.len());
+
+    for hit in &hits {
+        let (year, month, day) = ymd_from_epoch_secs(hit.committed_at);
+        let short = &hit.commit_hash[..hit.commit_hash.len().min(8)];
+
+        out.push_str(&format!(
+            "  {year:04}-{month:02}-{day:02} {short} +{}/-{} ({}f) {}: {}\n",
+            hit.insertions, hit.deletions, hit.files_changed, hit.author, hit.summary,
+        ));
+    }
+
+    Ok(out)
+}
+
+/// A timeline for one `symbol_history` query: the commits where a definition
+/// matching `symbol` was added, modified, or removed, newest first, each stamped
+/// with an absolute date, short hash, change kind, qualified name, and the
+/// signature at that revision. Reads the symbol history `history --symbols`
+/// ingests; empty until then.
+fn symbol_history_text(
+    store: &Store,
+    symbol: &str,
+    project: Option<&str>,
+    limit: u32,
+) -> Result<String, StoreError> {
+    let project_id = match project {
+        Some(name) => match find_project(store, name)? {
+            Some(id) => Some(id),
+            None => return Ok(format!("no project named {name:?}")),
+        },
+        None => None,
+    };
+
+    let hits = store.symbol_history(project_id.as_ref(), symbol, limit)?;
+
+    if hits.is_empty() {
+        if store.has_symbol_revisions(project_id.as_ref())? {
+            return Ok(format!(
+                "no recorded changes for {symbol:?} \
+                 (symbol history is populated, but nothing matches; try the bare name, \
+                 or an exact Owner.member like \"PurchaseOrderLineItem.quantity\")"
+            ));
+        }
+
+        return Ok(format!(
+            "no recorded changes for {symbol:?} \
+             (run `constellation history --symbols` to populate symbol history)"
+        ));
+    }
+
+    assert!(hits.len() as u32 <= limit, "symbol history respects its limit");
+
+    let mut out = format!("history of {symbol}: {} changes, newest first\n", hits.len());
+
+    for hit in &hits {
+        let (year, month, day) = ymd_from_epoch_secs(hit.committed_at);
+        let short = &hit.commit_hash[..hit.commit_hash.len().min(8)];
+
+        let signature = match hit.signature.as_deref() {
+            Some(signature) if !signature.is_empty() => format!("  [{signature}]"),
+            _ => String::new(),
+        };
+
+        out.push_str(&format!(
+            "  {year:04}-{month:02}-{day:02} {short} {} {} {}{signature}\n",
+            hit.change, hit.kind, hit.qualified_name,
+        ));
+    }
+
+    Ok(out)
+}
+
+/// The symbols alive at one point in time for `constellation_as_of`: those
+/// recorded as present (added or modified, not since removed) as of `at` (a
+/// commit hash or a "YYYY-MM-DD" date), grouped by file, each with its kind and
+/// the signature in effect then. Reads the symbol history `history --symbols`
+/// ingests.
+fn as_of_text(
+    store: &Store,
+    at: &str,
+    project: Option<&str>,
+    path: Option<&str>,
+    limit: u32,
+) -> Result<String, StoreError> {
+    let project_id = match project {
+        Some(name) => match find_project(store, name)? {
+            Some(id) => Some(id),
+            None => return Ok(format!("no project named {name:?}")),
+        },
+        None => None,
+    };
+
+    let threshold = match resolve_as_of(store, project_id.as_ref(), at)? {
+        Some(threshold) => threshold,
+        None => {
+            return Ok(format!(
+                "could not resolve {at:?} to a commit or date (pass a commit hash or YYYY-MM-DD)"
+            ));
+        }
+    };
+
+    let pattern = path.filter(|path| !path.is_empty()).map(|path| format!("%{path}%"));
+
+    let symbols = store.symbols_as_of(project_id.as_ref(), threshold, pattern.as_deref(), limit)?;
+
+    if symbols.is_empty() {
+        return Ok(format!(
+            "no symbols recorded as of {at} \
+             (run `constellation history --symbols`, widen the scope, or pick a later point)"
+        ));
+    }
+
+    let (year, month, day) = ymd_from_epoch_secs(threshold);
+
+    let mut out = format!("symbols as of {at} ({year:04}-{month:02}-{day:02}): {} alive\n", symbols.len());
+    let mut current_file = "";
+
+    for symbol in &symbols {
+        if symbol.file_path != current_file {
+            out.push_str(&format!("{}:\n", symbol.file_path));
+            current_file = symbol.file_path.as_str();
+        }
+
+        let signature = match symbol.signature.as_deref() {
+            Some(signature) if !signature.is_empty() => format!(" [{signature}]"),
+            _ => String::new(),
+        };
+
+        out.push_str(&format!("  {} {}{signature}\n", symbol.kind, symbol.qualified_name));
+    }
+
+    Ok(out)
+}
+
+/// The epoch-second threshold an as-of point resolves to: a "YYYY-MM-DD" date, or
+/// else the committer time of the commit whose hash matches `at`. `None` when it
+/// is neither a date nor a known commit.
+fn resolve_as_of(
+    store: &Store,
+    project: Option<&ProjectId>,
+    at: &str,
+) -> Result<Option<i64>, StoreError> {
+    if let Some(epoch) = parse_ymd_to_epoch(at) {
+        return Ok(Some(epoch));
+    }
+
+    store.commit_committed_at(project, at)
+}
+
+/// The UTC epoch seconds at the start of a "YYYY-MM-DD" date, or `None` when the
+/// string is not exactly such a date.
+fn parse_ymd_to_epoch(text: &str) -> Option<i64> {
+    let mut parts = text.split('-');
+
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    Some(epoch_secs_from_ymd(year, month, day))
+}
+
+/// The UTC epoch seconds at midnight of a civil date, by Howard Hinnant's
+/// days-from-civil algorithm (the inverse of [`ymd_from_epoch_secs`]).
+fn epoch_secs_from_ymd(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_position = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_position + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+
+    (era * 146_097 + day_of_era - 719_468) * 86_400
+}
+
+/// The project id whose id or display name equals `name`, or `None` when no
+/// project matches.
+fn find_project(store: &Store, name: &str) -> Result<Option<ProjectId>, StoreError> {
+    let projects = store.all_projects()?;
+
+    let found = projects
+        .into_iter()
+        .find(|project| project.id.as_str() == name || project.name == name);
+
+    Ok(found.map(|project| project.id))
+}
+
+/// The reply when a history query matches nothing, distinguishing "no history
+/// ingested yet" from "history exists but nothing touched this path".
+fn history_empty_message(target: Option<&str>) -> String {
+    match target.filter(|target| !target.is_empty()) {
+        Some(target) => format!(
+            "no commits touching {target:?} in the indexed history \
+             (run `constellation history` to populate it)"
+        ),
+        None => "no git history indexed (run `constellation history` to populate it)".to_string(),
+    }
+}
+
+/// The civil date (year, month, day) for `epoch_secs` UTC, by Howard Hinnant's
+/// days-to-civil algorithm. Stamps history timelines with absolute dates without
+/// a date-library dependency.
+fn ymd_from_epoch_secs(epoch_secs: i64) -> (i64, u32, u32) {
+    let days = epoch_secs.div_euclid(86_400);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_position = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_position + 2) / 5 + 1;
+    let month = if month_position < 10 { month_position + 3 } else { month_position - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+
+    assert!((1..=12).contains(&month), "month falls in 1..=12");
+    assert!((1..=31).contains(&day), "day falls in 1..=31");
+
+    (year, month as u32, day as u32)
+}
+
+#[cfg(test)]
+mod history_date_tests {
+    use super::{epoch_secs_from_ymd, parse_ymd_to_epoch, ymd_from_epoch_secs};
+
+    #[test]
+    fn ymd_matches_known_utc_dates() {
+        assert_eq!(ymd_from_epoch_secs(0), (1970, 1, 1));
+        assert_eq!(ymd_from_epoch_secs(86_400), (1970, 1, 2));
+        assert_eq!(ymd_from_epoch_secs(1_700_000_000), (2023, 11, 14));
+    }
+
+    #[test]
+    fn epoch_from_ymd_is_midnight_and_inverts_ymd() {
+        assert_eq!(epoch_secs_from_ymd(1970, 1, 1), 0);
+        assert_eq!(epoch_secs_from_ymd(1970, 1, 2), 86_400);
+
+        for &(year, month, day) in &[(1970, 1, 1), (1999, 12, 31), (2023, 11, 14), (2024, 2, 29)] {
+            let midnight = epoch_secs_from_ymd(year, month, day);
+
+            assert_eq!(ymd_from_epoch_secs(midnight), (year, month as u32, day as u32));
+        }
+    }
+
+    #[test]
+    fn parse_ymd_accepts_dates_and_rejects_hashes() {
+        assert_eq!(parse_ymd_to_epoch("1970-01-01"), Some(0));
+        assert_eq!(parse_ymd_to_epoch("2023-06-15"), Some(epoch_secs_from_ymd(2023, 6, 15)));
+        assert_eq!(parse_ymd_to_epoch("deadbeef"), None);
+        assert_eq!(parse_ymd_to_epoch("2023-13-01"), None);
+        assert_eq!(parse_ymd_to_epoch("2023-06-15-7"), None);
+    }
 }
 
 /// A working-tree staleness suffix for a project's status line (how many
@@ -1121,6 +1688,378 @@ pub fn qualified_name_ends_with(qualified: &str, path: &str) -> bool {
     }
 }
 
+/// The canonical Python import for a definition, from its file path and the top-level
+/// owner of its qualified name: `app/x/models.py::Order.save` -> `from app.x.models
+/// import Order`. A package `__init__.py` imports as the package. `None` for non-Python
+/// nodes and for kinds that are not importable names. A re-export in an `__init__.py`
+/// may offer a shorter path; this defining-module import is always valid, and saves an
+/// LLM guessing the dotted path (file path is not the import path).
+fn python_import_line(node: &Node) -> Option<String> {
+    if node.language != Language::Python {
+        return None;
+    }
+
+    if matches!(
+        node.kind,
+        NodeKind::File
+            | NodeKind::Import
+            | NodeKind::Module
+            | NodeKind::Route
+            | NodeKind::Template
+            | NodeKind::Selector
+            | NodeKind::Parameter
+            | NodeKind::External
+    ) {
+        return None;
+    }
+
+    let path = node.file_path.replace('\\', "/");
+    let module = path.strip_suffix(".py")?;
+    let module = module.strip_suffix("/__init__").unwrap_or(module);
+
+    if module.is_empty() {
+        return None;
+    }
+
+    let dotted = module.replace('/', ".");
+    let after = node.qualified_name.rsplit("::").next().unwrap_or(&node.qualified_name);
+    let owner = after.split('.').next().unwrap_or(after);
+
+    if owner.is_empty() {
+        return None;
+    }
+
+    Some(format!("from {dotted} import {owner}"))
+}
+
+/// Whether a reference covers its target as a test: a `Tests` edge (a TestCase bound by
+/// naming), or any non-structural reference (call, instantiation, access) from a file
+/// under a test path - a test that exercises the symbol however it reaches it, including
+/// the instantiation that is the common Django model-test pattern.
+fn is_covering_ref(kind: EdgeKind, caller_path: &str) -> bool {
+    kind == EdgeKind::Tests || (kind != EdgeKind::Contains && is_test_path(caller_path))
+}
+
+/// Whether a symbol is worth a "no covering tests" flag: a top-level definition a reader
+/// would test directly (a model, class, free function, or view), not a method, property,
+/// nested `Meta`, or dunder, which inherit coverage from their owner and only add noise.
+fn is_coverage_checkable(node: &Node) -> bool {
+    matches!(node.kind, NodeKind::Class | NodeKind::Model | NodeKind::Function | NodeKind::View)
+        && node.name != "Meta"
+        && !(node.name.starts_with("__") && node.name.ends_with("__"))
+}
+
+/// The tests covering a symbol: `TestCase` classes the extractor bound to it by the
+/// `XTestCase -> X` convention (a `Tests` edge), plus any reference to it from a test
+/// module (a call, or the instantiation Django model tests use). `(no covering tests)`
+/// when none. The signal an LLM needs before editing: what to run, and whether guarded.
+fn tests_text(store: &Store, symbol: &str, limit: u32) -> Result<String, StoreError> {
+    let nodes = seed_nodes(store, symbol)?;
+
+    if nodes.is_empty() {
+        return Ok(format!("no symbol named {symbol:?}"));
+    }
+
+    let mut out = String::new();
+
+    for node in &nodes {
+        let mut covering = store.callers(&node.id)?;
+
+        covering.retain(|(kind, caller)| is_covering_ref(*kind, &caller.file_path));
+
+        let covering = dedup_related(covering);
+
+        out.push_str(&format!("{}\n", node_line(node)));
+
+        if covering.is_empty() {
+            out.push_str("  (no covering tests)\n");
+        }
+
+        for (kind, test, _count) in covering.iter().take(limit as usize) {
+            out.push_str(&format!("  [{}] {}\n", kind.as_str(), node_line(test)));
+        }
+    }
+
+    Ok(out)
+}
+
+/// The transitive subclasses of a base class or mixin: every node reached by following
+/// incoming `Extends` edges breadth-first, so a deep mixin tree (`HistoryModelMixin`,
+/// `BaseDjangoModelService`) comes back whole, across projects. Bounded by hops and
+/// `limit`.
+fn subclasses_text(store: &Store, symbol: &str, limit: u32) -> Result<String, StoreError> {
+    let seeds = seed_nodes(store, symbol)?;
+
+    if seeds.is_empty() {
+        return Ok(format!("no symbol named {symbol:?}"));
+    }
+
+    let mut visited: FxHashSet<String> =
+        seeds.iter().map(|node| node.id.as_str().to_string()).collect();
+    let mut frontier: Vec<NodeId> = seeds.iter().map(|node| node.id.clone()).collect();
+    let mut found: Vec<Node> = Vec::new();
+    let mut hops: u32 = 0;
+
+    while !frontier.is_empty() && hops < SUBCLASS_HOPS_MAX && (found.len() as u32) < limit {
+        hops += 1;
+
+        let mut next: Vec<NodeId> = Vec::new();
+
+        for id in &frontier {
+            for (kind, child) in store.callers(id)? {
+                if kind != EdgeKind::Extends {
+                    continue;
+                }
+
+                if visited.insert(child.id.as_str().to_string()) {
+                    next.push(child.id.clone());
+                    found.push(child);
+                }
+            }
+        }
+
+        frontier = next;
+    }
+
+    let mut out = format!("subclasses of {symbol} ({} found):\n", found.len());
+
+    if found.is_empty() {
+        out.push_str("  (none)\n");
+    }
+
+    for node in found.iter().take(limit as usize) {
+        out.push_str(&format!("  {}\n", node_line(node)));
+    }
+
+    Ok(out)
+}
+
+/// Candidate dead code in one project: definitions with no incoming edge but
+/// structural containment, after dropping framework-reached symbols that legitimately
+/// lack a static caller. Scoped to one project; over-fetched then path/name-filtered so
+/// `limit` rows of real candidates come back.
+fn orphans_text(store: &Store, project: Option<&str>, limit: u32) -> Result<String, StoreError> {
+    let project_id = match project {
+        Some(name) => match find_project(store, name)? {
+            Some(id) => id,
+            None => return Ok(format!("no project named {name:?}")),
+        },
+        None => {
+            return Ok("pass project=<id or name>: orphans is scoped to one project".to_string());
+        }
+    };
+
+    let fetched = store.orphan_definitions(&project_id, limit.saturating_mul(6).max(limit))?;
+
+    let mut candidates: Vec<Node> = Vec::new();
+
+    for node in fetched.into_iter().filter(is_orphan_candidate) {
+        // A method reached only through a manager/service descriptor (`.objects.by_pk()`,
+        // `.services.x()`) has no static caller edge but does have a dark (unresolved)
+        // reference by name: it is dispatched dynamically, not dead.
+        if store.count_unresolved_named(&node.name)? == 0 {
+            candidates.push(node);
+        }
+    }
+
+    let mut out = format!(
+        "orphan candidates in {project_id} ({} shown, verify before deleting):\n",
+        candidates.len().min(limit as usize),
+    );
+
+    if candidates.is_empty() {
+        out.push_str("  (none)\n");
+    }
+
+    for node in candidates.iter().take(limit as usize) {
+        out.push_str(&format!("  {}\n", node_line(node)));
+    }
+
+    Ok(out)
+}
+
+/// Whether an edgeless definition is a real dead-code candidate, not a framework hook
+/// that simply has no static caller: tests, migrations, package initializers, dunder
+/// methods, app configs, and a management command's `handle` are excluded.
+fn is_orphan_candidate(node: &Node) -> bool {
+    let path = node.file_path.replace('\\', "/");
+
+    if is_test_path(&path) || path.contains("/migrations/") || path.contains("/management/commands/") {
+        return false;
+    }
+
+    if path.ends_with("__init__.py") || path.ends_with("admin.py") {
+        return false;
+    }
+
+    let name = node.name.as_str();
+
+    if name.starts_with("__") && name.ends_with("__") {
+        return false;
+    }
+
+    // Django / django_spire protocol hooks reached by the framework, not a static call.
+    if matches!(
+        name,
+        "Meta" | "handle" | "ready" | "save" | "clean" | "delete" | "get_absolute_url"
+            | "breadcrumbs" | "base_breadcrumb"
+    ) {
+        return false;
+    }
+
+    !(name.ends_with("Config") || name.ends_with("Migration") || name.ends_with("Admin"))
+}
+
+/// The changed symbols and their blast radius: the definitions overlapping the
+/// working-tree diff against `base` (default `HEAD`), per project, each with its direct
+/// caller count and a test-coverage flag. Combines `git diff` with the graph, the
+/// edit-impact view git alone cannot give.
+fn changed_text(store: &Store, base: Option<&str>, limit: u32) -> Result<String, StoreError> {
+    let roots = project_roots(store)?;
+
+    let mut out = String::new();
+    let mut total: usize = 0;
+
+    for (project_id, root) in &roots {
+        let project = ProjectId::new(project_id.clone());
+
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        let mut changed: Vec<Node> = Vec::new();
+
+        for (file, start, end) in git_diff_lines(root, base) {
+            for node in store.nodes_in_range(&project, &file, start, end)? {
+                if seen.insert(node.id.as_str().to_string()) {
+                    changed.push(node);
+                }
+            }
+        }
+
+        if changed.is_empty() {
+            continue;
+        }
+
+        out.push_str(&format!("[{project_id}] {} changed symbol(s):\n", changed.len()));
+
+        for node in changed.iter().take(limit as usize) {
+            let mut callers = store.callers(&node.id)?;
+            callers.retain(|(kind, _)| *kind != EdgeKind::Contains);
+
+            let covered = callers.iter().any(|(kind, caller)| is_covering_ref(*kind, &caller.file_path));
+
+            let caller_count = dedup_related(callers).len();
+            let coverage = if covered || is_test_path(&node.file_path) {
+                ""
+            } else {
+                "  [no covering tests]"
+            };
+
+            out.push_str(&format!("  {}  ({caller_count} direct caller(s)){coverage}\n", node_line(node)));
+            total += 1;
+        }
+    }
+
+    if total == 0 {
+        return Ok(
+            "no changed symbols (clean working tree vs the diff base, or not a git repo)".to_string(),
+        );
+    }
+
+    Ok(out)
+}
+
+/// The `(file, start_line, end_line)` ranges of the new side of every hunk in
+/// `git -C root diff --unified=0 <base>`. Empty when git is unavailable, the path is
+/// not a repo, or nothing changed.
+fn git_diff_lines(root: &str, base: Option<&str>) -> Vec<(String, u32, u32)> {
+    let reference = base.unwrap_or("HEAD");
+
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("diff")
+        .arg("--unified=0")
+        .arg("--no-color")
+        .arg(reference)
+        .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    parse_diff_hunks(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The new-side line ranges parsed from a unified diff: each `+++ b/<path>` sets the
+/// current file, each `@@ -a,b +c,d @@` yields `(file, c, c+d-1)` (a zero-length hunk,
+/// a pure deletion, maps to its anchor line `c`).
+fn parse_diff_hunks(diff: &str) -> Vec<(String, u32, u32)> {
+    let mut ranges: Vec<(String, u32, u32)> = Vec::new();
+    let mut current_file: Option<String> = None;
+
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            current_file = (path != "/dev/null").then(|| path.to_string());
+        } else if line.starts_with("@@")
+            && let Some(file) = &current_file
+            && let Some((start, len)) = parse_hunk_new_range(line)
+        {
+            let start = start.max(1);
+            let end = if len == 0 { start } else { start + len - 1 };
+
+            ranges.push((file.clone(), start, end));
+        }
+    }
+
+    ranges
+}
+
+/// The `(start, length)` of a hunk header's new side: `@@ -3,2 +5,4 @@` -> `(5, 4)`,
+/// `@@ -3 +5 @@` -> `(5, 1)`. `None` when the header is malformed.
+fn parse_hunk_new_range(hunk: &str) -> Option<(u32, u32)> {
+    let spec = hunk.split('+').nth(1)?.split(' ').next()?;
+    let mut parts = spec.split(',');
+
+    let start: u32 = parts.next()?.parse().ok()?;
+    let length: u32 = parts.next().and_then(|value| value.parse().ok()).unwrap_or(1);
+
+    Some((start, length))
+}
+
+/// A one-line "no covering tests" flag for the definition seeds an explore landed on,
+/// the actionable half of codegraph's blast-radius digest: which symbols you are about
+/// to read or edit have zero test coverage. Empty when every checked seed is covered or
+/// none is a checkable definition; a store error counts a seed as covered (never a false
+/// alarm). Bounded to a handful of seeds.
+fn explore_coverage_note(store: &Store, seeds: &[Node]) -> String {
+    let mut uncovered: Vec<&str> = Vec::new();
+
+    for node in seeds.iter().filter(|node| is_coverage_checkable(node)).take(EXPLORE_COVERAGE_CHECK_MAX) {
+        if is_test_path(&node.file_path) {
+            continue;
+        }
+
+        let covered = store.callers(&node.id).map_or(true, |callers| {
+            callers.iter().any(|(kind, caller)| is_covering_ref(*kind, &caller.file_path))
+        });
+
+        if !covered {
+            uncovered.push(node.name.as_str());
+        }
+    }
+
+    uncovered.dedup();
+
+    if uncovered.is_empty() {
+        return String::new();
+    }
+
+    format!("note: no covering tests for: {} (verify before editing)\n\n", uncovered.join(", "))
+}
+
 fn node_text(store: &Store, symbol: &str) -> Result<String, StoreError> {
     let nodes = seed_nodes(store, symbol)?;
 
@@ -1161,11 +2100,19 @@ fn node_text(store: &Store, symbol: &str) -> Result<String, StoreError> {
         let dark = store.count_unresolved_named(&nodes[0].name)?;
 
         if dark > 0 {
-            out.push_str(&format!(
-                "dark callers (name-global): {dark} unresolved reference(s) name {:?} \
-                 (dynamic dispatch or missing import); not attributable to a single overload\n",
-                nodes[0].name,
-            ));
+            if is_dispatch_method_name(&nodes[0].name) {
+                out.push_str(&format!(
+                    "note: {:?} is a common method name; {dark} unbound dynamic-dispatch call(s) \
+                     workspace-wide share it, not callers of any one of these overloads\n",
+                    nodes[0].name,
+                ));
+            } else {
+                out.push_str(&format!(
+                    "dark callers (name-global): {dark} unresolved reference(s) name {:?} \
+                     (dynamic dispatch or missing import); not attributable to a single overload\n",
+                    nodes[0].name,
+                ));
+            }
         }
     }
 
@@ -1192,6 +2139,10 @@ fn node_detail(
 
     if let Some(signature) = &node.signature {
         out.push_str(&format!("  signature: {signature}\n"));
+    }
+
+    if let Some(import) = python_import_line(node) {
+        out.push_str(&format!("  import: {import}\n"));
     }
 
     if let Some(docstring) = &node.docstring {
@@ -1224,11 +2175,19 @@ fn node_detail(
         let dark = store.count_unresolved_named(&node.name)?;
 
         if dark > 0 {
-            out.push_str(&format!(
-                "  dark callers: {dark} unresolved reference(s) name {:?} (dynamic dispatch or \
-                 missing import); resolved caller count understates usage\n",
-                node.name,
-            ));
+            if is_dispatch_method_name(&node.name) {
+                out.push_str(&format!(
+                    "  note: {:?} is a common method name; {dark} unbound dynamic-dispatch call(s) \
+                     workspace-wide share it, not necessarily callers of this symbol\n",
+                    node.name,
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  dark callers: {dark} unresolved reference(s) name {:?} (dynamic dispatch or \
+                     missing import); resolved caller count understates usage\n",
+                    node.name,
+                ));
+            }
         }
     }
 
@@ -1537,9 +2496,36 @@ fn callees_text(store: &Store, symbol: &str, limit: u32) -> Result<String, Store
 
             out.push_str(&format!("  [{}{}] {}\n", kind.as_str(), times, node_line(other)));
         }
+
+        append_unresolved_callees(store, node, limit, &mut out)?;
     }
 
     Ok(out)
+}
+
+/// The unproven, name-matched callee names appended after a definition's precise
+/// callees: the calls in its body the resolver could not bind (a `self.obj.services.x()`
+/// descriptor hop, an untyped receiver). Disjoint from the resolved callees, since a
+/// bound call leaves the unresolved table. Labeled so the precise list stays trustworthy.
+fn append_unresolved_callees(
+    store: &Store,
+    node: &Node,
+    limit: u32,
+    out: &mut String,
+) -> Result<(), StoreError> {
+    let unresolved = store.unresolved_callees_of(&node.id, limit)?;
+
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+
+    out.push_str("  unresolved callees (name match, receiver type unproven):\n");
+
+    for (name, line) in unresolved.iter().take(limit as usize) {
+        out.push_str(&format!("    {name}  ({}:{line})\n", node.file_path));
+    }
+
+    Ok(())
 }
 
 /// The node ids of every definition matching `symbol`, owned (the
@@ -1625,7 +2611,55 @@ fn callers_text(store: &Store, symbol: &str, limit: u32) -> Result<String, Store
         }
     }
 
+    append_unresolved_callers(store, &nodes, &roots, limit, &mut out)?;
+
     Ok(out)
+}
+
+/// The unproven, name-matched caller sites appended after the precise callers: the
+/// `Model.services.x()` / untyped-receiver / overloaded-or-base service calls the
+/// resolver dropped rather than bind to a guessed definition. Surfaced under a clear
+/// label so the precise edges stay trustworthy while a reader still sees the recall a
+/// text search would. Matched by each seed's simple name; deduped across overloads.
+fn append_unresolved_callers(
+    store: &Store,
+    nodes: &[Node],
+    roots: &FxHashMap<String, String>,
+    limit: u32,
+    out: &mut String,
+) -> Result<(), StoreError> {
+    let mut names: Vec<&str> = nodes.iter().map(|node| node.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut sites: Vec<(Node, u32)> = Vec::new();
+
+    for name in names {
+        for (caller, line) in store.unresolved_callers_of(name, limit)? {
+            if seen.insert(format!("{}:{line}", caller.id.as_str())) {
+                sites.push((caller, line));
+            }
+        }
+    }
+
+    if sites.is_empty() {
+        return Ok(());
+    }
+
+    out.push_str(
+        "  unresolved (name match, receiver type unproven, e.g. a Model.services.x() call):\n",
+    );
+
+    for (caller, line) in sites.iter().take(limit as usize) {
+        out.push_str(&format!("  [calls?] {}\n", node_line(caller)));
+
+        if let Some(snippet) = call_site_line(roots, caller, *line) {
+            out.push_str(&format!("      {}:{line}  {snippet}\n", caller.file_path));
+        }
+    }
+
+    Ok(())
 }
 
 /// The trimmed source of one line in a caller's file, capped, for a call-site
@@ -3266,12 +4300,32 @@ fn node_line(node: &Node) -> String {
     )
 }
 
-/// The render of several nodes, one per line.
+/// The maximum signature characters appended to a rendered node line before
+/// truncation, so a multi-line or very long signature cannot blow up a listing.
+const NODE_LINE_SIGNATURE_CHARS_MAX: usize = 120;
+
+/// The render of several nodes, one per line, each followed by a compact,
+/// whitespace-collapsed signature when the extractor captured one, so a search
+/// shows a symbol's call shape inline (the way codegraph's search does) without a
+/// second `node` lookup.
 fn node_lines(nodes: &[Node]) -> String {
     let mut out = String::new();
 
     for node in nodes {
         out.push_str(&node_line(node));
+
+        if let Some(signature) = node.signature.as_deref() {
+            let compact = signature.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            if !compact.is_empty() {
+                let shown: String = compact.chars().take(NODE_LINE_SIGNATURE_CHARS_MAX).collect();
+                let truncated = compact.chars().count() > NODE_LINE_SIGNATURE_CHARS_MAX;
+                let ellipsis = if truncated { "…" } else { "" };
+
+                out.push_str(&format!("  {shown}{ellipsis}"));
+            }
+        }
+
         out.push('\n');
     }
 

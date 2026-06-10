@@ -75,16 +75,16 @@ class LoopCTT(BaseModel):
 #[test]
 fn classifies_function_based_view_by_request_parameter() {
     let extractor = PythonExtractor::new();
-    let project = ProjectId::new("portal");
+    let project = ProjectId::new("workspace");
     let source = "from django.template.response import TemplateResponse
 
 
 def list_view(request):
-    return portal_views.list_view(request, template='app/list.html')
+    return workspace_views.list_view(request, template='app/list.html')
 
 
 def detail_view(request: WSGIRequest, pk: int) -> TemplateResponse:
-    return portal_views.detail_view(request, template='app/detail.html')
+    return workspace_views.detail_view(request, template='app/detail.html')
 
 
 def helper(value):
@@ -104,7 +104,7 @@ def helper(value):
 #[test]
 fn captures_include_namespace_and_full_reverse_target() {
     let extractor = PythonExtractor::new();
-    let project = ProjectId::new("portal");
+    let project = ProjectId::new("workspace");
     let source = "from django.urls import include, path, reverse
 from django.shortcuts import redirect
 
@@ -201,6 +201,37 @@ fn records_inheritance_call_and_import_references() {
 }
 
 #[test]
+fn skips_bare_builtin_calls_but_keeps_attribute_calls() {
+    let extractor = PythonExtractor::new();
+    let project = ProjectId::new("blog");
+
+    let source = "def handle(request, queryset):
+    print(len(request))
+    value = isinstance(request, dict)
+    text = str(value)
+    row = queryset.get(id=1)
+    queryset.filter(active=True)
+    return text
+";
+
+    let output = extractor.extract(&project, "blog/views.py", source);
+
+    let calls: Vec<&str> = output
+        .unresolved_refs
+        .iter()
+        .filter(|reference| reference.reference_kind == EdgeKind::Calls)
+        .map(|reference| reference.reference_name.as_str())
+        .collect();
+
+    for builtin in ["print", "len", "isinstance", "str"] {
+        assert!(!calls.contains(&builtin), "bare builtin {builtin} should not emit a call, got {calls:?}");
+    }
+
+    assert!(calls.contains(&"get"), "attribute call queryset.get should still emit, got {calls:?}");
+    assert!(calls.contains(&"filter"), "attribute call queryset.filter should still emit, got {calls:?}");
+}
+
+#[test]
 fn module_and_class_bindings_become_constants_and_variables() {
     let extractor = PythonExtractor::new();
     let project = ProjectId::new("blog");
@@ -235,7 +266,7 @@ fn settings_string_list_is_captured_as_signature() {
     let source = "INSTALLED_APPS = [
     'django.contrib.admin',
     'django_spire.core',
-    'portal.harvest',
+    'workspace.billing',
 ]
 ";
 
@@ -251,7 +282,7 @@ fn settings_string_list_is_captured_as_signature() {
     let signature = apps.signature.as_deref().unwrap_or("");
 
     assert!(signature.contains("django_spire.core"), "signature lists the apps, got {signature:?}");
-    assert!(signature.contains("portal.harvest"), "signature lists the apps, got {signature:?}");
+    assert!(signature.contains("workspace.billing"), "signature lists the apps, got {signature:?}");
 }
 
 #[test]
@@ -415,7 +446,7 @@ fn template_kwarg_emits_renders_ref() {
     let extractor = PythonExtractor::new();
     let project = ProjectId::new("app");
 
-    let source = "def detail_view(request):\n    return portal_views.list_view(request, template='hr/employee.html')\n";
+    let source = "def detail_view(request):\n    return workspace_views.list_view(request, template='hr/employee.html')\n";
 
     let output = extractor.extract(&project, "app/views.py", source);
 

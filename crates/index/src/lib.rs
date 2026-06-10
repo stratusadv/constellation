@@ -32,15 +32,114 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
 mod companions;
+mod history;
+mod symbol_history;
 
-pub use companions::{CompanionTarget, discover_companions, discover_versions};
+pub use companions::{
+    CompanionTarget, HistoryConfig, discover_companions, discover_versions,
+    fetch_companion_history_repo, load_companion_repositories, load_history_config,
+};
+
+/// One project's git commit history read from `root` and written to the store,
+/// replacing any history previously recorded for it. Returns the number of
+/// commits stored; zero when `root` is not a git repository, which is skipped
+/// rather than treated as an error, since not every indexed source is a git
+/// checkout.
+pub fn ingest_history(
+    store: &Store,
+    project: &ProjectId,
+    root: &Path,
+    commits_max: u32,
+) -> Result<u32, IndexError> {
+    ingest_history_reporting(store, project, root, commits_max, |_done, _total| {})
+}
+
+/// As [`ingest_history`], reporting progress as `(done, total)` commits through
+/// `on_progress` so a caller can draw a progress bar as the history streams in.
+pub fn ingest_history_reporting(
+    store: &Store,
+    project: &ProjectId,
+    root: &Path,
+    commits_max: u32,
+    on_progress: impl FnMut(u32, u32),
+) -> Result<u32, IndexError> {
+    assert!(!project.as_str().is_empty(), "project id must not be empty");
+    assert!(!root.as_os_str().is_empty(), "project root must not be empty");
+    assert!(commits_max > 0, "commit cap must be positive");
+
+    let commits = history::read_history(root, commits_max, on_progress)?;
+
+    let stored = store.replace_history(project, &commits)?;
+
+    Ok(stored)
+}
+
+/// One project's symbol-level history (Tier 2) derived from its git blobs and
+/// written to the store, replacing any previously recorded for it. For each file
+/// that ever changed, its trackable symbols are extracted at each commit that
+/// touched it and diffed against the prior revision, yielding added / modified /
+/// removed rows. Returns the number of rows stored. Requires [`ingest_history`]
+/// to have run first; it reads the commit/file map that left behind.
+pub fn ingest_symbol_revisions(
+    store: &Store,
+    project: &ProjectId,
+    root: &Path,
+) -> Result<u32, IndexError> {
+    ingest_symbol_revisions_reporting(store, project, root, |_done, _total| {})
+}
+
+/// As [`ingest_symbol_revisions`], reporting progress as `(done, total)` touched
+/// file revisions through `on_progress` so a caller can draw a progress bar over
+/// the long Tier-2 pass.
+pub fn ingest_symbol_revisions_reporting(
+    store: &Store,
+    project: &ProjectId,
+    root: &Path,
+    on_progress: impl FnMut(u32, u32),
+) -> Result<u32, IndexError> {
+    assert!(!project.as_str().is_empty(), "project id must not be empty");
+    assert!(!root.as_os_str().is_empty(), "project root must not be empty");
+
+    let touches = store.history_file_touches(project, symbol_history::TOUCHES_MAX)?;
+
+    if touches.is_empty() {
+        return store.replace_symbol_revisions(project, &[]).map_err(IndexError::from);
+    }
+
+    let revisions = symbol_history::diff_history(root, project, &touches, on_progress)?;
+
+    let stored = store.replace_symbol_revisions(project, &revisions)?;
+
+    Ok(stored)
+}
 
 /// The fail-fast bound on the number of filesystem entries one walk may visit.
 pub const FILE_COUNT_MAX: u32 = 5_000_000;
 
-/// The files extracted per parallel batch. Bounds peak memory (a batch's graphs are
-/// held until persisted) while keeping every CPU busy between store writes.
-const EXTRACT_CHUNK_MAX: usize = 256;
+/// The ceiling on files held in flight per parallel batch, so a many-core machine
+/// batches store writes without hoarding memory.
+const EXTRACT_BATCH_MAX: usize = 256;
+
+/// The floor on files per parallel batch, so even a single-core machine still
+/// amortizes store writes rather than committing one file at a time.
+const EXTRACT_BATCH_MIN: usize = 16;
+
+/// Files held in flight per worker thread within a batch. Peak memory (a batch's
+/// source and graphs, held until persisted) scales with this times the pool size.
+const EXTRACT_BATCH_PER_THREAD: usize = 8;
+
+/// The files to extract per parallel batch on this machine, scaled to the rayon
+/// pool so peak memory tracks core count: a low-core, low-memory laptop keeps
+/// little in flight while a many-core workstation keeps enough to stay busy
+/// between store writes. The batch is the dominant control on extraction-phase
+/// peak memory, so a smaller pool both does less work at once and holds less.
+fn extract_batch_size() -> usize {
+    let threads = rayon::current_num_threads().max(1);
+
+    threads
+        .saturating_mul(EXTRACT_BATCH_PER_THREAD)
+        .clamp(EXTRACT_BATCH_MIN, EXTRACT_BATCH_MAX)
+}
 
 /// The fail-fast bound on references processed in one resolution pass.
 const REFERENCE_COUNT_MAX: u32 = 50_000_000;
@@ -54,9 +153,14 @@ const RESOLVE_BULK_NODES_MIN: u32 = 50_000;
 /// full node load would dominate. Otherwise the bulk path amortizes better.
 const RESOLVE_INCREMENTAL_RATIO: u64 = 8;
 
-/// An event with more dispatchers or listeners than this is skipped when synthesizing
-/// edges; a generic name (`change`, `click`) over-links without type info.
-const EVENT_FANOUT_MAX: usize = 6;
+/// The most dispatcher->listener pairs one event may synthesize. The edge model is
+/// all-pairs (every dispatcher of an event to every listener's handler), so the
+/// edge count for an event is dispatchers x listeners. Bounding that product,
+/// rather than each side independently, links a high-traffic-but-focused bus
+/// (10 dispatchers x 1 listener = 10 pairs) that a per-side cap would have dropped,
+/// while still skipping a generic name (`change`, `click`) whose product explodes
+/// into low-signal noise.
+const EVENT_PAIRS_MAX: usize = 64;
 
 /// The fail-fast bound on synthesized event edges produced for one project.
 const SYNTHESIZED_EDGES_MAX: u32 = 1_000_000;
@@ -67,6 +171,11 @@ const SYNTHESIZED_EDGES_MAX: u32 = 1_000_000;
 const EXTERNAL_TEMPLATE_MARKER: &str = "::external::template::";
 
 /// The directory names skipped wholesale during the walk, alongside their subtrees.
+/// `migrations` is Django's auto-generated schema history: thousands of field
+/// constructors and `CreateModel`/`AddField` operations that are never navigation
+/// targets (the live schema lives in `models.py`), so indexing it only floods the
+/// graph with unresolved instantiations. Schema-over-time still comes from git
+/// history, not these files.
 const SKIP_DIRECTORIES: &[&str] = &[
     ".constellation",
     ".git",
@@ -75,6 +184,7 @@ const SKIP_DIRECTORIES: &[&str] = &[
     ".tox",
     ".venv",
     "__pycache__",
+    "migrations",
     "node_modules",
     "target",
     "venv",
@@ -107,6 +217,9 @@ pub enum IndexError {
 
     #[error("watch error: {0}")]
     Watch(#[from] notify::Error),
+
+    #[error("git error: {0}")]
+    Git(String),
 }
 
 /// The roll-back guard for the bulk write transaction: disarmed on success, rolls
@@ -186,6 +299,34 @@ fn index_fingerprint() -> Option<String> {
     Some(format!("{size}:{modified_ms}"))
 }
 
+/// The running binary's fingerprint (see [`index_fingerprint`]), exposed so the
+/// history pass can re-ingest when the extractor changes. Empty when the
+/// executable cannot be stat'd.
+pub fn extractor_fingerprint() -> String {
+    index_fingerprint().unwrap_or_default()
+}
+
+/// The current `HEAD` commit hash of the git repository at `root`, or `None` when
+/// `root` is not a git work tree. Lets the history pass skip a repository whose
+/// HEAD has not changed since the last ingest.
+pub fn git_head(root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if head.is_empty() { None } else { Some(head) }
+}
+
 /// The index of every supported file under `root`, reporting progress through
 /// `on_phase` as files are extracted and as resolution begins. [`index_project`]
 /// is this with a no-op reporter.
@@ -207,7 +348,7 @@ pub fn index_project_reporting(
     // A change to the extractor (a rebuilt binary) leaves every source file's
     // content hash unchanged, so the per-file skip would keep the old extractor's
     // nodes. Compare the binary's fingerprint to the project's stamp and, on a
-    // mismatch, re-extract every file by passing an empty hash baseline.
+    // mismatch, re-extract every file by extracting against an empty hash baseline.
     let fingerprint = index_fingerprint();
     let force_full = match fingerprint.as_deref() {
         Some(current) => store.index_version(project)? != current,
@@ -221,7 +362,15 @@ pub fn index_project_reporting(
         Box::new(CssExtractor::new()),
     ];
     let frameworks = detect_frameworks(root);
-    let existing = if force_full { FxHashMap::default() } else { store.file_hashes(project)? };
+
+    // The full stored file set is always the removal baseline: a file the walk no
+    // longer yields (deleted, or under a newly-excluded directory like migrations)
+    // must drop its stale nodes even on a force-full pass. The extraction skip is
+    // separate: an empty baseline on force_full so every surviving file re-extracts.
+    let stored = store.file_hashes(project)?;
+    let empty: FxHashMap<String, String> = FxHashMap::default();
+    let extract_baseline = if force_full { &empty } else { &stored };
+
     let mut stats = IndexStats::default();
     let mut seen: FxHashSet<String> = FxHashSet::default();
     let mut files_done: u32 = 0;
@@ -232,10 +381,12 @@ pub fn index_project_reporting(
     store.bulk_begin()?;
     let mut bulk = BulkGuard { store, armed: true };
 
-    for chunk in paths.chunks(EXTRACT_CHUNK_MAX) {
+    let batch_size = extract_batch_size();
+
+    for chunk in paths.chunks(batch_size) {
         let outcomes: Vec<ExtractOutcome> = chunk
             .par_iter()
-            .map(|path| extract_one(project, &extractors, &frameworks, &existing, root, path))
+            .map(|path| extract_one(project, &extractors, &frameworks, extract_baseline, root, path))
             .collect();
 
         for outcome in outcomes {
@@ -247,7 +398,7 @@ pub fn index_project_reporting(
         }
     }
 
-    stats.files_removed = remove_missing(store, project, &existing, &seen)?;
+    stats.files_removed = remove_missing(store, project, &stored, &seen)?;
 
     bulk.armed = false;
     store.bulk_commit()?;
@@ -337,25 +488,32 @@ fn run_resolution_phase(
 /// never a guessed, wrong edge.
 fn link_namespaced_reverses(store: &Store, project: &ProjectId) -> Result<u32, IndexError> {
     let pending = store.load_unresolved(Some(project))?;
-
-    let has_namespaced_reverse = pending.iter().any(|(_, reference)| {
-        reference.reference_kind == EdgeKind::Resolves && reference.reference_name.contains(':')
-    });
-
-    if !has_namespaced_reverse {
-        return Ok(0);
-    }
-
     let routes = store.nodes_kind_in(project, NodeKind::Route)?;
 
-    // The include map: included module -> (instance namespace, including module).
-    // The namespace rides on the include route node's signature; the included
-    // module is the pending `Imports` reference's name; the including module is
-    // that reference's own file.
+    // The application namespace each urls module declares (`app_name = 'django_spire'`),
+    // captured onto the variable node's signature, keyed by the module's file path.
+    // Django folds this into the reverse name where an `include()` gives no explicit
+    // namespace, and at the root urlconf it is the project-wide prefix.
+    let app_name_by_module: FxHashMap<String, String> = store
+        .nodes_kind_in(project, NodeKind::Variable)?
+        .into_iter()
+        .filter(|node| node.name == "app_name")
+        .filter_map(|node| node.signature.map(|value| (module_of(&node.file_path), value)))
+        .collect();
+
     let route_by_id: FxHashMap<&str, &Node> =
         routes.iter().map(|route| (route.id.as_str(), route)).collect();
 
-    let mut includes: FxHashMap<String, (String, String)> = FxHashMap::default();
+    // The modules that define routes, so an include's dotted module string resolves
+    // to the indexed file even when the package root is stripped from the project's
+    // paths (`django_spire.ai.urls` indexed as `ai.urls`).
+    let url_modules: FxHashSet<String> =
+        routes.iter().map(|route| module_of(&route.file_path)).collect();
+
+    // The include map: child url module -> (its namespace, the including module).
+    // The namespace is the include's `namespace=` kwarg (on the route signature) or,
+    // absent that, the included module's own app_name, Django's fallback.
+    let mut includes: FxHashMap<String, (Option<String>, String)> = FxHashMap::default();
 
     for (_, reference) in &pending {
         if reference.reference_kind != EdgeKind::Imports {
@@ -366,16 +524,27 @@ fn link_namespaced_reverses(store: &Store, project: &ProjectId) -> Result<u32, I
             continue;
         };
 
-        let Some(namespace) = route.signature.clone() else {
+        let Some(child) = resolve_include_module(&reference.reference_name, &url_modules) else {
             continue;
         };
 
-        includes.insert(reference.reference_name.clone(), (namespace, module_of(&reference.file_path)));
+        let namespace = route.signature.clone().or_else(|| app_name_by_module.get(&child).cloned());
+
+        includes.insert(child, (namespace, module_of(&reference.file_path)));
     }
 
     // Each named route's full reverse name, plus a bare-name index for fallback.
     let mut by_reverse_name: FxHashMap<String, NodeId> = FxHashMap::default();
     let mut by_bare_name: FxHashMap<&str, Vec<&Node>> = FxHashMap::default();
+    let mut reverse_rows: Vec<(String, String)> = Vec::new();
+
+    // The project's application namespace: the app_name of its root urlconf, the
+    // uniquely-shallowest app_name module (django-spire's `urls.py` -> `django_spire`).
+    // Django's root urlconf often includes its apps dynamically (a comprehension over
+    // installed apps), so the chain cannot walk up to it; prepend it explicitly. A
+    // project whose root declares no app_name (so the shallowest is not unique) gets
+    // no prefix, the correct result for a top-level app's own routes.
+    let root_app_name = project_root_app_name(&app_name_by_module);
 
     for route in &routes {
         // A bare-URL route (`page/`) has no `name=` and cannot be reversed.
@@ -385,10 +554,24 @@ fn link_namespaced_reverses(store: &Store, project: &ProjectId) -> Result<u32, I
 
         by_bare_name.entry(route.name.as_str()).or_default().push(route);
 
-        if let Some(chain) = namespace_chain(&module_of(&route.file_path), &includes) {
-            by_reverse_name.insert(format!("{}:{}", chain.join(":"), route.name), route.id.clone());
+        if let Some(mut chain) = namespace_chain(&module_of(&route.file_path), &includes, &app_name_by_module) {
+            if let Some(root) = &root_app_name
+                && chain.first() != Some(root)
+            {
+                chain.insert(0, root.clone());
+            }
+
+            let reverse_name = format!("{}:{}", chain.join(":"), route.name);
+
+            by_reverse_name.insert(reverse_name.clone(), route.id.clone());
+            reverse_rows.push((reverse_name, route.id.as_str().to_string()));
         }
     }
+
+    // Persist this project's reverse names even when it has no namespaced reverse of
+    // its own to resolve: another project's `{% url 'django_spire:...' %}` resolves
+    // against them in the cross-project linker.
+    store.replace_route_reverse_names(project, &reverse_rows)?;
 
     let mut resolved: Vec<(i64, Edge)> = Vec::new();
 
@@ -418,6 +601,60 @@ fn link_namespaced_reverses(store: &Store, project: &ProjectId) -> Result<u32, I
     Ok(store.commit_resolved(&resolved)?)
 }
 
+/// The indexed url module an include's dotted module string names, matched as a
+/// suffix so a stripped package root (`django_spire.ai.urls` indexed as `ai.urls`)
+/// still resolves. An exact match wins; otherwise a unique dot-boundary suffix
+/// match in either direction; an ambiguous suffix returns `None` rather than bind
+/// the wrong parent.
+/// The project's application namespace: the app_name of its root urlconf, taken as
+/// the uniquely shallowest (fewest dotted segments) module that declares an app_name.
+/// `None` when the shallowest depth is shared by several modules, so a project whose
+/// root urlconf declares no app_name never prepends an arbitrary app's namespace to
+/// every reverse.
+fn project_root_app_name(app_name_by_module: &FxHashMap<String, String>) -> Option<String> {
+    let min_depth = app_name_by_module.keys().map(|module| module.split('.').count()).min()?;
+
+    let mut shallowest = app_name_by_module
+        .iter()
+        .filter(|(module, _)| module.split('.').count() == min_depth);
+
+    let (_, app_name) = shallowest.next()?;
+
+    if shallowest.next().is_some() {
+        return None;
+    }
+
+    Some(app_name.clone())
+}
+
+/// The indexed url module an include's dotted module string names, matched as a
+/// suffix so a stripped package root (`django_spire.ai.urls` indexed as `ai.urls`)
+/// still resolves. An exact match wins; otherwise a unique dot-boundary suffix
+/// match in either direction; an ambiguous suffix returns `None` rather than bind
+/// the wrong parent.
+fn resolve_include_module(module_string: &str, url_modules: &FxHashSet<String>) -> Option<String> {
+    if url_modules.contains(module_string) {
+        return Some(module_string.to_string());
+    }
+
+    let mut matched: Option<&String> = None;
+
+    for candidate in url_modules {
+        let is_suffix = module_string.ends_with(&format!(".{candidate}"))
+            || candidate.ends_with(&format!(".{module_string}"));
+
+        if is_suffix {
+            if matched.is_some() {
+                return None;
+            }
+
+            matched = Some(candidate);
+        }
+    }
+
+    matched.cloned()
+}
+
 /// The dotted module path of a Python file: `app/partner/urls/page_urls.py` ->
 /// `app.partner.urls.page_urls`, and a package `__init__.py` to the package
 /// itself (`app/partner/urls/__init__.py` -> `app.partner.urls`). Matches the
@@ -431,13 +668,21 @@ pub fn module_of(file_path: &str) -> String {
     module.replace('/', ".")
 }
 
-/// The instance-namespace chain from the root urlconf down to `module`, walking
-/// the include map child -> parent. Returned root-first (`["partner", "page"]`
-/// for `app.partner.urls.page_urls`), or `None` when no captured include reaches
-/// the module (so it carries no reverse namespace). Bounded by
-/// [`NAMESPACE_DEPTH_MAX`], and a visited set breaks any cyclic include.
+/// The namespace chain from the root urlconf down to `module`, walking the include
+/// map child -> parent. Each include hop contributes its namespace when it has one
+/// (a `namespace=` kwarg or the child's app_name); a hop with neither still chains
+/// upward but adds no level. The topmost module reached contributes its own
+/// app_name, the project-wide application namespace (django-spire's root
+/// `app_name='django_spire'`) that no include carries. Returned root-first
+/// (`["django_spire", "auth", "user", "page"]`), or `None` when nothing on the path
+/// carries a namespace. Bounded by [`NAMESPACE_DEPTH_MAX`]; a visited set breaks any
+/// cyclic include.
 #[doc(hidden)]
-pub fn namespace_chain(module: &str, includes: &FxHashMap<String, (String, String)>) -> Option<Vec<String>> {
+pub fn namespace_chain(
+    module: &str,
+    includes: &FxHashMap<String, (Option<String>, String)>,
+    app_name_by_module: &FxHashMap<String, String>,
+) -> Option<Vec<String>> {
     let mut chain: Vec<String> = Vec::new();
     let mut visited: FxHashSet<String> = FxHashSet::default();
     let mut current = module.to_string();
@@ -452,8 +697,15 @@ pub fn namespace_chain(module: &str, includes: &FxHashMap<String, (String, Strin
             break;
         }
 
-        chain.push(namespace.clone());
+        if let Some(level) = namespace {
+            chain.push(level.clone());
+        }
+
         current = parent.clone();
+    }
+
+    if let Some(root_namespace) = app_name_by_module.get(&current) {
+        chain.push(root_namespace.clone());
     }
 
     if chain.is_empty() {
@@ -636,7 +888,7 @@ fn synthesize_events(store: &Store, project: &ProjectId) -> Result<u32, IndexErr
             continue;
         };
 
-        if sites.len() > EVENT_FANOUT_MAX || handler_names.len() > EVENT_FANOUT_MAX {
+        if sites.len().saturating_mul(handler_names.len()) > EVENT_PAIRS_MAX {
             continue;
         }
 
@@ -852,6 +1104,13 @@ fn nearest_base_method<'graph>(
 /// before the first `::` separator, or the whole string if absent.
 fn project_prefix(node_id: &str) -> &str {
     node_id.split("::").next().unwrap_or(node_id)
+}
+
+/// The installed package name a project's root path ends in, the import-package
+/// key a companion is linked by: `.../site-packages/django_spire` -> `django_spire`.
+/// `None` when the path has no final segment.
+fn package_root_name(root_path: &str) -> Option<&str> {
+    root_path.rsplit(['/', '\\']).find(|segment| !segment.is_empty())
 }
 
 /// The JS function or method a listener's handler name resolves to,
@@ -1322,7 +1581,13 @@ fn external_target(
     template_names: &FxHashSet<String>,
 ) -> Option<ExternalTarget> {
     match reference.reference_kind {
-        EdgeKind::Imports | EdgeKind::Extends | EdgeKind::Decorates | EdgeKind::Calls => {
+        EdgeKind::Imports
+        | EdgeKind::Extends
+        | EdgeKind::Decorates
+        | EdgeKind::Calls
+        | EdgeKind::Instantiates
+        | EdgeKind::Returns
+        | EdgeKind::TypeOf => {
             let mapping = mappings_by_file
                 .get(&reference.file_path)?
                 .get(&reference.reference_name)?;
@@ -1429,12 +1694,36 @@ pub fn link_constellation(store: &Store) -> Result<u32, IndexError> {
     let reference_only: FxHashSet<String> =
         store.reference_only_project_ids()?.into_iter().collect();
 
-    let redirects = external_redirects(&nodes, &reference_only);
+    // The package an import spells (`django_spire`) maps to the project indexed
+    // from it (`django-spire`), keyed by the installed package directory name. Only
+    // real projects are targets; a reference-only version shares the package name,
+    // so including it would make the key ambiguous. Backs the package-evidence
+    // fallback in both stub unification and import linking.
+    let package_to_project: FxHashMap<String, String> = store
+        .all_projects()?
+        .into_iter()
+        .filter(|project| !project.reference_only)
+        .filter_map(|project| {
+            package_root_name(&project.root_path)
+                .map(|package| (package.to_string(), project.id.as_str().to_string()))
+        })
+        .collect();
+
+    let redirects = external_redirects(&nodes, &reference_only, &package_to_project);
     let template_overrides = template_override_edges(&nodes, &reference_only);
 
-    let context = ConstellationContext::new(nodes, &reference_only);
+    let context = ConstellationContext::new(nodes, &reference_only, package_to_project);
     let pending = store.load_unresolved(None)?;
     let linker = ImportLinker;
+
+    // Every project's route reverse names, for resolving a `{% url 'django_spire:...' %}`
+    // / reverse() into the route another project defines. Grouped by reverse name so
+    // an ambiguous name (two projects own it) stays unlinked.
+    let mut reverse_index: FxHashMap<String, Vec<(String, String)>> = FxHashMap::default();
+
+    for (reverse_project, reverse_name, route_id) in store.route_reverse_names()? {
+        reverse_index.entry(reverse_name).or_default().push((reverse_project, route_id));
+    }
 
     let mut links: Vec<(i64, Edge)> = Vec::with_capacity(pending.len());
     let mut seen: u32 = 0;
@@ -1460,6 +1749,8 @@ pub fn link_constellation(store: &Store) -> Result<u32, IndexError> {
             EdgeKind::RelatesTo | EdgeKind::Receives | EdgeKind::AdminOf => {
                 cross_project_relation(reference, &context)
             }
+            EdgeKind::Handles | EdgeKind::UsesTag => cross_project_handler(reference, &context),
+            EdgeKind::Resolves => cross_project_reverse(reference, &reverse_index),
             _ => None,
         };
 
@@ -1483,10 +1774,17 @@ pub fn link_constellation(store: &Store) -> Result<u32, IndexError> {
 
     persist_template_overrides(store, template_overrides)?;
 
+    // Every resolution, linking, and synthesis pass has now emitted its edges. The
+    // external-synthesis and synthesized-edge passes write in bulk and never delete
+    // the reference rows they satisfy, so clear those now-resolved rows here, at the
+    // one point where all edges exist: the pending table is left holding only
+    // references that bind to nothing.
+    store.delete_satisfied_unresolved()?;
+
     Ok(linked)
 }
 
-/// The cross-project template overrides: a portal's vendored copy of a namespaced
+/// The cross-project template overrides: a workspace's vendored copy of a namespaced
 /// template (`templates/django_spire/page/full_page.html`) shadows the original it
 /// copies. For each template whose name is owned by one project's namespace
 /// (`django_spire/...` -> django-spire) and is also defined elsewhere, emit an
@@ -1554,7 +1852,7 @@ fn persist_template_overrides(store: &Store, edges: Vec<Edge>) -> Result<(), Ind
 /// another project. Covers a cross-project ORM relation (`relates_to`: a foreign
 /// key to a model the project does not define locally) and a cross-project signal
 /// (`receives`: a `@receiver(sender=Model)` whose model lives in another repo,
-/// e.g. a portal handler on django-spire's `AuthUser`). An ambiguous name (defined
+/// e.g. a workspace handler on django-spire's `AuthUser`). An ambiguous name (defined
 /// in more than one other project) stays unlinked, the same no-false-edge
 /// discipline the import linker keeps. The edge carries the reference's own kind.
 fn cross_project_relation(reference: &UnresolvedRef, context: &dyn LinkContext) -> Option<Edge> {
@@ -1581,12 +1879,79 @@ fn cross_project_relation(reference: &UnresolvedRef, context: &dyn LinkContext) 
     )
 }
 
+/// A leftover Alpine `Handles` reference linked to the sole function/method of that
+/// name in another project: a template's `@click="close_modal()"` whose handler is
+/// an `x-data` method or `Alpine.data` function defined in an installed app
+/// (django-spire's modal component), which per-project resolution cannot see across
+/// the boundary. An ambiguous name (defined in more than one other project) stays
+/// unlinked, the same no-false-edge discipline the import and relation links keep.
+fn cross_project_handler(reference: &UnresolvedRef, context: &dyn LinkContext) -> Option<Edge> {
+    let project = reference.from_node_id.project_prefix();
+
+    let mut matched = context
+        .exports_by_name(&reference.reference_name)
+        .into_iter()
+        .filter(|node| {
+            node.project_id.as_str() != project
+                && matches!(node.kind, NodeKind::Function | NodeKind::Method)
+        });
+
+    let (Some(target), None) = (matched.next(), matched.next()) else {
+        return None;
+    };
+
+    let provenance = format!("link:{}->{}", project, target.project_id);
+
+    Some(
+        Edge::new(reference.from_node_id.clone(), target.id.clone(), reference.reference_kind)
+            .at(reference.line, reference.column)
+            .with_provenance(provenance),
+    )
+}
+
+/// A leftover namespaced reverse (`{% url 'django_spire:auth:user:page:detail' %}`,
+/// `reverse('django_spire:...')`) linked to the route another project defines, found
+/// by exact reverse name in `reverse_index`. Within-project reverses resolved during
+/// that project's own pass, so a still-pending namespaced reverse names a route across
+/// the boundary. An ambiguous name (owned by more than one other project) stays
+/// unlinked, the same no-false-edge discipline the other cross-project links keep.
+fn cross_project_reverse(
+    reference: &UnresolvedRef,
+    reverse_index: &FxHashMap<String, Vec<(String, String)>>,
+) -> Option<Edge> {
+    let project = reference.from_node_id.project_prefix();
+
+    let targets = reverse_index.get(&reference.reference_name)?;
+
+    let mut cross = targets.iter().filter(|(owner, _)| owner.as_str() != project);
+
+    let (Some((owner, route_id)), None) = (cross.next(), cross.next()) else {
+        return None;
+    };
+
+    let provenance = format!("link:{}->{}", project, owner);
+
+    Some(
+        Edge::new(reference.from_node_id.clone(), NodeId::from_raw(route_id.clone()), EdgeKind::Resolves)
+            .at(reference.line, reference.column)
+            .with_provenance(provenance),
+    )
+}
+
 /// The map from each external stub to the single real cross-project definition it shadows.
 /// A stub `django_spire.history.mixins.HistoryModelMixin` matches a non-external,
 /// linkable definition of the same simple name in another project whose file path
 /// agrees with the stub's module, the same module-path evidence the import linker
-/// requires. An ambiguous stub (two projects define the name) is left alone.
-fn external_redirects(nodes: &[Node], reference_only: &FxHashSet<String>) -> Vec<(NodeId, NodeId)> {
+/// requires. Failing that, the stub module's top-level package names a companion
+/// project directly (`package_to_project`), scoping to a sole definition there, so a
+/// re-exported symbol's non-import edges (instantiations, annotations) collapse onto
+/// the real definition just as its import links. An ambiguous stub (two definitions
+/// after scoping) is left alone.
+fn external_redirects(
+    nodes: &[Node],
+    reference_only: &FxHashSet<String>,
+    package_to_project: &FxHashMap<String, String>,
+) -> Vec<(NodeId, NodeId)> {
     let mut definitions: FxHashMap<&str, Vec<&Node>> = FxHashMap::default();
     let mut templates: FxHashMap<&str, Vec<&Node>> = FxHashMap::default();
 
@@ -1641,6 +2006,20 @@ fn external_redirects(nodes: &[Node], reference_only: &FxHashSet<String>) -> Vec
 
         if let (Some(definition), None) = (matched.next(), matched.next()) {
             redirects.push((stub.id.clone(), definition.id.clone()));
+
+            continue;
+        }
+
+        let package = module.split('.').next().unwrap_or("");
+
+        if let Some(project) = package_to_project.get(package) {
+            let mut scoped = candidates
+                .iter()
+                .filter(|node| node.project_id != stub.project_id && node.project_id.as_str() == project);
+
+            if let (Some(definition), None) = (scoped.next(), scoped.next()) {
+                redirects.push((stub.id.clone(), definition.id.clone()));
+            }
         }
     }
 
@@ -1649,7 +2028,7 @@ fn external_redirects(nodes: &[Node], reference_only: &FxHashSet<String>) -> Vec
 
 /// The real template `stub` should redirect to among `candidates`: templates of
 /// the same name in any project. The sole other-project template wins outright;
-/// when several projects own the name (a portal that vendored a copy of a
+/// when several projects own the name (a workspace that vendored a copy of a
 /// django-spire base under its own `templates/django_spire/...`) the canonical
 /// owner wins: the project whose id matches the name's leading namespace
 /// (`django_spire/page/full_page.html` -> `django-spire`), so a vendored
@@ -2497,6 +2876,7 @@ impl ResolutionContext for FsContext {
 /// lookups [`ImportLinker`] makes.
 struct ConstellationContext {
     by_name: FxHashMap<String, Vec<Arc<Node>>>,
+    package_to_project: FxHashMap<String, String>,
 }
 
 impl ConstellationContext {
@@ -2504,7 +2884,13 @@ impl ConstellationContext {
     /// project is in `reference_only`: a reference-only version is queryable and
     /// links out, but its symbols are never cross-project link targets, so two
     /// indexed versions of one library cannot compete to win an ambiguous import.
-    fn new(nodes: Vec<Node>, reference_only: &FxHashSet<String>) -> Self {
+    /// `package_to_project` maps an installed package name to the project indexed
+    /// from it, backing the package-evidence link fallback.
+    fn new(
+        nodes: Vec<Node>,
+        reference_only: &FxHashSet<String>,
+        package_to_project: FxHashMap<String, String>,
+    ) -> Self {
         let mut by_name: FxHashMap<String, Vec<Arc<Node>>> =
             FxHashMap::with_capacity_and_hasher(nodes.len(), Default::default());
 
@@ -2516,12 +2902,16 @@ impl ConstellationContext {
             by_name.entry(node.name.clone()).or_default().push(Arc::new(node));
         }
 
-        Self { by_name }
+        Self { by_name, package_to_project }
     }
 }
 
 impl LinkContext for ConstellationContext {
     fn exports_by_name(&self, name: &str) -> Vec<Arc<Node>> {
         self.by_name.get(name).cloned().unwrap_or_default()
+    }
+
+    fn project_for_package(&self, package: &str) -> Option<&str> {
+        self.package_to_project.get(package).map(String::as_str)
     }
 }

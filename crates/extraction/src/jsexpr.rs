@@ -9,9 +9,30 @@
 //! leading `{` lexes as a block, not an object), so every fragment is wrapped in
 //! parentheses to force expression context before parsing.
 
+use std::cell::RefCell;
+
 use tree_sitter::{Node as TsNode, Parser};
 
 use crate::tsutil::{node_text, to_u32};
+
+/// The JavaScript global functions called from Alpine expressions that are not
+/// project-defined handlers, so a `Handles` reference to one never resolves and
+/// is pure noise. Skipped when collecting call identifiers, the analogue of the
+/// Python builtin-call filter. Alpine magics (`$dispatch`, `$nextTick`, `$id`,
+/// `$refs`, ...) are excluded by their `$` prefix, not listed here.
+const JS_CALL_BUILTINS: &[&str] = &[
+    "Array", "Boolean", "Date", "JSON", "Math", "Number", "Object", "String", "alert",
+    "clearInterval", "clearTimeout", "confirm", "decodeURIComponent", "encodeURIComponent",
+    "fetch", "isFinite", "isNaN", "parseFloat", "parseInt", "prompt", "setInterval", "setTimeout",
+    "structuredClone",
+];
+
+/// Whether a called name is a non-handler JavaScript global: an Alpine magic
+/// (`$`-prefixed) or a builtin in [`JS_CALL_BUILTINS`]. Such a call is never a
+/// project-defined handler, so it must not become a `Handles` reference.
+fn is_js_non_handler(name: &str) -> bool {
+    name.starts_with('$') || JS_CALL_BUILTINS.contains(&name)
+}
 
 /// A fail-fast bound on the node-walk loop.
 const WALK_ITERATIONS_MAX: u32 = 5_000_000;
@@ -148,24 +169,37 @@ pub(crate) fn identifier_argument<'bytes>(
     }
 }
 
-/// A reusable parser for the JavaScript fragments embedded in Alpine attribute
-/// values. One instance is built per file and reused across its attributes.
-pub(crate) struct AlpineExpr {
-    parser: Parser,
+thread_local! {
+    /// The per-thread JavaScript parser for the embedded Alpine expressions,
+    /// reused across attributes and files. One parser per rayon worker thread,
+    /// no cross-thread sharing; an attribute value pays only for its parse.
+    static PARSER: RefCell<Parser> = RefCell::new(new_parser());
 }
 
+/// A JavaScript parser with the grammar loaded. It panics only on a grammar
+/// against tree-sitter ABI mismatch, a build error that cannot arise at runtime
+/// in a correctly linked binary.
+fn new_parser() -> Parser {
+    let language: tree_sitter::Language = tree_sitter_javascript::LANGUAGE.into();
+
+    let mut parser = Parser::new();
+
+    parser
+        .set_language(&language)
+        .expect("the bundled javascript grammar is ABI-compatible with tree-sitter");
+
+    parser
+}
+
+/// An analyzer of the JavaScript fragments embedded in Alpine attribute values,
+/// parsing each through a per-thread parser shared across attributes and files.
+pub(crate) struct AlpineExpr;
+
 impl AlpineExpr {
-    /// The embedded-expression parser, or `None` if the grammar fails to
-    /// load (an ABI mismatch, never a runtime condition).
+    /// The embedded-expression analyzer. Always `Some`; the `Option` return is
+    /// kept so existing call sites and tests need no change.
     pub(crate) fn new() -> Option<Self> {
-        let language: tree_sitter::Language = tree_sitter_javascript::LANGUAGE.into();
-        let mut parser = Parser::new();
-
-        if parser.set_language(&language).is_err() {
-            return None;
-        }
-
-        Some(Self { parser })
+        Some(Self)
     }
 
     /// The bare function identifiers called in the expression (`save()` ->
@@ -185,7 +219,7 @@ impl AlpineExpr {
             {
                 let name = node_text(bytes, function);
 
-                if !name.is_empty() && !names.iter().any(|seen| seen == name) {
+                if !name.is_empty() && !is_js_non_handler(name) && !names.iter().any(|seen| seen == name) {
                     names.push(name.to_string());
                 }
             }
@@ -277,7 +311,7 @@ impl AlpineExpr {
         let sanitized = blank_django_tags(value);
         let wrapped = format!("({sanitized})");
 
-        let Some(tree) = self.parser.parse(&wrapped, None) else {
+        let Some(tree) = PARSER.with(|parser| parser.borrow_mut().parse(&wrapped, None)) else {
             return Vec::new();
         };
 
@@ -312,7 +346,7 @@ impl AlpineExpr {
         let sanitized = blank_django_tags(value);
         let wrapped = format!("({sanitized})");
 
-        let Some(tree) = self.parser.parse(&wrapped, None) else {
+        let Some(tree) = PARSER.with(|parser| parser.borrow_mut().parse(&wrapped, None)) else {
             return;
         };
 

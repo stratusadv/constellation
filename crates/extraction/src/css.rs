@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use constellation_graph::{
     Edge, EdgeKind, Language, Node, NodeId, NodeIdentity, NodeKind, ProjectId,
 };
@@ -18,18 +20,36 @@ const PROVENANCE: &str = "extraction:css";
 
 /// An extractor of CSS class and id selectors as [`Selector`](NodeKind::Selector)
 /// nodes, so a template's `class="card"` can resolve to the `.card` rule.
-pub struct CssExtractor {
-    language: tree_sitter::Language,
+pub struct CssExtractor;
+
+thread_local! {
+    /// The per-thread CSS parser, reused across files so each file pays only for
+    /// its parse, not for parser construction. One parser per rayon worker thread,
+    /// no cross-thread sharing.
+    static PARSER: RefCell<Parser> = RefCell::new(new_parser());
+}
+
+/// A CSS parser with the grammar loaded. It panics only on a grammar against
+/// tree-sitter ABI mismatch, a build error that cannot arise at runtime in a
+/// correctly linked binary.
+fn new_parser() -> Parser {
+    let language: tree_sitter::Language = tree_sitter_css::LANGUAGE.into();
+
+    assert!(language.node_kind_count() > 0, "css grammar must expose node kinds");
+
+    let mut parser = Parser::new();
+
+    parser
+        .set_language(&language)
+        .expect("the bundled css grammar is ABI-compatible with tree-sitter");
+
+    parser
 }
 
 impl CssExtractor {
-    /// The extractor, with the CSS grammar loaded.
+    /// The extractor; the grammar loads per worker thread on first use.
     pub fn new() -> Self {
-        let language: tree_sitter::Language = tree_sitter_css::LANGUAGE.into();
-
-        assert!(language.node_kind_count() > 0, "css grammar must expose node kinds");
-
-        Self { language }
+        Self
     }
 }
 
@@ -48,13 +68,8 @@ impl Extractor for CssExtractor {
         assert!(!file_path.is_empty(), "file_path must not be empty");
 
         let mut output = ExtractionOutput::empty();
-        let mut parser = Parser::new();
 
-        if parser.set_language(&self.language).is_err() {
-            return output;
-        }
-
-        let Some(tree) = parser.parse(source, None) else {
+        let Some(tree) = PARSER.with(|parser| parser.borrow_mut().parse(source, None)) else {
             return output;
         };
 

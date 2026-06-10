@@ -10,4 +10,7 @@ mod store;
 mod time;
 
 pub use error::StoreError;
-pub use store::{FileIndex, FileRow, LinkEdge, ProjectRow, Store};
+pub use store::{
+    AsOfSymbol, CommitFile, CommitRecord, FileIndex, FileRow, FileTouch, HistoryHit, LinkEdge,
+    ProjectRow, Store, SymbolChange, SymbolHistoryHit, SymbolRevision,
+};

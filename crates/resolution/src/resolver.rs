@@ -43,7 +43,7 @@ const SERVICE_BUILTINS: &[&str] = &["save_model_obj", "save_model_objs"];
 /// Django with no project-local definition to bind to. Filtered out so a
 /// builtin like `order_by` never binds to some app's custom queryset that
 /// overrides it (the C-1 false-edge class).
-const QUERYSET_BUILTINS: &[&str] = &[
+pub const QUERYSET_BUILTINS: &[&str] = &[
     "aggregate", "all", "annotate", "bulk_create", "bulk_update", "contains", "count", "create",
     "defer", "delete", "difference", "distinct", "earliest", "exclude", "exists", "filter",
     "first", "get", "get_or_create", "in_bulk", "intersection", "iterator", "last", "latest",
@@ -332,6 +332,7 @@ fn target_language(kind: EdgeKind) -> Option<Language> {
         | EdgeKind::Tests
         | EdgeKind::Reads => Some(Language::Python),
         EdgeKind::Returns | EdgeKind::TypeOf => Some(Language::Python),
+        EdgeKind::UsesTag => Some(Language::Python),
         EdgeKind::Handles => Some(Language::JavaScript),
         _ => None,
     }
@@ -395,8 +396,23 @@ fn resolve_import(
         return Some(resolved);
     }
 
+    // An absolute first-party submodule import (`from app.asset import models`)
+    // names a module file, not a symbol: bind it to the file at the module path the
+    // import spells (`app/asset/models.py`), matched as a path suffix so an index
+    // rooted below the top package still resolves. A symbol import of the same shape
+    // (`from app.asset.models import Inventory`) resolved through the name-and-stem
+    // path above; one that names neither a file nor a symbol here is external and
+    // stays pending for the cross-project linker.
     if !module.starts_with('.') {
-        return None;
+        let module_path = format!("{}/{name}.py", module.replace('.', "/"));
+
+        let mut files = context.nodes_by_kind(NodeKind::File);
+        files.retain(|node| path_in_module(&node.file_path, &module_path));
+
+        return files
+            .into_iter()
+            .next()
+            .map(|node| ResolvedRef::new(reference, node.id.clone(), 0.85, ResolvedBy::Import));
     }
 
     let mut files = context.nodes_by_kind(NodeKind::File);
@@ -764,6 +780,7 @@ fn preferred_kinds(kind: EdgeKind) -> &'static [NodeKind] {
         }
         EdgeKind::Tests => &[NodeKind::Class, NodeKind::Model, NodeKind::Function, NodeKind::View],
         EdgeKind::Reads => &[NodeKind::Constant, NodeKind::Variable],
+        EdgeKind::UsesTag => &[NodeKind::Function, NodeKind::Method],
         _ => &[
             NodeKind::Class,
             NodeKind::Function,
@@ -805,6 +822,7 @@ fn allows_loose_fallback(kind: EdgeKind) -> bool {
             | EdgeKind::AdminOf
             | EdgeKind::Tests
             | EdgeKind::Reads
+            | EdgeKind::UsesTag
     )
 }
 

@@ -33,6 +33,7 @@ pub enum EdgeKind {
     LoopBinding,
     ReverseAccessor,
     DerivedCollection,
+    UsesTag,
 }
 
 impl EdgeKind {
@@ -67,6 +68,7 @@ impl EdgeKind {
             EdgeKind::LoopBinding => "loop_binding",
             EdgeKind::ReverseAccessor => "reverse_accessor",
             EdgeKind::DerivedCollection => "derived_collection",
+            EdgeKind::UsesTag => "uses_tag",
         }
     }
 
@@ -101,6 +103,7 @@ impl EdgeKind {
             "loop_binding" => EdgeKind::LoopBinding,
             "reverse_accessor" => EdgeKind::ReverseAccessor,
             "derived_collection" => EdgeKind::DerivedCollection,
+            "uses_tag" => EdgeKind::UsesTag,
             _ => return None,
         };
 

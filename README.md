@@ -62,10 +62,21 @@ While refactoring a shared library, index other git refs of it alongside the ins
 
 ```toml
 [companions]
-versions = ["django-spire@refactor/next", "django-glue@v1.2.0"]
+versions = { django-spire = "refactor/next", django-glue = "v1.2.0" }
 ```
 
 Each `"package@ref"` is checked out from the package's own repository (its editable checkout, or the git url pip recorded) into `.constellation/sources/`, and indexed as a separate project (`django-spire@refactor/next`) rooted exactly like the `.venv` copy, so only the version suffix differs. These copies are reference-only: your code still resolves to the installed version, and you query the extra ones to compare. This needs the library installed editable or from git, so a repository exists to take other refs from.
+
+### Library history
+
+Reading history over time (`constellation_history`, `constellation_symbol_history`, `constellation_as_of`) needs a git repository. A library installed as a wheel in `.venv` has none, so give constellation each library's repository and it fetches the history at the tag matching the installed version, no local clone, no version drift:
+
+```toml
+[companions.repositories]
+django-spire = "https://github.com/your-org/django-spire"
+```
+
+The clone is cached under `.constellation/sources/`, so the network is used only the first time (or when the installed version changes). If no tag matches the installed version, that library's history is skipped rather than shown at the wrong version.
 
 ## How your agent uses it
 

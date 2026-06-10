@@ -32,17 +32,28 @@ const UNLINKABLE_KINDS: [NodeKind; 9] = [
 
 struct FakeContext {
     nodes: Vec<Arc<Node>>,
+    packages: Vec<(String, String)>,
 }
 
 impl FakeContext {
     fn new(nodes: Vec<Arc<Node>>) -> Self {
-        Self { nodes }
+        Self { nodes, packages: Vec::new() }
+    }
+
+    fn with_package(mut self, package: &str, project: &str) -> Self {
+        self.packages.push((package.to_string(), project.to_string()));
+
+        self
     }
 }
 
 impl LinkContext for FakeContext {
     fn exports_by_name(&self, name: &str) -> Vec<Arc<Node>> {
         self.nodes.iter().filter(|node| node.name == name).cloned().collect()
+    }
+
+    fn project_for_package(&self, package: &str) -> Option<&str> {
+        self.packages.iter().find(|(pkg, _)| pkg == package).map(|(_, project)| project.as_str())
     }
 }
 
@@ -234,6 +245,49 @@ fn link_declines_when_the_module_path_disagrees() {
     assert!(
         ImportLinker.link(&import, &context).is_none(),
         "a name match whose module path disagrees is not linked",
+    );
+}
+
+#[test]
+fn link_uses_package_to_project_evidence_for_a_reexported_symbol() {
+    // The defining file sits deeper than the imported package (a re-export) and
+    // under a stripped package root, so module_matches finds no overlap; the
+    // package name still pins the project.
+    let context = FakeContext::new(vec![export(
+        "django-spire",
+        "contrib/seeding/model/django/seeder.py",
+        "DjangoModelSeeder",
+        NodeKind::Class,
+    )])
+    .with_package("django_spire", "django-spire");
+
+    let import = pending("shop", "DjangoModelSeeder", "django_spire.contrib.seeding");
+
+    let link = ImportLinker.link(&import, &context).expect("package evidence links the re-export");
+
+    assert_eq!(link.confidence, 0.8, "a package-evidenced link carries the lower confidence");
+    assert!(link.edge.is_cross_project(), "the link spans the two projects");
+
+    assert_eq!(
+        link.edge.provenance.as_deref(),
+        Some("link:shop->django-spire"),
+        "provenance records the crossed boundary",
+    );
+}
+
+#[test]
+fn link_declines_package_evidence_when_the_project_has_two_same_named_exports() {
+    let context = FakeContext::new(vec![
+        export("django-spire", "a/x.py", "Thing", NodeKind::Class),
+        export("django-spire", "b/y.py", "Thing", NodeKind::Class),
+    ])
+    .with_package("django_spire", "django-spire");
+
+    let import = pending("shop", "Thing", "django_spire.contrib");
+
+    assert!(
+        ImportLinker.link(&import, &context).is_none(),
+        "two same-named exports in the named project are ambiguous and stay unlinked",
     );
 }
 

@@ -34,6 +34,32 @@ fn emits_member_access_ref_for_variable_attribute() {
 }
 
 #[test]
+fn emits_uses_tag_for_custom_tags_and_filters_only() {
+    let extractor = TemplateExtractor::new();
+    let project = ProjectId::new("blog");
+
+    let source = "{% load my_tags %}\n\
+                  {% if record %}{{ record.total|money }}{% endif %}\n\
+                  {% quick_filter_button label='x' %}\n\
+                  {{ value|truncatewords:30 }}\n";
+
+    let output = extractor.extract(&project, "templates/inventory/card.html", source);
+
+    let tags: Vec<&str> = output
+        .unresolved_refs
+        .iter()
+        .filter(|reference| reference.reference_kind == EdgeKind::UsesTag)
+        .map(|reference| reference.reference_name.as_str())
+        .collect();
+
+    assert!(tags.contains(&"quick_filter_button"), "a custom tag emits UsesTag, got {tags:?}");
+    assert!(tags.contains(&"money"), "a custom filter emits UsesTag, got {tags:?}");
+    assert!(!tags.contains(&"if"), "the builtin tag if must not emit, got {tags:?}");
+    assert!(!tags.contains(&"load"), "the builtin tag load must not emit, got {tags:?}");
+    assert!(!tags.contains(&"truncatewords"), "the builtin filter truncatewords must not emit, got {tags:?}");
+}
+
+#[test]
 fn emits_loop_binding_for_for_tag() {
     let extractor = TemplateExtractor::new();
     let project = ProjectId::new("blog");

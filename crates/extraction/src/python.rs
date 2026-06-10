@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use constellation_graph::{
@@ -110,6 +111,37 @@ const TYPING_NAMES: &[&str] = &[
     "Union",
 ];
 
+/// The lowercase Python builtin functions, dispatched by the interpreter with no
+/// project-local definition to bind to. A bare `print(...)` / `len(...)` /
+/// `isinstance(...)` call can never resolve to an indexed node, so emitting a
+/// `Calls` reference for it only manufactures a permanently-unresolved row. Skipped
+/// at extraction. Sorted for lookup-by-eye; matched only against a bare-identifier
+/// callee, so an attribute call (`queryset.filter(...)`, `value.get(...)`) is
+/// untouched and still routes through method dispatch. Capitalized builtins
+/// (`ValueError`, `KeyError`) read as constructors and take the `Instantiates`
+/// path instead, so they are intentionally absent here.
+const CALL_BUILTINS: &[&str] = &[
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes", "callable", "chr",
+    "classmethod", "complex", "delattr", "dict", "dir", "divmod", "enumerate", "eval", "exec",
+    "filter", "float", "format", "frozenset", "getattr", "globals", "hasattr", "hash", "hex", "id",
+    "input", "int", "isinstance", "issubclass", "iter", "len", "list", "locals", "map", "max",
+    "memoryview", "min", "next", "object", "oct", "open", "ord", "pow", "print", "property",
+    "range", "repr", "reversed", "round", "set", "setattr", "slice", "sorted", "staticmethod",
+    "str", "sum", "super", "tuple", "type", "vars", "zip",
+];
+
+/// The decorator names that are Python descriptor builtins or well-known framework
+/// decorators, none of which name a project-local symbol, so a `Decorates`
+/// reference to one never resolves and is pure noise. `@property` / `@classmethod`
+/// / `@x.setter` decorate in-language; `@pytest.fixture` / `@pytest.mark.django_db`
+/// / `@transaction.atomic` come from test and ORM libraries. A custom decorator
+/// (`@ai`, a project `@action`) is not listed: it can resolve to its definition.
+const DECORATOR_BUILTINS: &[&str] = &[
+    "abstractmethod", "abstractproperty", "atomic", "cached_property", "classmethod", "deleter",
+    "django_db", "final", "fixture", "override", "parametrize", "property", "setter",
+    "staticmethod", "wraps",
+];
+
 /// A bound on receiver-chain links walked looking for `.objects`, far past any
 /// real queryset chain, so the walk is provably finite.
 const CHAIN_DEPTH_MAX: u32 = 32;
@@ -142,18 +174,37 @@ const PARENTHESES_DEPTH_MAX: u32 = 1_000;
 /// An extractor of Python source into graph nodes, containment edges, and the
 /// unresolved references (calls, imports, inheritance, decorators) that
 /// resolution later turns into edges.
-pub struct PythonExtractor {
-    language: tree_sitter::Language,
+pub struct PythonExtractor;
+
+thread_local! {
+    /// The per-thread Python parser, reused across files. Extraction runs over
+    /// files on rayon workers, so one parser per thread is reuse-maximal with no
+    /// cross-thread sharing: a file pays for its parse, never for parser
+    /// construction.
+    static PARSER: RefCell<Parser> = RefCell::new(new_parser());
+}
+
+/// A Python parser with the grammar loaded. It panics only on a grammar against
+/// tree-sitter ABI mismatch, a build error that cannot arise at runtime in a
+/// correctly linked binary.
+fn new_parser() -> Parser {
+    let language: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
+
+    assert!(language.node_kind_count() > 0, "python grammar must expose node kinds");
+
+    let mut parser = Parser::new();
+
+    parser
+        .set_language(&language)
+        .expect("the bundled python grammar is ABI-compatible with tree-sitter");
+
+    parser
 }
 
 impl PythonExtractor {
-    /// The extractor, with the Python grammar loaded.
+    /// The extractor; the grammar loads per worker thread on first use.
     pub fn new() -> Self {
-        let language: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
-
-        assert!(language.node_kind_count() > 0, "python grammar must expose node kinds");
-
-        Self { language }
+        Self
     }
 }
 
@@ -177,13 +228,7 @@ impl Extractor for PythonExtractor {
             return output;
         }
 
-        let mut parser = Parser::new();
-
-        if parser.set_language(&self.language).is_err() {
-            return output;
-        }
-
-        let Some(tree) = parser.parse(source, None) else {
+        let Some(tree) = PARSER.with(|parser| parser.borrow_mut().parse(source, None)) else {
             return output;
         };
 
@@ -791,7 +836,9 @@ fn decorates_refs(
 
         assert!(count <= CHILDREN_MAX, "decorator fan-out exceeded {CHILDREN_MAX}");
 
-        if let Some(name) = decorator_base_name(bytes, *decorator) {
+        if let Some(name) = decorator_base_name(bytes, *decorator)
+            && !DECORATOR_BUILTINS.contains(&name.as_str())
+        {
             output.unresolved_refs.push(UnresolvedRef::new(
                 symbol_id.clone(),
                 name,
@@ -1226,6 +1273,10 @@ fn call_ref(file_path: &str, bytes: &[u8], frame: &Frame<'_>) -> Option<Unresolv
 
     assert!(!name.is_empty(), "callee name must not be empty");
 
+    if function.kind() == "identifier" && CALL_BUILTINS.contains(&name) {
+        return None;
+    }
+
     let position = frame.node.start_position();
 
     let mut reference = UnresolvedRef::new(
@@ -1430,7 +1481,7 @@ fn render_ref(file_path: &str, bytes: &[u8], frame: &Frame<'_>) -> Option<Unreso
 
 /// A `Renders` reference for a `template=` / `template_name=` string
 /// keyword argument on any call, the dominant convention in wrapper-based view
-/// layers (`portal_views.list_view(request, ..., template='page.html')`), which
+/// layers (`workspace_views.list_view(request, ..., template='page.html')`), which
 /// the direct-`render()` rule misses. Emitted alongside the call's own edge.
 fn template_kwarg_ref(file_path: &str, bytes: &[u8], frame: &Frame<'_>) -> Option<UnresolvedRef> {
     assert!(!file_path.is_empty(), "file_path must not be empty");
@@ -2502,6 +2553,18 @@ fn module_or_class_binding(
     node.visibility = Some(visibility_of(name));
     node.signature = string_list_signature(bytes, frame.node);
 
+    // The application namespace `app_name = 'django_spire'` declares: stored as the
+    // node's signature so route reverse-name resolution can fold it into the
+    // namespace chain (Django's app namespace, which the `include(namespace=...)`
+    // chain alone does not carry).
+    if name == "app_name"
+        && node.signature.is_none()
+        && let Some(right) = frame.node.child_by_field_name("right")
+        && let Some(value) = string_value(bytes, right)
+    {
+        node.signature = Some(value);
+    }
+
     output.edges.push(contains_edge(&frame.scope.parent_id, &id));
     output.nodes.push(node);
 }
@@ -2878,7 +2941,7 @@ fn function_kind(
 /// Whether a module-level function is a Django function-based view: its first
 /// parameter is `request` (the view calling convention) and it is not a pytest
 /// fixture. Catches the `def list_view(request, pk): ...` delegating views the
-/// portals use, which carry no view base class for `class_kind` to classify, so
+/// workspaces use, which carry no view base class for `class_kind` to classify, so
 /// generic extraction would otherwise file them as plain functions.
 fn is_function_view(bytes: &[u8], def_node: TsNode<'_>, decorators: &[String]) -> bool {
     let is_fixture = decorators
