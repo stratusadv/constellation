@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo/constellation-banner-dark.png" width="640" alt="constellation"></p>
+
 # constellation
 
 A cross-project knowledge graph of Django codebases, served to an LLM coding agent over MCP. constellation parses Python and Django into a graph of symbols, imports, calls, and Django structure such as models, URL routes, and templates. It links those graphs across separate repositories and answers an agent's questions about how your projects connect.

@@ -1,0 +1,7 @@
+# Statically link the MSVC C runtime so the release binary carries no dependency
+# on the VC++ redistributable (VCRUNTIME140.dll). A winget install lands on clean
+# Windows machines that lack that DLL, where a dynamically linked binary fails to
+# start with a blocking "DLL not found" dialog. Static linkage makes constellation
+# a self-contained executable that runs on a bare Windows install.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
