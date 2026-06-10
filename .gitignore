@@ -23,4 +23,7 @@ Desktop.ini
 
 # Local environment / credentials
 .env
+*.env
 .env.*
+
+scripts/
