@@ -26,4 +26,5 @@ Desktop.ini
 *.env
 .env.*
 
+manifests/
 scripts/

@@ -44,7 +44,10 @@ impl Progress {
     /// The render of the bar (or the resolving spinner) for one indexing phase event.
     pub fn on_phase(&mut self, phase: IndexPhase) {
         match phase {
-            IndexPhase::Extracting { files_done, files_total } => {
+            IndexPhase::Extracting {
+                files_done,
+                files_total,
+            } => {
                 self.draw_bar(files_done, files_total);
             }
             IndexPhase::Resolving => self.draw_spinner("resolving references"),
@@ -66,7 +69,10 @@ impl Progress {
     }
 
     fn draw_bar(&mut self, files_done: u32, files_total: u32) {
-        assert!(files_done <= files_total, "progress cannot exceed the total");
+        assert!(
+            files_done <= files_total,
+            "progress cannot exceed the total"
+        );
 
         if !self.enabled {
             return;
@@ -126,14 +132,20 @@ impl Progress {
 
         let mut stderr = std::io::stderr();
 
-        let _ = write!(stderr, "\r\x1b[K\x1b[2m{rail}\x1b[0m  {spinner} {message}{ellipsis}");
+        let _ = write!(
+            stderr,
+            "\r\x1b[K\x1b[2m{rail}\x1b[0m  {spinner} {message}{ellipsis}"
+        );
         let _ = stderr.flush();
 
         self.drawn = true;
     }
 
     fn gradient_bar(&self, filled: u32) -> String {
-        assert!(filled <= BAR_WIDTH, "filled cells stay within the bar width");
+        assert!(
+            filled <= BAR_WIDTH,
+            "filled cells stay within the bar width"
+        );
 
         let filled_glyph = if self.unicode { "█" } else { "#" };
         let empty_glyph = if self.unicode { "░" } else { "-" };
@@ -162,7 +174,11 @@ impl Progress {
     }
 
     fn spinner(&self) -> &'static str {
-        let frames = if self.unicode { SPINNER_UNICODE } else { SPINNER_ASCII };
+        let frames = if self.unicode {
+            SPINNER_UNICODE
+        } else {
+            SPINNER_ASCII
+        };
 
         frames[self.spinner_frame as usize % frames.len()]
     }
@@ -202,7 +218,9 @@ fn supports_unicode() -> bool {
         return std::env::var_os("WT_SESSION").is_some();
     }
 
-    std::env::var("TERM").map(|term| term != "linux").unwrap_or(true)
+    std::env::var("TERM")
+        .map(|term| term != "linux")
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -244,8 +262,18 @@ mod tests {
         let early = lerp_color(GRADIENT_START, GRADIENT_END, 0.25);
         let late = lerp_color(GRADIENT_START, GRADIENT_END, 0.75);
 
-        assert!(early.0 > late.0, "red descends from 139 to 34, got {} then {}", early.0, late.0);
-        assert!(early.1 < late.1, "green climbs from 92 to 211, got {} then {}", early.1, late.1);
+        assert!(
+            early.0 > late.0,
+            "red descends from 139 to 34, got {} then {}",
+            early.0,
+            late.0
+        );
+        assert!(
+            early.1 < late.1,
+            "green climbs from 92 to 211, got {} then {}",
+            early.1,
+            late.1
+        );
     }
 
     #[test]
@@ -253,7 +281,10 @@ mod tests {
         let progress = Progress::new("indexing");
 
         assert_eq!(progress.label, "indexing", "the label is stored verbatim");
-        assert_eq!(progress.spinner_frame, 0, "the spinner starts at its first frame");
+        assert_eq!(
+            progress.spinner_frame, 0,
+            "the spinner starts at its first frame"
+        );
         assert!(!progress.drawn, "nothing is drawn until a phase arrives");
     }
 
@@ -270,17 +301,33 @@ mod tests {
         // not stderr is a terminal, keeping this test independent of the runner.
         let mut progress = Progress::new("indexing");
 
-        progress.on_phase(IndexPhase::Extracting { files_done: 5, files_total: 3 });
+        progress.on_phase(IndexPhase::Extracting {
+            files_done: 5,
+            files_total: 3,
+        });
     }
 
     #[test]
     fn gradient_bar_colors_exactly_the_filled_cells() {
         let progress = Progress::new("indexing");
-        let colored = |filled: u32| -> usize { progress.gradient_bar(filled).matches("\u{1b}[38;2;").count() };
+        let colored = |filled: u32| -> usize {
+            progress
+                .gradient_bar(filled)
+                .matches("\u{1b}[38;2;")
+                .count()
+        };
 
         assert_eq!(colored(0), 0, "an empty bar colors no cells");
-        assert_eq!(colored(5), 5, "each filled cell gets its own truecolor escape");
-        assert_eq!(colored(BAR_WIDTH), BAR_WIDTH as usize, "a full bar colors every cell");
+        assert_eq!(
+            colored(5),
+            5,
+            "each filled cell gets its own truecolor escape"
+        );
+        assert_eq!(
+            colored(BAR_WIDTH),
+            BAR_WIDTH as usize,
+            "a full bar colors every cell"
+        );
     }
 
     #[test]

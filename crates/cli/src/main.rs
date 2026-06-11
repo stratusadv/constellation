@@ -172,7 +172,10 @@ fn history_command(rest: &[String]) -> Result<()> {
         );
     }
 
-    let workspace_root = database.parent().and_then(Path::parent).map(Path::to_path_buf);
+    let workspace_root = database
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
     let config = match &workspace_root {
         Some(root) => constellation_index::load_history_config(root),
         None => constellation_index::HistoryConfig::default(),
@@ -200,7 +203,9 @@ fn ingest_all_history(
     workspace_root: Option<&Path>,
 ) -> Result<()> {
     let projects = store.all_projects()?;
-    let repositories = workspace_root.map(constellation_index::load_companion_repositories).unwrap_or_default();
+    let repositories = workspace_root
+        .map(constellation_index::load_companion_repositories)
+        .unwrap_or_default();
     let fingerprint = constellation_index::extractor_fingerprint();
 
     let mut rows: Vec<HistoryRow> = Vec::new();
@@ -217,7 +222,11 @@ fn ingest_all_history(
         // `.git`) sources history from a full clone of that repo at the tag matching
         // the installed version; everything else reads its own root.
         let history_root = match workspace_root.zip(repositories.get(project.id.as_str())) {
-            Some((root, url)) => match constellation_index::fetch_companion_history_repo(root, project.id.as_str(), url) {
+            Some((root, url)) => match constellation_index::fetch_companion_history_repo(
+                root,
+                project.id.as_str(),
+                url,
+            ) {
                 Some(clone) => clone,
                 None => continue,
             },
@@ -239,14 +248,24 @@ fn ingest_all_history(
                 continue;
             }
 
-            let changes = if symbols { Some(store.count_symbol_revisions(&project.id)?) } else { None };
+            let changes = if symbols {
+                Some(store.count_symbol_revisions(&project.id)?)
+            } else {
+                None
+            };
 
-            rows.push(HistoryRow { label: project.id.as_str().to_string(), commits, changes, cached: true });
+            rows.push(HistoryRow {
+                label: project.id.as_str().to_string(),
+                commits,
+                changes,
+                cached: true,
+            });
 
             continue;
         }
 
-        let commits = ingest_history_with_progress(store, &project.id, &history_root, config.commits_max)?;
+        let commits =
+            ingest_history_with_progress(store, &project.id, &history_root, config.commits_max)?;
 
         // Zero commits means the root is not its own git repository (a `.venv` copy
         // shares the workspace's repo); replace_history already cleared any stale
@@ -255,14 +274,26 @@ fn ingest_all_history(
             continue;
         }
 
-        let changes =
-            if symbols { Some(ingest_symbols_with_progress(store, &project.id, &history_root)?) } else { None };
+        let changes = if symbols {
+            Some(ingest_symbols_with_progress(
+                store,
+                &project.id,
+                &history_root,
+            )?)
+        } else {
+            None
+        };
 
         if let Some(stamp) = stamp {
             store.set_git_ingest_stamp(&project.id, &stamp)?;
         }
 
-        rows.push(HistoryRow { label: project.id.as_str().to_string(), commits, changes, cached: false });
+        rows.push(HistoryRow {
+            label: project.id.as_str().to_string(),
+            commits,
+            changes,
+            cached: false,
+        });
     }
 
     print_history_summary(&rows, skipped);
@@ -339,7 +370,11 @@ fn print_history_summary(rows: &[HistoryRow], skipped: u32) {
     }
 
     let name_width = rows.iter().map(|row| row.label.len()).max().unwrap_or(0);
-    let commits_width = rows.iter().map(|row| digits(row.commits)).max().unwrap_or(1);
+    let commits_width = rows
+        .iter()
+        .map(|row| digits(row.commits))
+        .max()
+        .unwrap_or(1);
 
     println!("git history");
 
@@ -354,13 +389,16 @@ fn print_history_summary(rows: &[HistoryRow], skipped: u32) {
 
         let cached = if row.cached { "  (cached)" } else { "" };
 
-        let line = format!("  {label:<name_width$}  {commits:>commits_width$} commits{changes}{cached}");
+        let line =
+            format!("  {label:<name_width$}  {commits:>commits_width$} commits{changes}{cached}");
 
         println!("{}", line.trim_end());
     }
 
     if skipped > 0 {
-        println!("  ({skipped} companion/library projects skipped; set history.companions = true to include)");
+        println!(
+            "  ({skipped} companion/library projects skipped; set history.companions = true to include)"
+        );
     }
 }
 
@@ -373,7 +411,10 @@ fn is_workspace_primary(project_root: &str, workspace_root: Option<&Path>) -> bo
         return true;
     };
 
-    match (std::path::absolute(project_root), std::path::absolute(workspace_root)) {
+    match (
+        std::path::absolute(project_root),
+        std::path::absolute(workspace_root),
+    ) {
         (Ok(project), Ok(workspace)) => project == workspace,
         _ => false,
     }
@@ -424,7 +465,10 @@ fn discover_database_optional() -> Result<Option<PathBuf>> {
     loop {
         depth += 1;
 
-        assert!(depth <= DISCOVER_DEPTH_MAX, "directory walk exceeded {DISCOVER_DEPTH_MAX} levels");
+        assert!(
+            depth <= DISCOVER_DEPTH_MAX,
+            "directory walk exceeded {DISCOVER_DEPTH_MAX} levels"
+        );
 
         let candidate = directory.join(".constellation").join("index.db");
 
@@ -535,9 +579,12 @@ fn project_name(root: &Path) -> String {
         return name.to_string();
     }
 
-    let resolved = std::fs::canonicalize(root)
-        .ok()
-        .and_then(|absolute| absolute.file_name().and_then(|name| name.to_str()).map(str::to_string));
+    let resolved = std::fs::canonicalize(root).ok().and_then(|absolute| {
+        absolute
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    });
 
     let name = resolved.unwrap_or_else(|| "project".to_string());
 
@@ -598,9 +645,15 @@ fn index_companions(store: &Store, workspace_root: &Path) -> Result<Vec<SummaryR
         let project = ProjectId::new(target.project_id.as_str());
         let mut progress = progress::Progress::new(&format!("indexing {}", target.project_id));
 
-        index_project_reporting(store, &project, &target.project_id, &target.package_root, |phase| {
-            progress.on_phase(phase);
-        })?;
+        index_project_reporting(
+            store,
+            &project,
+            &target.project_id,
+            &target.package_root,
+            |phase| {
+                progress.on_phase(phase);
+            },
+        )?;
 
         progress.finish();
 
@@ -636,7 +689,10 @@ fn project_source(root: &Path, workspace_root: &Path, reference_only: bool) -> &
         return "";
     }
 
-    if root.components().any(|part| part.as_os_str() == "site-packages") {
+    if root
+        .components()
+        .any(|part| part.as_os_str() == "site-packages")
+    {
         return ".venv";
     }
 
@@ -702,7 +758,11 @@ fn print_summary_all_projects(store: &Store, workspace_root: &Path) -> Result<()
             label: project.id.as_str().to_string(),
             files: store.count_files(&project.id)?,
             nodes: store.count_nodes(&project.id)?,
-            source: project_source(Path::new(&project.root_path), workspace_root, project.reference_only),
+            source: project_source(
+                Path::new(&project.root_path),
+                workspace_root,
+                project.reference_only,
+            ),
         });
     }
 
@@ -781,7 +841,10 @@ fn smoke_check() -> Result<()> {
     let store = Store::open_in_memory()?;
     let fingerprint = store.schema_version()?;
 
-    assert!(fingerprint != 0, "an initialized store carries a schema fingerprint");
+    assert!(
+        fingerprint != 0,
+        "an initialized store carries a schema fingerprint"
+    );
 
     println!("{NAME} {VERSION}: in-memory store ready (schema {fingerprint:#010x})");
     println!("pass a repository path to index it");
@@ -797,14 +860,30 @@ mod tests {
 
     #[test]
     fn project_name_takes_the_last_path_segment() {
-        assert_eq!(project_name(Path::new("/srv/www/workspace")), "workspace", "the leaf directory names the project");
-        assert_eq!(project_name(Path::new("blog")), "blog", "a bare relative name is taken as-is");
-        assert_eq!(project_name(Path::new("a/b/c")), "c", "nested paths use the final segment");
+        assert_eq!(
+            project_name(Path::new("/srv/www/workspace")),
+            "workspace",
+            "the leaf directory names the project"
+        );
+        assert_eq!(
+            project_name(Path::new("blog")),
+            "blog",
+            "a bare relative name is taken as-is"
+        );
+        assert_eq!(
+            project_name(Path::new("a/b/c")),
+            "c",
+            "nested paths use the final segment"
+        );
     }
 
     #[test]
     fn project_name_ignores_a_trailing_separator() {
-        assert_eq!(project_name(Path::new("a/b/")), "b", "a trailing slash does not blank the name");
+        assert_eq!(
+            project_name(Path::new("a/b/")),
+            "b",
+            "a trailing slash does not blank the name"
+        );
     }
 
     #[test]
@@ -813,7 +892,10 @@ mod tests {
         // directory's actual name, which is always a non-empty segment.
         let name = project_name(Path::new("."));
 
-        assert!(!name.is_empty(), "the dot directory resolves to a real, non-empty name");
+        assert!(
+            !name.is_empty(),
+            "the dot directory resolves to a real, non-empty name"
+        );
         assert_ne!(name, ".", "the literal dot is never returned as the name");
     }
 
@@ -823,7 +905,11 @@ mod tests {
 
         let resolved = resolve_root(directory.path()).unwrap();
 
-        assert!(resolved.is_absolute(), "a canonical root is absolute, got {}", resolved.display());
+        assert!(
+            resolved.is_absolute(),
+            "a canonical root is absolute, got {}",
+            resolved.display()
+        );
         assert!(
             !resolved.to_string_lossy().starts_with(r"\\?\"),
             "the Windows verbatim prefix is stripped, got {}",
@@ -836,26 +922,45 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("does-not-exist");
 
-        assert!(resolve_root(&missing).is_err(), "canonicalizing an absent path fails");
+        assert!(
+            resolve_root(&missing).is_err(),
+            "canonicalizing an absent path fails"
+        );
     }
 
     #[test]
     fn project_source_tags_each_origin() {
         let workspace = Path::new("/code/workspace");
 
-        assert_eq!(project_source(workspace, workspace, false), "", "the workspace itself has no tag");
         assert_eq!(
-            project_source(Path::new("/code/workspace/.venv/Lib/site-packages/robit"), workspace, false),
+            project_source(workspace, workspace, false),
+            "",
+            "the workspace itself has no tag"
+        );
+        assert_eq!(
+            project_source(
+                Path::new("/code/workspace/.venv/Lib/site-packages/robit"),
+                workspace,
+                false
+            ),
             ".venv",
             "a site-packages path is the installed copy",
         );
         assert_eq!(
-            project_source(Path::new("/code/.constellation/sources/x/pkg"), workspace, true),
+            project_source(
+                Path::new("/code/.constellation/sources/x/pkg"),
+                workspace,
+                true
+            ),
             "ref",
             "a reference-only checkout is a version ref",
         );
         assert_eq!(
-            project_source(Path::new("/code/django-spire/django_spire"), workspace, false),
+            project_source(
+                Path::new("/code/django-spire/django_spire"),
+                workspace,
+                false
+            ),
             "local",
             "a working copy outside the venv is a local override",
         );

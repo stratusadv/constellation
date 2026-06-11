@@ -14,7 +14,7 @@ An agent exploring a codebase without an index spends most of its budget on grep
 
     winget install stratusadv.constellation
 
-This installs the binary, adds it to your PATH, and registers the MCP server with OpenCode and Claude Code. Open a new terminal, then index each repository:
+This installs the binary, adds it to your PATH, and registers the MCP server with Claude Code, Codex, and OpenCode. Grok Build discovers the configured server on its own, so it needs no registration. Open a new terminal, then index each repository:
 
     constellation init
 

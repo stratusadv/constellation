@@ -40,7 +40,9 @@ fn write_icon(ico_path: &std::path::Path) {
     use resvg::{tiny_skia, usvg};
 
     let svg = std::fs::read_to_string(FAVICON_SVG_PATH).expect("read the favicon svg");
-    let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).expect("parse the favicon svg");
+
+    let tree =
+        usvg::Tree::from_str(&svg, &usvg::Options::default()).expect("parse the favicon svg");
 
     let intrinsic = tree.size().width();
 

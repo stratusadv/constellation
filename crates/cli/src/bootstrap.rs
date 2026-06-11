@@ -4,14 +4,17 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-/// The registration of `constellation serve` as an MCP server in every supported agent.
-/// The registered command takes no database argument (`serve` discovers the
-/// project's `.constellation/index.db` from the working directory), so one
-/// registration covers every project.
+/// The registration of `constellation serve` as an MCP server with every agent
+/// that needs it (Claude Code, Codex, and OpenCode; Grok Build discovers a
+/// configured server on its own). The registered command takes no database
+/// argument (`serve` discovers the project's `.constellation/index.db` from the
+/// working directory), so one registration covers every project.
 pub fn install() -> Result<()> {
     install_claude_code();
+    install_codex();
     install_opencode();
 
+    println!("Grok Build: discovers constellation automatically; no registration needed");
     println!("Then, in each project: `constellation init`");
 
     Ok(())
@@ -22,6 +25,7 @@ pub fn install() -> Result<()> {
 /// the agent registrations are undone.
 pub fn uninstall() -> Result<()> {
     uninstall_claude_code();
+    uninstall_codex();
     uninstall_opencode();
 
     println!("Project indexes are kept; delete each `.constellation/` to remove them");
@@ -45,9 +49,19 @@ fn server_command() -> String {
 fn install_claude_code() {
     let executable = server_command();
 
-    let status = claude_command(&[
-        "mcp", "add", "--scope", "user", "constellation", "--", executable.as_str(), "serve",
-    ])
+    let status = agent_command(
+        "claude",
+        &[
+            "mcp",
+            "add",
+            "--scope",
+            "user",
+            "constellation",
+            "--",
+            executable.as_str(),
+            "serve",
+        ],
+    )
     .status();
 
     match status {
@@ -65,7 +79,11 @@ fn install_claude_code() {
 
 /// The removal of the Claude Code registration via its own CLI (user scope).
 fn uninstall_claude_code() {
-    let status = claude_command(&["mcp", "remove", "--scope", "user", "constellation"]).status();
+    let status = agent_command(
+        "claude",
+        &["mcp", "remove", "--scope", "user", "constellation"],
+    )
+    .status();
 
     match status {
         Ok(status) if status.success() => {
@@ -80,21 +98,72 @@ fn uninstall_claude_code() {
     }
 }
 
-/// A `claude` CLI invocation. On Windows the `claude` entry point is an npm
-/// shim (`claude.cmd`) that `Command::new` cannot launch directly, so it is run
-/// through `cmd /c`; on other platforms `claude` is invoked directly.
-fn claude_command(arguments: &[&str]) -> Command {
-    assert!(!arguments.is_empty(), "a claude invocation needs arguments");
+/// The registration of Codex via its own CLI, which writes the global
+/// `~/.codex/config.toml`, so one registration covers every project. Best-effort:
+/// a missing or failing `codex` falls back to printed manual instructions, so it
+/// never aborts the rest of `install`.
+fn install_codex() {
+    let executable = server_command();
+
+    let status = agent_command(
+        "codex",
+        &[
+            "mcp",
+            "add",
+            "constellation",
+            "--",
+            executable.as_str(),
+            "serve",
+        ],
+    )
+    .status();
+
+    match status {
+        Ok(status) if status.success() => {
+            println!("Codex: registered constellation");
+        }
+        _ => {
+            println!(
+                "Codex: add manually -> \
+                 codex mcp add constellation -- {executable} serve",
+            );
+        }
+    }
+}
+
+/// The removal of the Codex registration via its own CLI, the inverse of
+/// [`install_codex`].
+fn uninstall_codex() {
+    let status = agent_command("codex", &["mcp", "remove", "constellation"]).status();
+
+    match status {
+        Ok(status) if status.success() => {
+            println!("Codex: removed constellation");
+        }
+        _ => {
+            println!("Codex: remove manually -> codex mcp remove constellation");
+        }
+    }
+}
+
+/// A CLI invocation of an agent's own entry point (`claude`, `codex`). On Windows
+/// such an entry point is often a shim (`claude.cmd` from npm) or a portable
+/// `.exe` that `Command::new` cannot reliably launch by bare name, so it is run
+/// through `cmd /c`, which resolves either; on other platforms it is invoked
+/// directly.
+fn agent_command(program: &str, arguments: &[&str]) -> Command {
+    assert!(!program.is_empty(), "an agent invocation needs a program");
+    assert!(!arguments.is_empty(), "an agent invocation needs arguments");
 
     #[cfg(windows)]
     let mut command = {
         let mut shim = Command::new("cmd");
-        shim.arg("/c").arg("claude");
+        shim.arg("/c").arg(program);
         shim
     };
 
     #[cfg(not(windows))]
-    let mut command = Command::new("claude");
+    let mut command = Command::new(program);
 
     command.args(arguments);
 
@@ -214,7 +283,9 @@ fn opencode_config_path() -> Result<PathBuf> {
 /// `$XDG_CONFIG_HOME/opencode` when that variable is set, else
 /// `<home>/.config/opencode` (the fallback on every OS, Windows included).
 fn opencode_config_dir() -> Result<PathBuf> {
-    let xdg = std::env::var("XDG_CONFIG_HOME").ok().filter(|value| !value.is_empty());
+    let xdg = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|value| !value.is_empty());
     let home = dirs::home_dir().context("could not determine the home directory")?;
 
     Ok(resolve_opencode_dir(xdg.as_deref(), &home))
@@ -235,8 +306,8 @@ fn read_config(path: &Path) -> Result<Value> {
         return Ok(json!({}));
     }
 
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
 
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
@@ -256,7 +327,7 @@ fn write_config(path: &Path, config: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        claude_command, opencode_config_path, read_config, resolve_opencode_dir, server_command,
+        agent_command, opencode_config_path, read_config, resolve_opencode_dir, server_command,
         write_config,
     };
 
@@ -281,8 +352,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_command_forwards_its_arguments() {
-        let command = claude_command(&["mcp", "remove", "--scope", "user", "constellation"]);
+    fn agent_command_forwards_its_arguments() {
+        let command = agent_command(
+            "claude",
+            &["mcp", "remove", "--scope", "user", "constellation"],
+        );
 
         let arguments: Vec<String> = command
             .get_args()
@@ -303,20 +377,71 @@ mod tests {
         let program = command.get_program().to_string_lossy().into_owned();
 
         #[cfg(windows)]
-        assert_eq!(program, "cmd", "the npm shim is launched through cmd on Windows");
+        assert_eq!(
+            program, "cmd",
+            "an agent entry point is launched through cmd on Windows"
+        );
         #[cfg(not(windows))]
-        assert_eq!(program, "claude", "the claude entry point is launched directly off Windows");
+        assert_eq!(
+            program, "claude",
+            "the agent entry point is launched directly off Windows"
+        );
+    }
+
+    #[test]
+    fn agent_command_uses_the_named_program() {
+        let command = agent_command("codex", &["mcp", "remove", "constellation"]);
+
+        let program = command.get_program().to_string_lossy().into_owned();
+
+        let arguments: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                program, "cmd",
+                "a portable exe is launched through cmd on Windows"
+            );
+            assert!(
+                arguments.starts_with(&["/c".to_string(), "codex".to_string()]),
+                "cmd runs the named program in /c mode, got {arguments:?}",
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert_eq!(
+                program, "codex",
+                "the named program is launched directly off Windows"
+            );
+            assert!(
+                arguments.starts_with(&["mcp".to_string()]),
+                "the arguments are forwarded as-is, got {arguments:?}",
+            );
+        }
     }
 
     #[test]
     #[should_panic(expected = "needs arguments")]
-    fn claude_command_rejects_empty_arguments() {
-        let _ = claude_command(&[]);
+    fn agent_command_rejects_empty_arguments() {
+        let _ = agent_command("claude", &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "needs a program")]
+    fn agent_command_rejects_an_empty_program() {
+        let _ = agent_command("", &["mcp"]);
     }
 
     #[test]
     fn server_command_is_never_empty() {
-        assert!(!server_command().is_empty(), "the registered server command always resolves to a value");
+        assert!(
+            !server_command().is_empty(),
+            "the registered server command always resolves to a value"
+        );
     }
 
     #[test]
@@ -329,7 +454,9 @@ mod tests {
             "the config file is opencode.json",
         );
         assert_eq!(
-            path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str()),
+            path.parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str()),
             Some("opencode"),
             "it lives under the opencode config directory",
         );
@@ -340,7 +467,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("absent.json");
 
-        assert_eq!(read_config(&missing).unwrap(), json!({}), "an absent config reads as an empty object");
+        assert_eq!(
+            read_config(&missing).unwrap(),
+            json!({}),
+            "an absent config reads as an empty object"
+        );
     }
 
     #[test]
@@ -355,6 +486,10 @@ mod tests {
 
         write_config(&path, &config).unwrap();
 
-        assert_eq!(read_config(&path).unwrap(), config, "the written config reads back identically");
+        assert_eq!(
+            read_config(&path).unwrap(),
+            config,
+            "the written config reads back identically"
+        );
     }
 }
