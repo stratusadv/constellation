@@ -1,5 +1,5 @@
 //! Companion-library discovery: when a Django workspace is indexed, locate the
-//! company packages it installs (`django-spire`, `django-glue`, `robit`) inside
+//! company packages it installs (`django-spire`, `django-glue`, `robit`, `dandy`) inside
 //! its virtual environment and register each as its own project, so the workspace's
 //! imports of them resolve across a project boundary instead of dead-ending at an
 //! external stub.
@@ -20,7 +20,7 @@
 //! ```toml
 //! [companions]
 //! enabled = true
-//! packages = ["django-spire", "django-glue", "robit"]
+//! packages = ["django-spire", "django-glue", "robit", "dandy"]
 //! # venv = ".venv"
 //!
 //! # Each package -> ref entry indexes that git ref of a companion as its own
@@ -49,7 +49,7 @@ use crate::IndexError;
 /// The companion packages registered by default when none are configured. Each is
 /// a project id (hyphenated); the import package name is the id with hyphens
 /// replaced by underscores (`django-spire` -> `django_spire`).
-const COMPANIONS_DEFAULT: &[&str] = &["django-spire", "django-glue", "robit"];
+const COMPANIONS_DEFAULT: &[&str] = &["django-spire", "django-glue", "robit", "dandy"];
 
 /// The default git repository for each default companion, used to fetch its
 /// history (at the tag matching the installed version) when `[companions]
@@ -59,6 +59,7 @@ const COMPANION_REPOSITORIES_DEFAULT: &[(&str, &str)] = &[
     ("django-spire", "https://github.com/stratusadv/django-spire"),
     ("django-glue", "https://github.com/stratusadv/django-glue"),
     ("robit", "https://github.com/stratusadv/robit"),
+    ("dandy", "https://github.com/stratusadv/dandy"),
 ];
 
 /// The fail-fast bound on companions resolved in one discovery pass.
@@ -210,7 +211,7 @@ pub fn discover_companions(
 }
 
 /// The `[companions]` section read from `.constellation/config.toml`. A missing file
-/// yields the defaults (discovery on, the three company packages); a malformed file
+/// yields the defaults (discovery on, the four company packages); a malformed file
 /// also yields the defaults: an optional config must never fail an index.
 fn load_config(workspace_root: &Path) -> CompanionsConfig {
     read_config_file(workspace_root).companions

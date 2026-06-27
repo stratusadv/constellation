@@ -6,7 +6,7 @@ A cross-project knowledge graph of Django codebases, served to an LLM coding age
 
 ## Why it exists
 
-An agent exploring a codebase without an index spends most of its budget on grep and file reads, and it typically sees one repository at a time. Most of our projects use shared packages (`django-spire`, `django-glue`, `robit`), and a single request crosses those boundaries. A per-repo index cannot show those edges, and grep cannot follow them across repositories at all.
+An agent exploring a codebase without an index spends most of its budget on grep and file reads, and it typically sees one repository at a time. Most of our projects use shared packages (`django-spire`, `django-glue`, `robit`, `dandy`), and a single request crosses those boundaries. A per-repo index cannot show those edges, and grep cannot follow them across repositories at all.
 
 `constellation` builds the graph once and links it across repositories, so an agent can trace a flow that leaves one repo and lands in another, and answer in a single query what would otherwise be a grep-and-read hunt across several checkouts.
 
@@ -45,14 +45,14 @@ Update:
 
 ## Companions
 
-Most requests cross into the shared packages a project installs (`django-spire`, `django-glue`, `robit`). On `init`, constellation finds those packages in the project's virtual environment, indexes each as its own project, and links the imports across the boundary, so the agent can follow a call from your code into the library and back.
+Most requests cross into the shared packages a project installs (`django-spire`, `django-glue`, `robit`, `dandy`). On `init`, constellation finds those packages in the project's virtual environment, indexes each as its own project, and links the imports across the boundary, so the agent can follow a call from your code into the library and back.
 
 `init` writes a starter `.constellation/config.toml` you can edit:
 
 ```toml
 [companions]
 enabled = true
-packages = ["django-spire", "django-glue", "robit"]
+packages = ["django-spire", "django-glue", "robit", "dandy"]
 # venv = ".venv"
 ```
 

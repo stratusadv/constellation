@@ -515,9 +515,9 @@ fn scaffold_config(root: &Path) {
 # Set to false to index this project only.
 enabled = true
 
-# The libraries to index, by name. Defaults to the three below when omitted; give
+# The libraries to index, by name. Defaults to the four below when omitted; give
 # your own list, or [] to index none while leaving companions enabled.
-# packages = [\"django-spire\", \"django-glue\", \"robit\"]
+# packages = [\"django-spire\", \"django-glue\", \"robit\", \"dandy\"]
 
 # Libraries to leave out of the default set, without having to re-list the rest.
 # exclude = [\"robit\"]
@@ -533,7 +533,7 @@ enabled = true
 
 # The git repository for each library, used to fetch its commit history at the tag
 # matching the installed version, no local clone needed. Defaults to the
-# django-spire / django-glue / robit repos, so library history works out of the
+# django-spire / django-glue / robit / dandy repos, so library history works out of the
 # box; set this to override those or add your own. Cloned into
 # .constellation/sources/ and cached.
 # repositories = { django-spire = \"https://github.com/stratusadv/django-spire\" }
