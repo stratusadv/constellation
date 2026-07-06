@@ -134,5 +134,7 @@ jobs:
         $tag = "${{ github.event.release.tag_name }}"
         $version = $tag -replace '^v', ''
         $url = "https://github.com/${{ github.repository }}/releases/download/$tag/constellation-setup-$version.exe"
-        .\wingetcreate.exe update stratusadv.constellation --version $version --urls "$url" --submit --token "${{ secrets.WINGET_TOKEN }}"
+        # Inno Setup stubs are 32-bit, so wingetcreate reads the .exe as x86 and cannot match
+        # the x64/user node in the existing manifest. Pin arch|scope overrides to force the match.
+        .\wingetcreate.exe update stratusadv.constellation --version $version --urls "$url|x64|user" --submit --token "${{ secrets.WINGET_TOKEN }}"
       shell: pwsh

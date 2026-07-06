@@ -181,7 +181,7 @@ checksum = "baf0a07a401f374238ab8e2f11a104d2851bf9ce711ec69804834de8af45c7af"
 
 [[package]]
 name = "constellation-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "constellation-graph",
@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-extraction"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "constellation-graph",
  "constellation-resolution",
@@ -214,11 +214,11 @@ dependencies = [
 
 [[package]]
 name = "constellation-graph"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "constellation-index"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "constellation-extraction",
  "constellation-graph",
@@ -238,14 +238,14 @@ dependencies = [
 
 [[package]]
 name = "constellation-linking"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "constellation-graph",
 ]
 
 [[package]]
 name = "constellation-mcp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "constellation-graph",
  "constellation-index",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-resolution"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "constellation-graph",
  "divan",
@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-store"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "constellation-graph",
  "constellation-resolution",
