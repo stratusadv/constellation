@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use constellation_graph::{Edge, EdgeKind, Node, NodeId, NodeKind, ProjectId};
+use constellation_graph::{
+    Edge, EdgeKind, Node, NodeId, NodeKind, ProjectId, is_generated_path,
+};
 
 /// An import left unresolved within its own project, a candidate for linking
 /// to a symbol in another project.
@@ -72,9 +74,11 @@ impl ImportLinker {
             .exports_by_name(&pending.reference_name)
             .into_iter()
             .filter(|node| {
+                // A `path` symbol parsed out of a bundled `Chart.min.js` must
+                // never become the link target for `from django.urls import path`.
                 node.project_id != pending.project_id
                     && is_linkable(node.kind)
-                    && !is_generated_target(&node.file_path)
+                    && !is_generated_path(&node.file_path)
             })
             .collect();
 
@@ -141,40 +145,6 @@ fn make_link(pending: &PendingImport, target: &Node, confidence: f32) -> Project
         .with_provenance(provenance);
 
     ProjectLink::new(edge, confidence)
-}
-
-/// Whether a defining file is machine-generated, minified, or vendored, and
-/// therefore never a real cross-project import target. A `path` symbol parsed
-/// out of a bundled `Chart.min.js` must not become the link target for
-/// `from django.urls import path`.
-fn is_generated_target(file_path: &str) -> bool {
-    let base = file_path.rsplit(['/', '\\']).next().unwrap_or(file_path);
-
-    // Case-insensitive checks without allocating a lowercased copy of the path
-    // per candidate; this runs inside the per-candidate link filter.
-    if ends_with_ignore_ascii_case(base, ".min.js")
-        || ends_with_ignore_ascii_case(base, ".min.css")
-        || ends_with_ignore_ascii_case(base, ".bundle.js")
-        || ends_with_ignore_ascii_case(base, "_pb2.py")
-    {
-        return true;
-    }
-
-    file_path.split(['/', '\\']).any(|segment| {
-        segment.eq_ignore_ascii_case("migrations")
-            || segment.eq_ignore_ascii_case("vendor")
-            || segment.eq_ignore_ascii_case("staticfiles")
-            || segment.eq_ignore_ascii_case("static_files")
-            || segment.eq_ignore_ascii_case("node_modules")
-    })
-}
-
-/// Whether `text` ends with `suffix`, ASCII case-insensitive, without allocating.
-fn ends_with_ignore_ascii_case(text: &str, suffix: &str) -> bool {
-    let text = text.as_bytes();
-    let suffix = suffix.as_bytes();
-
-    text.len() >= suffix.len() && text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 /// Whether a node kind is something another project would import.

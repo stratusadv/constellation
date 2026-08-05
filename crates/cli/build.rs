@@ -17,7 +17,7 @@ const FAVICON_SVG_PATH: &str = concat!(
 #[cfg(windows)]
 const ICON_SIZES_PX: [u32; 5] = [16, 32, 48, 128, 256];
 
-/// Renders the favicon SVG into an `.ico` and embeds it in the executable.
+/// The favicon SVG rendered into an `.ico` and embedded in the executable.
 #[cfg(windows)]
 fn embed_windows_icon() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
@@ -34,7 +34,7 @@ fn embed_windows_icon() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
-/// Renders the favicon SVG at every icon size and writes a multi-resolution `.ico`.
+/// The favicon SVG rendered at every icon size and written as a multi-resolution `.ico`.
 #[cfg(windows)]
 fn write_icon(ico_path: &std::path::Path) {
     use resvg::{tiny_skia, usvg};
@@ -75,7 +75,7 @@ fn write_icon(ico_path: &std::path::Path) {
     icon_dir.write(file).expect("write the ico file");
 }
 
-/// Un-premultiplies tiny-skia pixels into the straight RGBA bytes `.ico` expects.
+/// The tiny-skia pixels un-premultiplied into the straight RGBA bytes `.ico` expects.
 #[cfg(windows)]
 fn straight_rgba(pixels: &[resvg::tiny_skia::PremultipliedColorU8]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(pixels.len() * 4);

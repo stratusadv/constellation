@@ -1,0 +1,46 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: "python(\"apiary/beehive/choices.py\", CHOICES)"
+---
+file    apiary/beehive/choices.py
+project apiary
+
+nodes (8)
+  file       choices.py              apiary/beehive/choices.py       1:0-15:0
+  class      HiveStatus              HiveStatus                      6:0-9:40
+    visibility  public
+  constant   ACTIVE                  HiveStatus.ACTIVE               7:4-7:31
+    visibility  public
+  constant   DORMANT                 HiveStatus.DORMANT              8:4-8:34
+    visibility  public
+  constant   COLLAPSED               HiveStatus.COLLAPSED            9:4-9:40
+    visibility  public
+  class      InspectionOutcome       InspectionOutcome               12:0-14:27
+    visibility  public
+  constant   PASSED                  InspectionOutcome.PASSED        13:4-13:21
+    visibility  public
+  constant   FOLLOW_UP               InspectionOutcome.FOLLOW_UP     14:4-14:27
+    visibility  public
+
+edges (7)
+  contains            apiary/beehive/choices.py       -> HiveStatus  [extraction:python]
+  contains            apiary/beehive/choices.py       -> InspectionOutcome  [extraction:python]
+  contains            HiveStatus                      -> HiveStatus.ACTIVE  [extraction:python]
+  contains            HiveStatus                      -> HiveStatus.COLLAPSED  [extraction:python]
+  contains            HiveStatus                      -> HiveStatus.DORMANT  [extraction:python]
+  contains            InspectionOutcome               -> InspectionOutcome.FOLLOW_UP  [extraction:python]
+  contains            InspectionOutcome               -> InspectionOutcome.PASSED  [extraction:python]
+
+refs (4)
+  imports             apiary/beehive/choices.py       -> "StrEnum"  @1:17
+    candidates  enum
+  imports             apiary/beehive/choices.py       -> "HiveTextChoices"  @3:34
+    candidates  hivecore.core.choices
+  extends             HiveStatus                      -> "HiveTextChoices"  @6:17
+  extends             InspectionOutcome               -> "StrEnum"  @12:24
+
+imports (2)
+  StrEnum                 StrEnum                 from enum
+  HiveTextChoices         HiveTextChoices         from hivecore.core.choices
+
+events (0)

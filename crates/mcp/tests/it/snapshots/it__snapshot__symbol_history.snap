@@ -1,0 +1,7 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+history of recalculate_totals: 2 changes, newest first
+  2020-02-10 <commit-2> modified method orders/models.py::Order.recalculate_totals  [(self, precision)]
+  2020-01-05 <commit-1> added method orders/models.py::Order.recalculate_totals  [(self)]

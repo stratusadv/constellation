@@ -1,0 +1,27 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+[shop] model Order @ orders/models.py::Order (orders/models.py:6)
+[shop] view OrderDetailView @ orders/views.py::OrderDetailView (orders/views.py:7)
+[shop] selector order-card @ .order-card (static/orders.css:1)
+[shop] template orders/base.html @ orders/base.html (templates/orders/base.html:1)
+[shop] template orders/checkout.html @ orders/checkout.html (templates/orders/checkout.html:1)
+[shop] template orders/detail.html @ orders/detail.html (templates/orders/detail.html:1)
+[shop] method recalculate_totals @ Order.recalculate_totals (orders/models.py:10)  (self)
+[shop] method audit @ Order.audit (orders/models.py:13)  (self)
+[shop] route checkout @ orders/urls.py::route::checkout/ (orders/urls.py:8)
+[shop] route detail @ orders/urls.py::route::<int:pk>/ (orders/urls.py:9)
+[shop] view checkout_view @ orders/views.py::checkout_view (orders/views.py:12)  (request)
+[shop] field reference @ Order.reference (orders/models.py:7)  CharField(max_length=32)
+[shop] field total @ Order.total (orders/models.py:8)  DecimalField(max_digits=10, decimal_places=2)
+[shop] file orders.css @ static/orders.css (static/orders.css:1)
+[shop] file __init__.py @ orders/__init__.py (orders/__init__.py:1)
+[shop] file models.py @ orders/models.py (orders/models.py:1)
+[shop] file urls.py @ orders/urls.py (orders/urls.py:1)
+[shop] file views.py @ orders/views.py (orders/views.py:1)
+[shop] variable app_name @ orders/urls.py::app_name (orders/urls.py:5)  orders
+[shop] variable urlpatterns @ orders/urls.py::urlpatterns (orders/urls.py:7)
+[shop] class OrderTestCase @ orders/tests/test_orders.py::OrderTestCase (orders/tests/test_orders.py:6)
+[shop] method test_recalculate_totals @ OrderTestCase.test_recalculate_totals (orders/tests/test_orders.py:7)  (self)
+[shop] file test_orders.py @ orders/tests/test_orders.py (orders/tests/test_orders.py:1)

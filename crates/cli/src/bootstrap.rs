@@ -4,33 +4,268 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use crate::commands::supervise::SUPERVISE_FLAG;
+
+/// The tool names the `PreToolUse` hook enriches, as the regular expression
+/// Claude Code matches a tool call against.
+const HOOK_MATCHER: &str = "Grep|Glob|Read|Bash";
+
+/// The seconds Claude Code waits for the hook before abandoning it. The hook
+/// budgets itself far tighter; this is only the outer guard.
+const HOOK_TIMEOUT_SECS: u64 = 5;
+
 /// The registration of `constellation serve` as an MCP server with every agent
 /// that needs it (Claude Code, Codex, and OpenCode; Grok Build discovers a
 /// configured server on its own). The registered command takes no database
 /// argument (`serve` discovers the project's `.constellation/index.db` from the
 /// working directory), so one registration covers every project.
-pub fn install() -> Result<()> {
+///
+/// Registered with `--supervise`, so the client's process outlives the worker it
+/// proxies and a `cargo xtask install` reaches a running session without anyone
+/// reconnecting. The flag costs a session nothing when constellation is not being
+/// worked on: the supervisor is a pipe until the binary underneath it changes.
+///
+/// Deliberately no hook at user scope. A hook is a Claude Code feature, and
+/// registering one for the whole machine would fire it in every project there,
+/// including the ones constellation has never indexed, where it can only spawn
+/// and exit. [`install_project_hook`] registers it per project instead, so a
+/// project without a `.constellation/` directory never pays for one. What every
+/// client gets regardless is the MCP server's own `instructions`, which carry
+/// the same "ask the graph before you grep" message over the protocol they all
+/// speak rather than through one client's settings file.
+///
+/// The project hook is registered for the directory this ran inside, when that
+/// directory holds an index, and skipped by `--no-hooks`. `init` is what normally
+/// writes it; this covers the project indexed before the binary knew how, which
+/// otherwise needs a re-index to gain one.
+pub fn install(rest: &[String]) -> Result<()> {
+    let hooks = !rest.iter().any(|argument| argument == "--no-hooks");
+
     install_claude_code();
     install_codex();
     install_opencode();
 
     println!("Grok Build: discovers constellation automatically; no registration needed");
+
+    install_hook_here(hooks);
+
     println!("Then, in each project: `constellation init`");
 
     Ok(())
 }
 
+/// The project hook registered for the working directory's own project, unless
+/// `--no-hooks` was passed or the directory sits in no indexed project.
+fn install_hook_here(hooks: bool) {
+    if !hooks {
+        println!("  hook     skipped (--no-hooks)");
+
+        return;
+    }
+
+    let Some(root) = indexed_root_here() else {
+        return;
+    };
+
+    install_project_hook(&root);
+}
+
+/// The root of the indexed project the working directory sits in, or `None` when
+/// it sits in none. The root holds the `.constellation/` directory, so it is the
+/// database's grandparent.
+fn indexed_root_here() -> Option<PathBuf> {
+    let database = crate::workspace::discover_database_optional().ok()??;
+
+    database.parent().and_then(Path::parent).map(Path::to_path_buf)
+}
+
 /// The removal of `constellation` from every supported agent, the inverse of
-/// `install`. Each project's `.constellation/` index is left untouched; only
-/// the agent registrations are undone.
+/// `install`. Each project's `.constellation/` index is left untouched; only the
+/// agent registrations are undone.
+///
+/// The user-scope hook is removed too. Nothing writes one any more, but a
+/// machine that ran an earlier `install` still carries it, and leaving it behind
+/// would keep taxing every non-constellation project on that machine.
 pub fn uninstall() -> Result<()> {
     uninstall_claude_code();
     uninstall_codex();
     uninstall_opencode();
+    uninstall_hooks();
 
     println!("Project indexes are kept; delete each `.constellation/` to remove them");
+    println!("Project hooks: delete `.claude/settings.local.json` in each indexed project");
 
     Ok(())
+}
+
+/// The `PreToolUse` hook registered for one project, in its own
+/// `.claude/settings.local.json`.
+///
+/// Project scope rather than user scope is the whole point: Claude Code matches
+/// a hook on the tool name alone, so a user-scope registration runs on every
+/// `Grep`, `Read`, and `Bash` in every project on the machine, and in one
+/// constellation has not indexed it can only start up, find no database, and
+/// exit. Writing it beside the index means the two appear and disappear
+/// together.
+///
+/// `settings.local.json` rather than `settings.json` because the entry names an
+/// absolute path to this binary, which is correct for this machine and wrong for
+/// a teammate's; the local file is also the one Claude Code keeps out of version
+/// control, so a repository shared with people using other clients gains nothing
+/// it has to ignore.
+pub fn install_project_hook(root: &Path) {
+    match register_project_hook(root) {
+        Ok(path) => {
+            println!("  hook     registered in {}", path.display());
+
+            // Deliberately no PostToolUse hook on Write or Edit: `serve` already
+            // watches every indexed root and re-indexes after each debounced
+            // burst, so a post-write re-index would duplicate that work and race
+            // it for the same SQLite writer.
+        }
+        Err(error) => {
+            eprintln!("  hook     not registered: {error}");
+
+            print_hooks_manual(root);
+        }
+    }
+}
+
+/// The hook entry merged into one project's `.claude/settings.local.json`,
+/// preserving every other setting and any hook another tool registered. Returns
+/// the settings path.
+fn register_project_hook(root: &Path) -> Result<PathBuf> {
+    let path = project_settings_path(root);
+
+    merge_hook_entry(&path)?;
+
+    Ok(path)
+}
+
+/// The hook entry merged into the settings file at `path`.
+fn merge_hook_entry(path: &Path) -> Result<()> {
+    let mut settings = read_config(path)?;
+
+    let root = settings
+        .as_object_mut()
+        .context("claude settings root is not a JSON object")?;
+
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .context("claude `hooks` is not a JSON object")?;
+
+    let events = hooks
+        .entry("PreToolUse")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .context("claude `hooks.PreToolUse` is not a JSON array")?;
+
+    events.retain(|entry| !is_constellation_hook(entry));
+
+    events.push(json!({
+        "matcher": HOOK_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": hook_command(),
+            "timeout": HOOK_TIMEOUT_SECS,
+        }],
+    }));
+
+    write_config(path, &settings)?;
+
+    Ok(())
+}
+
+/// The legacy user-scope hook removed, leaving every other hook in place. Only
+/// `uninstall` calls this; nothing registers a user-scope hook any more.
+fn uninstall_hooks() {
+    match deregister_hooks() {
+        Ok(Some(path)) => println!("Hooks: removed the legacy user-scope hook from {}", path.display()),
+        Ok(None) => println!("Hooks: no user-scope hook registered; nothing to remove"),
+        Err(error) => {
+            eprintln!("Hooks: could not update the settings automatically: {error}");
+
+            println!("Hooks: remove the constellation entry under \"hooks\" by hand");
+        }
+    }
+}
+
+/// The removal itself, returning the settings path when an entry was removed and
+/// `None` when there was nothing to remove.
+fn deregister_hooks() -> Result<Option<PathBuf>> {
+    let path = claude_settings_path()?;
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let mut settings = read_config(&path)?;
+
+    let Some(events) = settings
+        .as_object_mut()
+        .and_then(|root| root.get_mut("hooks"))
+        .and_then(|hooks| hooks.get_mut("PreToolUse"))
+        .and_then(|events| events.as_array_mut())
+    else {
+        return Ok(None);
+    };
+
+    let before = events.len();
+
+    events.retain(|entry| !is_constellation_hook(entry));
+
+    if events.len() == before {
+        return Ok(None);
+    }
+
+    write_config(&path, &settings)?;
+
+    Ok(Some(path))
+}
+
+/// Whether a `PreToolUse` entry is one constellation registered, identified by
+/// the `hook pre-tool-use` subcommand in its command string. Matching on the
+/// subcommand rather than the whole path survives a moved or reinstalled binary.
+fn is_constellation_hook(entry: &Value) -> bool {
+    let Some(hooks) = entry.get("hooks").and_then(Value::as_array) else {
+        return false;
+    };
+
+    hooks.iter().any(|hook| {
+        hook.get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.contains("hook pre-tool-use"))
+    })
+}
+
+/// The Claude Code user-scope settings file, read only to remove a hook an earlier
+/// version installed there.
+fn claude_settings_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("could not determine the home directory")?;
+
+    Ok(home.join(".claude").join("settings.json"))
+}
+
+/// A project's Claude Code settings file. The `.local` variant deliberately:
+/// the entry names an absolute path to this binary, and Claude Code keeps this
+/// file out of version control.
+fn project_settings_path(root: &Path) -> PathBuf {
+    root.join(".claude").join("settings.local.json")
+}
+
+/// The manual hook entry, printed when automatic registration cannot proceed.
+fn print_hooks_manual(root: &Path) {
+    println!(
+        "  hook     add this under \"hooks\".\"PreToolUse\" in {}:",
+        project_settings_path(root).display(),
+    );
+    println!(
+        "  {{ \"matcher\": {HOOK_MATCHER:?}, \"hooks\": [{{ \"type\": \"command\", \
+         \"command\": {:?} }}] }}",
+        hook_command(),
+    );
 }
 
 /// The absolute path to the running `constellation` binary, registered with each
@@ -45,9 +280,33 @@ fn server_command() -> String {
     }
 }
 
+/// The full `hook pre-tool-use` command line as it is written into a settings
+/// file, with the binary path made safe for a shell.
+///
+/// Claude Code runs a hook command through a shell, and on Windows that shell is
+/// commonly bash, which reads the backslashes of a native path as escapes and
+/// collapses `C:\Users\...` to `C:Users...`. Forward slashes survive both shells
+/// and are accepted by the Windows path APIs; the quotes cover an install
+/// directory containing spaces.
+fn hook_command() -> String {
+    let executable = server_command().replace('\\', "/");
+
+    format!("\"{executable}\" hook pre-tool-use")
+}
+
 /// The registration of Claude Code via its own CLI (user scope), so its config stays valid.
+///
+/// `claude mcp add` refuses a name it already holds, which would make an install
+/// that changes the served command a no-op that reports success. The existing
+/// entry is removed first so a reinstall updates rather than declines; removing
+/// one that is not there is not an error worth reporting.
 fn install_claude_code() {
     let executable = server_command();
+
+    let _ = agent_command("claude", &["mcp", "remove", "--scope", "user", "constellation"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 
     let status = agent_command(
         "claude",
@@ -60,6 +319,7 @@ fn install_claude_code() {
             "--",
             executable.as_str(),
             "serve",
+            SUPERVISE_FLAG,
         ],
     )
     .status();
@@ -70,8 +330,8 @@ fn install_claude_code() {
         }
         _ => {
             println!(
-                "Claude Code: add manually -> \
-                 claude mcp add --scope user constellation -- {executable} serve",
+                "Claude Code: add manually -> claude mcp add --scope user \
+                 constellation -- {executable} serve {SUPERVISE_FLAG}",
             );
         }
     }
@@ -114,6 +374,7 @@ fn install_codex() {
             "--",
             executable.as_str(),
             "serve",
+            SUPERVISE_FLAG,
         ],
     )
     .status();
@@ -125,7 +386,7 @@ fn install_codex() {
         _ => {
             println!(
                 "Codex: add manually -> \
-                 codex mcp add constellation -- {executable} serve",
+                 codex mcp add constellation -- {executable} serve {SUPERVISE_FLAG}",
             );
         }
     }
@@ -211,7 +472,7 @@ fn register_opencode() -> Result<PathBuf> {
         "constellation".to_string(),
         json!({
             "type": "local",
-            "command": [server_command(), "serve"],
+            "command": [server_command(), "serve", SUPERVISE_FLAG],
             "enabled": true
         }),
     );
@@ -228,7 +489,8 @@ fn print_opencode_manual() {
 
     println!("OpenCode: add this under \"mcp\" in your opencode.json:");
     println!(
-        "  \"constellation\": {{ \"type\": \"local\", \"command\": [{executable:?}, \"serve\"], \"enabled\": true }}",
+        "  \"constellation\": {{ \"type\": \"local\", \"command\": \
+         [{executable:?}, \"serve\", \"{SUPERVISE_FLAG}\"], \"enabled\": true }}",
     );
 }
 
@@ -272,14 +534,14 @@ fn deregister_opencode() -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-/// OpenCode's global `opencode.json`. constellation writes to `opencode.json`
+/// The OpenCode global `opencode.json`. constellation writes to `opencode.json`
 /// specifically: it is strict JSON that round-trips without losing comments (unlike
 /// `opencode.jsonc`), and OpenCode merges it with its other global files anyway.
 fn opencode_config_path() -> Result<PathBuf> {
     Ok(opencode_config_dir()?.join("opencode.json"))
 }
 
-/// OpenCode's global config directory, matching its `xdg-basedir` resolution:
+/// The OpenCode global config directory, matching its `xdg-basedir` resolution:
 /// `$XDG_CONFIG_HOME/opencode` when that variable is set, else
 /// `<home>/.config/opencode` (the fallback on every OS, Windows included).
 fn opencode_config_dir() -> Result<PathBuf> {

@@ -1,0 +1,23 @@
+---
+source: crates/extraction/tests/it/snapshot.rs
+expression: text
+---
+file    shop/static/orders.css
+project shop
+
+nodes (4)
+  file       orders.css              shop/static/orders.css          1:0-8:0
+  selector   total                   .total                          2:12-2:18
+  selector   checkout-form           #checkout-form                  3:0-3:14
+  selector   order-card              .order-card                     6:4-6:15
+
+edges (3)
+  contains            shop/static/orders.css          -> #checkout-form  [extraction:css]
+  contains            shop/static/orders.css          -> .order-card  [extraction:css]
+  contains            shop/static/orders.css          -> .total  [extraction:css]
+
+refs (0)
+
+imports (0)
+
+events (0)

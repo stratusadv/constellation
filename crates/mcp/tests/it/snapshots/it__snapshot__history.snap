@@ -1,0 +1,7 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+history of the constellation: 2 commits, newest first
+  2020-02-10 <commit-2> +6/-2 (1f) constellation tests: Total on orders
+  2020-01-05 <commit-1> +15/-0 (3f) constellation tests: Add orders

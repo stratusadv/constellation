@@ -1,0 +1,12 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+[shop] model Order @ orders/models.py::Order (orders/models.py:6)
+  bases: TimeStamped
+  fields (3):
+    [own] reference - CharField(max_length=32)
+    [own] total - DecimalField(max_digits=10, decimal_places=2)
+    [TimeStamped] created_at - DateTimeField(auto_now_add=True)
+  relations (1): [->] forward FK/M2M this model declares, [<-] reverse (a model that points here):
+    [<-] OrderDetailView (orders/views.py:7)

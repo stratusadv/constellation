@@ -4,22 +4,24 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-constellation-extraction = { path = "../extraction" }
-constellation-graph = { path = "../graph" }
-constellation-linking = { path = "../linking" }
-constellation-resolution = { path = "../resolution" }
-constellation-store = { path = "../store" }
-ignore = "0.4.26"
-notify = "8.2.0"
-rayon = "1.12.0"
-rustc-hash = "2.1.2"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-thiserror = "2.0.18"
-toml = "1.1.2"
+constellation-extraction.workspace = true
+constellation-graph.workspace = true
+constellation-linking.workspace = true
+constellation-resolution.workspace = true
+constellation-store.workspace = true
+ignore.workspace = true
+notify.workspace = true
+notify-debouncer-full.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-tempfile = "3.27.0"
+proptest.workspace = true
+tempfile.workspace = true

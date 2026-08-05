@@ -1,0 +1,7 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+subclasses of TimeStamped (2 shown of 2 found):
+  [platform] model AuditLog @ platform_core/models.py::AuditLog (platform_core/models.py:11)
+  [shop] model Order @ orders/models.py::Order (orders/models.py:6)

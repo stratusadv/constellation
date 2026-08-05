@@ -1,0 +1,49 @@
+# A curated goldset: the questions an agent actually asks, each with the one
+# symbol a correct answer must surface.
+#
+# Twenty questions is enough to start. The harness matters more than the size,
+# and a goldset that is too large to keep current is worse than a small one that
+# is. Every entry is graded strictly: an answer that named a different but
+# equally good symbol scores zero, which is stated in the report's Limits.
+#
+# `expected` may be a full qualified name (`app/models.py::Order.total`) or a
+# distinctive suffix of one (`Order.total`), matched at a name boundary.
+#
+# `hops` is how many graph hops separate the query's obvious anchor from the
+# answer. Leave it at the default 1 for a direct lookup. Set it to 2 or 3 for a
+# question only the graph can answer (route to view to template; model to
+# reverse accessor to consuming view). Those are scored separately by the
+# `multi_hop` benchmark, because they are the ones a text search cannot do.
+#
+# Replace every entry below with questions about your own repository. They are
+# placeholders showing the shape, not a usable goldset.
+
+# --- direct lookups ---------------------------------------------------------
+
+[[question]]
+query = "order number generation"
+expected = "OrderService.generate_order_number"
+
+[[question]]
+query = "order line subtotal_amount"
+expected = "OrderLineItem.subtotal_amount"
+
+[[question]]
+query = "Order model"
+expected = "Order"
+
+# --- multi-hop questions ----------------------------------------------------
+
+# Route to view to template: the answer is the template, and only the graph
+# knows a route reaches it.
+[[question]]
+query = "which template does the order detail page render"
+expected = "order/detail_page.html"
+hops = 3
+
+# Model to reverse accessor to consuming view: the answer is a view that never
+# mentions the model by name.
+[[question]]
+query = "what reads an order's line items"
+expected = "OrderDetailView.get_context_data"
+hops = 2

@@ -1,0 +1,13 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+projects: 2
+nodes: 38
+edges: 54
+cross-project links: 2
+history commits: 0
+symbol revisions: 0
+execution flows: 3
+  - platform (platform): 10 nodes, indexed <age>
+  - shop (shop): 28 nodes, indexed <age>

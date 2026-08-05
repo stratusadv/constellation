@@ -95,12 +95,12 @@ fn search_content_matches_body_identifiers_with_stemming() {
         language: Language::Python,
         size_bytes: 1,
         modified_at_ms: 0,
-        source: "def save_model_obj(self):\n    obj.po_number = compute_next()\n",
+        source: "def save_model_obj(self):\n    obj.order_number = compute_next()\n",
     };
 
     store.persist_file(&project, &file, &[], &[], &[], &[], &[]).unwrap();
 
-    let body = store.search_content("po_number", 10).unwrap();
+    let body = store.search_content("order_number", 10).unwrap();
 
     assert!(
         body.iter().any(|(_, path)| path == "services.py"),
@@ -111,7 +111,7 @@ fn search_content_matches_body_identifiers_with_stemming() {
 
     assert!(
         stemmed.iter().any(|(_, path)| path == "services.py"),
-        "porter stemming matches 'numbers' to the 'number' in po_number",
+        "porter stemming matches 'numbers' to the 'number' in order_number",
     );
 
     assert!(store.search_content("xyzzy", 10).unwrap().is_empty(), "an absent term matches nothing");
@@ -247,6 +247,95 @@ fn search_nodes_any_matches_when_not_all_terms_do() {
     let any = store.search_nodes_any("alpha missing", 10).unwrap();
 
     assert_eq!(any.len(), 1, "any-term match finds the node, got {any:?}");
+}
+
+/// The search for a symbol's own name returns that symbol, even when many others
+/// contain the word and the result set is truncated below their number.
+///
+/// The regression test for a search that had no `ORDER BY` at all: matches came
+/// back in FTS rowid order, so on a real index the `Inventory` model did not
+/// appear in the top forty hits for "Inventory", crowded out by the views,
+/// forms, and serializers that merely contain the string. Measured against a
+/// goldset, that alone cost two thirds of the achievable mean reciprocal rank.
+#[test]
+fn an_exact_name_outranks_the_symbols_that_merely_contain_it() {
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("blog");
+
+    store.upsert_project(&project, "blog", "/tmp/blog").unwrap();
+
+    // The decoys are persisted first, so rowid order alone would bury the exact
+    // match: this fails without the ordering and passes with it.
+    let mut nodes: Vec<Node> = (0..40)
+        .map(|index| {
+            let name = format!("Inventory{index}Serializer");
+
+            sample_node(&format!("blog::app.py::{name}"), &name)
+        })
+        .collect();
+
+    nodes.push(sample_node("blog::app.py::Inventory", "Inventory"));
+
+    store.persist_file(&project, &sample_file(), &nodes, &[], &[], &[], &[]).unwrap();
+
+    let hits = store.search_nodes("Inventory", 5).unwrap();
+
+    assert_eq!(
+        hits.first().map(|node| node.name.as_str()),
+        Some("Inventory"),
+        "the symbol actually called Inventory ranks first, got {:?}",
+        hits.iter().map(|node| node.name.as_str()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn a_name_prefix_outranks_a_name_that_merely_contains_the_query() {
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("blog");
+
+    store.upsert_project(&project, "blog", "/tmp/blog").unwrap();
+
+    let nodes = vec![
+        sample_node("blog::app.py::CustomerOrderLine", "CustomerOrderLine"),
+        sample_node("blog::app.py::OrderService", "OrderService"),
+    ];
+
+    store.persist_file(&project, &sample_file(), &nodes, &[], &[], &[], &[]).unwrap();
+
+    let hits = store.search_nodes("Order", 5).unwrap();
+
+    assert_eq!(
+        hits.first().map(|node| node.name.as_str()),
+        Some("OrderService"),
+        "a name starting with the query beats one containing it, got {:?}",
+        hits.iter().map(|node| node.name.as_str()).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn search_ordering_is_stable_across_identical_runs() {
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("blog");
+
+    store.upsert_project(&project, "blog", "/tmp/blog").unwrap();
+
+    let nodes: Vec<Node> = (0..12)
+        .map(|index| {
+            let name = format!("ReportBuilder{index}");
+
+            sample_node(&format!("blog::app.py::{name}"), &name)
+        })
+        .collect();
+
+    store.persist_file(&project, &sample_file(), &nodes, &[], &[], &[], &[]).unwrap();
+
+    let names = |hits: Vec<Node>| -> Vec<String> { hits.into_iter().map(|n| n.name).collect() };
+
+    assert_eq!(
+        names(store.search_nodes("ReportBuilder", 12).unwrap()),
+        names(store.search_nodes("ReportBuilder", 12).unwrap()),
+        "equal candidates order identically run to run",
+    );
 }
 
 #[test]
@@ -417,8 +506,128 @@ fn an_on_disk_store_keeps_its_schema_and_data_across_a_reopen() {
 
     let store = Store::open(&path).unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), version, "reopening keeps the same schema fingerprint");
+    assert_eq!(store.schema_version().unwrap(), version, "reopening keeps the same schema version");
     assert_eq!(store.count_nodes(&project).unwrap(), 1, "the persisted node survives a reopen");
+}
+
+/// A database written before a table was added is upgraded in place, not deleted.
+///
+/// This is the regression test for the schema-hash design that preceded explicit
+/// versioning: it stamped a hash of the whole schema file into `user_version` and
+/// deleted the database whenever the hash moved, so *adding* a table destroyed
+/// every existing index on the next open, on a read path, with no warning.
+///
+/// The older database is simulated by dropping the newest tables from a current
+/// one rather than by checking in a binary fixture, which would rot. The property
+/// under test is the one that matters either way: re-applying the schema creates
+/// what is missing and keeps what is there.
+#[test]
+fn a_database_missing_a_newly_added_table_is_upgraded_rather_than_discarded() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("index.db");
+    let project = ProjectId::new("blog");
+
+    {
+        let store = Store::open(&path).unwrap();
+
+        store.upsert_project(&project, "blog", "/tmp/blog").unwrap();
+
+        let nodes = vec![sample_node("blog::app.py::handler", "handler")];
+        store.persist_file(&project, &sample_file(), &nodes, &[], &[], &[], &[]).unwrap();
+    }
+
+    // Every table a later release appended, removed: exactly the shape of a
+    // database built by a previous one. `resolved_refs` is listed because an
+    // additive table must reach an existing database through the schema
+    // re-apply, not through a version bump that would make an older build
+    // discard the whole index over a table it never queries.
+    let connection = rusqlite::Connection::open(&path).unwrap();
+
+    for table in ["flow_membership", "flow", "resolved_refs"] {
+        connection.execute_batch(&format!("DROP TABLE IF EXISTS {table}")).unwrap();
+    }
+
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+
+    assert_eq!(
+        store.count_nodes(&project).unwrap(),
+        1,
+        "the indexed graph survives an additive schema change",
+    );
+
+    assert_eq!(
+        store.count_flows(&project).unwrap(),
+        0,
+        "and the table added by the upgrade exists, empty, rather than erroring",
+    );
+
+    assert_eq!(
+        store.requeue_refs_into_file(&project, "app.py").unwrap(),
+        0,
+        "the reference archive is queryable too, so no version bump was needed to add it",
+    );
+}
+
+#[test]
+fn a_database_stamped_by_an_unrecognized_schema_is_discarded() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("index.db");
+    let project = ProjectId::new("blog");
+
+    {
+        let store = Store::open(&path).unwrap();
+
+        store.upsert_project(&project, "blog", "/tmp/blog").unwrap();
+
+        let nodes = vec![sample_node("blog::app.py::handler", "handler")];
+        store.persist_file(&project, &sample_file(), &nodes, &[], &[], &[], &[]).unwrap();
+    }
+
+    // What every database written before versioning carries: a hash of the schema
+    // file in the pragma that now holds a version. It names no schema this build
+    // knows, so rebuilding is the only honest reading of it.
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.pragma_update(None, "user_version", 1_234_567_i32).unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+
+    assert_eq!(
+        store.count_nodes(&project).unwrap(),
+        0,
+        "an unrecognized schema is rebuilt rather than read as though it matched",
+    );
+}
+
+#[test]
+fn a_database_from_a_newer_build_is_discarded_rather_than_misread() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("index.db");
+    let project = ProjectId::new("blog");
+
+    {
+        let store = Store::open(&path).unwrap();
+
+        store.upsert_project(&project, "blog", "/tmp/blog").unwrap();
+    }
+
+    let current = Store::open(&path).unwrap().schema_version().unwrap();
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .pragma_update(None, "user_version", i32::try_from(current).unwrap() + 1)
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).unwrap();
+
+    assert_eq!(
+        store.schema_version().unwrap(),
+        current,
+        "a database from a newer constellation is rebuilt at this build's version",
+    );
 }
 
 #[test]

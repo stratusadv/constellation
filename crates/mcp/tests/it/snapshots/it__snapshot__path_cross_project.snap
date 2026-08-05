@@ -1,0 +1,7 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+# path audit -> AuditLog:
+  audit (orders/models.py:13)
+    →instantiates→ AuditLog (platform_core/models.py:11)

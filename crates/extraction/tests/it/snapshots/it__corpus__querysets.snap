@@ -1,0 +1,47 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: "python(\"apiary/beehive/querysets.py\", QUERYSETS)"
+---
+file    apiary/beehive/querysets.py
+project apiary
+
+nodes (5)
+  file       querysets.py            apiary/beehive/querysets.py     1:0-15:0
+  class      BeehiveQuerySet         BeehiveQuerySet                 6:0-14:62
+    visibility  public
+  method     active                  BeehiveQuerySet.active          7:4-8:52
+    signature   (self)
+    visibility  public
+  method     for_apiary              BeehiveQuerySet.for_apiary      10:4-11:56
+    signature   (self, apiary_id)
+    visibility  public
+  method     with_inspections        BeehiveQuerySet.with_inspections 13:4-14:62
+    signature   (self)
+    visibility  public
+
+edges (4)
+  contains            apiary/beehive/querysets.py     -> BeehiveQuerySet  [extraction:python]
+  contains            BeehiveQuerySet                 -> BeehiveQuerySet.active  [extraction:python]
+  contains            BeehiveQuerySet                 -> BeehiveQuerySet.for_apiary  [extraction:python]
+  contains            BeehiveQuerySet                 -> BeehiveQuerySet.with_inspections  [extraction:python]
+
+refs (8)
+  imports             apiary/beehive/querysets.py     -> "HistoryQuerySet"  @1:39
+    candidates  hivecore.history.querysets
+  imports             apiary/beehive/querysets.py     -> "HiveStatus"  @3:35
+    candidates  apiary.beehive.choices
+  extends             BeehiveQuerySet                 -> "HistoryQuerySet"  @6:22
+  calls               BeehiveQuerySet.active          -> "filter"  @8:15
+    candidates  apiary/beehive/querysets.py::BeehiveQuerySet
+  calls               BeehiveQuerySet.for_apiary      -> "active"  @11:15
+    candidates  apiary/beehive/querysets.py::BeehiveQuerySet
+  calls               BeehiveQuerySet.for_apiary      -> "filter"  @11:15
+  calls               BeehiveQuerySet.with_inspections -> "distinct"  @14:15
+  calls               BeehiveQuerySet.with_inspections -> "prefetch_related"  @14:15
+    candidates  apiary/beehive/querysets.py::BeehiveQuerySet
+
+imports (2)
+  HiveStatus              HiveStatus              from apiary.beehive.choices
+  HistoryQuerySet         HistoryQuerySet         from hivecore.history.querysets
+
+events (0)

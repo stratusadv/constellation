@@ -1,0 +1,9 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+# path checkout -> orders/base.html:
+  checkout (orders/urls.py:8)
+    →routes_to→ checkout_view (orders/views.py:12)
+    →renders→ orders/checkout.html (templates/orders/checkout.html:1)
+    →extends_template→ orders/base.html (templates/orders/base.html:1)

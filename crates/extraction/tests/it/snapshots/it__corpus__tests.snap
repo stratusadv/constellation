@@ -1,0 +1,49 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: text
+---
+file    apiary/beehive/tests/test_models.py
+project apiary
+
+nodes (4)
+  file       test_models.py          apiary/beehive/tests/test_models.py 1:0-18:0
+  class      BeehiveTestCase         BeehiveTestCase                 10:0-17:44
+    decorators  pytest.mark.django_db
+    visibility  public
+  method     test_is_active          BeehiveTestCase.test_is_active  11:4-14:49
+    signature   (self)
+    visibility  public
+  method     test_active_for         BeehiveTestCase.test_active_for 16:4-17:44
+    signature   (self)
+    visibility  public
+
+edges (3)
+  contains            apiary/beehive/tests/test_models.py -> BeehiveTestCase  [extraction:python]
+  contains            BeehiveTestCase                 -> BeehiveTestCase.test_active_for  [extraction:python]
+  contains            BeehiveTestCase                 -> BeehiveTestCase.test_is_active  [extraction:python]
+
+refs (10)
+  imports             apiary/beehive/tests/test_models.py -> "pytest"  @1:7
+  imports             apiary/beehive/tests/test_models.py -> "BaseTestCase"  @3:43
+    candidates  hivecore.core.tests.test_cases
+  imports             apiary/beehive/tests/test_models.py -> "Beehive"  @5:34
+    candidates  apiary.beehive.models
+  imports             apiary/beehive/tests/test_models.py -> "BeehiveFactory"  @6:43
+    candidates  apiary.beehive.tests.factories
+  tests               BeehiveTestCase                 -> "Beehive"  @10:0
+  extends             BeehiveTestCase                 -> "BaseTestCase"  @10:22
+  instantiates        BeehiveTestCase.test_is_active  -> "BeehiveFactory"  @12:18
+  calls               BeehiveTestCase.test_is_active  -> "assertTrue"  @14:15
+    candidates  apiary/beehive/tests/test_models.py::BeehiveTestCase
+  calls               BeehiveTestCase.test_active_for -> "active_for"  @17:15
+    candidates  receiver-root, Beehive
+  calls               BeehiveTestCase.test_active_for -> "count"  @17:15
+
+imports (4)
+  Beehive                 Beehive                 from apiary.beehive.models
+  BeehiveFactory          BeehiveFactory          from apiary.beehive.tests.factories
+  BaseTestCase            BaseTestCase            from hivecore.core.tests.test_cases
+  pytest                  pytest                  from pytest
+    shape       namespace
+
+events (0)

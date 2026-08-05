@@ -1,0 +1,6 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+orphan candidates in shop (1 shown of 1, verify before deleting):
+  [shop] method audit @ Order.audit (orders/models.py:13)

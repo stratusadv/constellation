@@ -531,7 +531,7 @@ fn uv_source_path(workspace_root: &Path, package: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
-/// Every directory named by a `PYTHONPATH_APPEND` or `PYTHONPATH` in the workspace's
+/// The directories named by a `PYTHONPATH_APPEND` or `PYTHONPATH` in the workspace's
 /// `development.env` or `.env`, split on the platform path separator.
 fn pythonpath_dirs(workspace_root: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();

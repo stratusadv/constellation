@@ -1,10 +1,12 @@
 use constellation_graph::{
     Edge, EdgeKind, Language, Node, NodeId, NodeIdentity, NodeKind, ProjectId, Span,
 };
+use constellation_mcp::cursor::Page;
 use constellation_mcp::{
     EXPLORE_BYTES_BASE, EXPLORE_BYTES_MAX, explore_budget, feature_text, is_flow_edge, model_text,
     path_penalty, qualified_name_ends_with, rank_by_structure, routes_text, shortest_flow_path,
 };
+use constellation_index::index_project;
 use constellation_store::{FileIndex, Store};
 
 #[test]
@@ -255,16 +257,62 @@ fn routes_text_filters_to_routes_matching_a_pattern() {
 
     store.persist_file(&project, &blog_file(), &nodes, &edges, &[], &[], &[]).unwrap();
 
-    let filtered = routes_text(&store, Some("blog"), Some("detail")).unwrap();
+    let page = Page::default();
+    let filtered = routes_text(&store, Some("blog"), Some("detail"), 250, &page, 0).unwrap();
 
     assert!(filtered.contains("detail_view"), "the matching route's view is shown: {filtered}");
     assert!(filtered.contains("blog/detail.html"), "and the template it renders: {filtered}");
     assert!(!filtered.contains("list_view"), "the non-matching route is filtered out: {filtered}");
     assert!(filtered.contains("matching \"detail\""), "the header notes the active filter: {filtered}");
 
-    let unmatched = routes_text(&store, Some("blog"), Some("zzz")).unwrap();
+    let unmatched = routes_text(&store, Some("blog"), Some("zzz"), 250, &page, 0).unwrap();
 
     assert!(unmatched.contains("no routes matching"), "an unmatched pattern says so: {unmatched}");
+}
+
+/// A route whose handler never binds must say *what* it named. `(unresolved)`
+/// alone reads as "constellation has nothing to say", which is what let a whole
+/// module of dropped route edges sit unnoticed.
+#[test]
+fn routes_text_names_the_handler_a_route_could_not_bind() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+
+    std::fs::create_dir_all(root.join("app/inventory/views")).unwrap();
+    std::fs::create_dir_all(root.join("app/inventory/urls")).unwrap();
+
+    std::fs::write(
+        root.join("app/inventory/views/json_views.py"),
+        "def adjust_view(request):\n    return None\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("app/inventory/urls/json_urls.py"),
+        "from django.urls import path\n\n\
+         from app.inventory.views import json_views\n\n\n\
+         urlpatterns = [\n\
+         \x20   path('bulk-update/', json_views.bulk_update_view, name='bulk_update'),\n\
+         ]\n",
+    )
+    .unwrap();
+
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("blog");
+
+    index_project(&store, &project, "blog", root).unwrap();
+
+    let text = routes_text(&store, Some("blog"), None, 250, &Page::default(), 0).unwrap();
+
+    assert!(
+        text.contains("(unresolved: json_views.bulk_update_view)"),
+        "an unbound route names the handler it failed to bind, receiver and all: {text}",
+    );
+
+    assert!(
+        text.contains("app/inventory/urls/json_urls.py:7 json_views.bulk_update_view"),
+        "and the footer says which file and line to go read: {text}",
+    );
 }
 
 #[test]
@@ -367,4 +415,59 @@ fn flow_traces_multi_hop_when_no_direct_edge() {
         shortest_flow_path(&out_edges, 0, 2),
         Some(vec![(1, EdgeKind::Calls), (2, EdgeKind::Calls)]),
     );
+}
+
+#[test]
+fn feature_from_a_route_reaches_the_service_its_view_calls() {
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("blog");
+
+    store.upsert_project(&project, "blog", "/tmp/blog").unwrap();
+
+    let route = make_node(
+        "blog::urls.py::route::entry/update/",
+        NodeKind::Route,
+        "entry_update",
+        "urls.py::route::entry/update/",
+        "urls.py",
+    );
+
+    let view = make_node(
+        "blog::views/json_views.py::entry_update_view",
+        NodeKind::View,
+        "entry_update_view",
+        "views/json_views.py::entry_update_view",
+        "views/json_views.py",
+    );
+
+    let service = make_node(
+        "blog::app/services/service.py::EntryService.set_quantity",
+        NodeKind::Method,
+        "set_quantity",
+        "app/services/service.py::EntryService.set_quantity",
+        "app/services/service.py",
+    );
+
+    let nodes = vec![route.clone(), view.clone(), service.clone()];
+
+    let edges = vec![
+        Edge::new(route.id.clone(), view.id.clone(), EdgeKind::RoutesTo),
+        Edge::new(view.id.clone(), service.id.clone(), EdgeKind::Calls),
+    ];
+
+    store.persist_file(&project, &blog_file(), &nodes, &edges, &[], &[], &[]).unwrap();
+
+    // A route is pure indirection to its view, and the route name is the spelling
+    // `routes` prints. Slicing from it must not lose the data layer that slicing
+    // from the view one hop later finds.
+    let from_route = feature_text(&store, "entry_update").unwrap();
+
+    assert!(
+        from_route.contains("set_quantity"),
+        "the route's slice reaches the service its view calls: {from_route}",
+    );
+
+    let from_view = feature_text(&store, "entry_update_view").unwrap();
+
+    assert!(from_view.contains("set_quantity"), "as it already did from the view: {from_view}");
 }

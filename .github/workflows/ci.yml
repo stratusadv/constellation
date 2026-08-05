@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build, lint, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    # Both platforms are developed on, and the parts that differ between them
+    # (the install directory, the agent entry points, the displaced-binary
+    # dance) are exactly the parts a single-platform run cannot check.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # The eval harness reads indexed git history, so a shallow clone would
+          # silently produce an empty churn window rather than a real one.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # No rustfmt: the project formats by hand (see ARCHITECTURE.md, Testing),
+          # so installing the component would advertise a gate that never runs.
+          components: clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-ci-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # The style ratchets. Each is a count of known debt that must match the
+      # tree exactly: a change that adds an offender fails, and a change that
+      # removes one fails until the recorded count is lowered to match. Debt
+      # therefore only moves down, and progress is recorded when it happens.
+      - name: Tidy
+        run: cargo xtask tidy
+
+      # Serially, because the index crate's watcher tests each run a real
+      # filesystem watcher and poll a from-scratch re-index every 100 ms to
+      # decide convergence. Run alongside each other they starve one another
+      # until a convergence wait hits its timeout.
+      #
+      # This reduces the flake, it does not remove it. Measured on Linux:
+      # fuzz_file_operations fails roughly 3 runs in 4 in parallel and roughly
+      # 1 in 6 serially, for about 20 extra seconds of wall clock. The
+      # remaining failures are that one test, and the race behind them is not
+      # yet understood; a red CI run that names only this test is the known
+      # issue, not a regression.
+      - name: Test
+        run: cargo test --workspace
+        env:
+          RUST_TEST_THREADS: 1
+          # A snapshot mismatch on CI is a failure, never an update. insta
+          # already infers this from `CI`, but the inference is invisible at the
+          # point it matters, and a run that silently rewrote its own
+          # expectations would pass while proving nothing.
+          INSTA_UPDATE: "no"
+
+  retrieval-quality:
+    name: Retrieval quality
+    runs-on: windows-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-ci-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build the tools
+        run: cargo build --release -p constellation-cli -p constellation-eval
+
+      # A fixture repository rather than a real one: CI must not depend on a
+      # checkout of a private Django project, and a fixture keeps the numbers
+      # comparable run to run.
+      - name: Build the fixture project
+        run: |
+          New-Item -ItemType Directory -Force eval/fixture/orders | Out-Null
+          New-Item -ItemType Directory -Force eval/fixture/templates/orders | Out-Null
+          Set-Content -Encoding utf8 eval/fixture/orders/__init__.py ''
+          Set-Content -Encoding utf8 eval/fixture/orders/models.py @'
+          from django.db import models
+
+
+          class Order(models.Model):
+              total = models.DecimalField(max_digits=10, decimal_places=2)
+
+              def recalculate_totals(self):
+                  return self.total
+          '@
+          Set-Content -Encoding utf8 eval/fixture/orders/views.py @'
+          from django.shortcuts import render
+
+          from orders.models import Order
+
+
+          def checkout_view(request):
+              order = Order()
+              order.recalculate_totals()
+              return render(request, 'orders/checkout.html', {'order': order})
+          '@
+          Set-Content -Encoding utf8 eval/fixture/orders/urls.py @'
+          from django.urls import path
+
+          from orders import views
+
+          urlpatterns = [
+              path('checkout/', views.checkout_view, name='checkout'),
+          ]
+          '@
+          Set-Content -Encoding utf8 eval/fixture/templates/orders/checkout.html '{% extends "base.html" %}{% block content %}{{ order.total }}{% endblock %}'
+        shell: pwsh
+
+      - name: Index the fixture and trace its flows
+        run: |
+          .\target\release\constellation.exe init eval/fixture
+          .\target\release\constellation.exe flows eval/fixture/.constellation/index.db
+        shell: pwsh
+
+      - name: Run the retrieval-quality harness
+        run: .\target\release\constellation-eval.exe --config eval/configs/ci-fixture.toml
+        shell: pwsh
+
+      # The gate: mean reciprocal rank on the fixture goldset must not regress
+      # below the recorded floor. Raise the floor in eval/configs/ci-fixture.toml
+      # when a change genuinely improves it; never lower it without saying why in
+      # the commit message.
+      - name: Check for a retrieval regression
+        run: |
+          $rows = Import-Csv eval/results/ci-fixture.csv
+          $floor = 0.60
+          $mrr = $rows |
+            Where-Object { $_.benchmark -eq 'search_quality' -and $_.metric -eq 'mrr' -and $_.ground_truth_mode -eq 'explore file ranking' } |
+            Select-Object -First 1
+          if (-not $mrr) { throw "the harness produced no explore MRR row" }
+          Write-Host "explore MRR: $($mrr.value) (floor $floor)"
+          if ([double]$mrr.value -lt $floor) {
+            throw "explore MRR $($mrr.value) regressed below the floor $floor"
+          }
+        shell: pwsh
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-quality
+          path: eval/results/

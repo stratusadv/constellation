@@ -1,0 +1,90 @@
+---
+source: crates/extraction/tests/it/snapshot.rs
+expression: text
+---
+file    shop/orders/models.py
+project shop
+
+nodes (15)
+  file       models.py               shop/orders/models.py           1:0-43:0
+  constant   STATUS_OPEN             STATUS_OPEN                     8:0-8:20
+    visibility  public
+  model      TimeStamped             TimeStamped                     11:0-17:23
+    visibility  public
+  field      created_at              TimeStamped.created_at          14:4-14:53
+    signature   DateTimeField(default=tz.now)
+  class      Meta                    TimeStamped.Meta                16:4-17:23
+    visibility  public
+  variable   abstract                TimeStamped.Meta.abstract       17:8-17:23
+    visibility  public
+  model      Order                   Order                           20:0-37:42
+    visibility  public
+  field      customer                Order.customer                  21:4-21:91
+    signature   ForeignKey(Customer, on_delete=models.CASCADE, related_name='orders')
+  field      tags                    Order.tags                      22:4-22:57
+    signature   ManyToManyField(Tag, blank=True)
+  field      status                  Order.status                    23:4-23:65
+    signature   CharField(max_length=16, default=STATUS_OPEN)
+  method     __str__                 Order.__str__                   25:4-26:33
+    signature   (self)
+    visibility  protected
+  property   is_open                 Order.is_open                   29:4-30:41
+    signature   (self)
+    decorators  property
+    visibility  public
+  method     open_orders             Order.open_orders               33:4-34:53
+    signature   (cls)
+    decorators  classmethod
+    visibility  public
+  method     notify                  Order.notify                    36:4-37:42
+    signature   (self)
+    flags       async
+    visibility  public
+  function   build_order             build_order                     40:0-42:50
+    signature   (customer: Customer) -> Order
+    visibility  public
+
+edges (14)
+  contains            shop/orders/models.py           -> Order  [extraction:python]
+  contains            shop/orders/models.py           -> STATUS_OPEN  [extraction:python]
+  contains            shop/orders/models.py           -> TimeStamped  [extraction:python]
+  contains            shop/orders/models.py           -> build_order  [extraction:python]
+  contains            Order                           -> Order.__str__  [extraction:python]
+  contains            Order                           -> Order.customer  [extraction:python]
+  contains            Order                           -> Order.is_open  [extraction:python]
+  contains            Order                           -> Order.notify  [extraction:python]
+  contains            Order                           -> Order.open_orders  [extraction:python]
+  contains            Order                           -> Order.status  [extraction:python]
+  contains            Order                           -> Order.tags  [extraction:python]
+  contains            TimeStamped                     -> TimeStamped.Meta  [extraction:python]
+  contains            TimeStamped                     -> TimeStamped.created_at  [extraction:python]
+  contains            TimeStamped.Meta                -> TimeStamped.Meta.abstract  [extraction:python]
+
+refs (13)
+  imports             shop/orders/models.py           -> "models"  @3:22
+    candidates  django.db
+  imports             shop/orders/models.py           -> "timezone"  @4:25
+    candidates  django.utils
+  imports             shop/orders/models.py           -> "Customer"  @6:34
+    candidates  shop.customers.models
+  extends             TimeStamped                     -> "Model"  @11:18
+  extends             Order                           -> "TimeStamped"  @20:12
+  relates_to          Order                           -> "Customer"  @21:4
+  reverse_accessor    Order                           -> "Customer"  @21:4
+    candidates  orders
+  relates_to          Order                           -> "Tag"  @22:4
+  calls               Order.open_orders               -> "filter"  @34:15
+    candidates  queryset-dispatch
+  calls               Order.notify                    -> "send_receipt"  @37:14
+    candidates  receiver-root, self.customer
+  returns             build_order                     -> "Order"  @40:0
+  type_of             build_order                     -> "Customer"  @40:0
+  calls               build_order                     -> "create"  @42:11
+    candidates  queryset-dispatch, Order
+
+imports (3)
+  models                  models                  from django.db
+  tz                      timezone                from django.utils
+  Customer                Customer                from shop.customers.models
+
+events (0)

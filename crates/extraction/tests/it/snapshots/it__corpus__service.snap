@@ -1,0 +1,39 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: "python(\"apiary/beehive/service.py\", SERVICE)"
+---
+file    apiary/beehive/service.py
+project apiary
+
+nodes (4)
+  file       service.py              apiary/beehive/service.py       1:0-17:0
+  class      BeehiveService          BeehiveService                  6:0-16:30
+    visibility  public
+  method     collapse                BeehiveService.collapse         7:4-11:23
+    signature   (self)
+    visibility  public
+  method     rename                  BeehiveService.rename           13:4-16:30
+    signature   (self, tag)
+    visibility  public
+
+edges (3)
+  contains            apiary/beehive/service.py       -> BeehiveService  [extraction:python]
+  contains            BeehiveService                  -> BeehiveService.collapse  [extraction:python]
+  contains            BeehiveService                  -> BeehiveService.rename  [extraction:python]
+
+refs (5)
+  imports             apiary/beehive/service.py       -> "BaseHiveModelService"  @1:34
+    candidates  hivecore.core.service
+  imports             apiary/beehive/service.py       -> "HiveStatus"  @3:35
+    candidates  apiary.beehive.choices
+  extends             BeehiveService                  -> "BaseHiveModelService"  @6:21
+  calls               BeehiveService.collapse         -> "save"  @9:8
+    candidates  receiver-root, self.obj
+  calls               BeehiveService.rename           -> "save"  @16:15
+    candidates  receiver-root, self.obj
+
+imports (2)
+  HiveStatus              HiveStatus              from apiary.beehive.choices
+  BaseHiveModelService    BaseHiveModelService    from hivecore.core.service
+
+events (0)

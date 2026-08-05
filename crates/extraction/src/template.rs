@@ -20,7 +20,7 @@ const CHILDREN_MAX: u32 = 1_000_000;
 /// The provenance tag on edges this extractor produces for Alpine component methods.
 const ALPINE_PROVENANCE: &str = "alpine";
 
-/// Django's built-in template tags (and the `{% end... %}` closers and clause
+/// The built-in Django template tags (and the `{% end... %}` closers and clause
 /// words a leaf/block tag node can surface), none of which a project defines, so a
 /// `UsesTag` reference to one would only be permanent noise. A tag not listed is a
 /// custom `{% my_tag %}` from a `{% load %}`-ed library, resolved to its
@@ -34,7 +34,7 @@ const TEMPLATE_BUILTIN_TAGS: &[&str] = &[
     "static", "templatetag", "trans", "translate", "url", "verbatim", "widthratio", "with",
 ];
 
-/// Django's built-in template filters plus the `humanize` contrib set, excluded
+/// The built-in Django template filters plus the `humanize` contrib set, excluded
 /// from `UsesTag` references for the same reason as the built-in tags. A filter not
 /// listed is a custom `@register.filter`.
 const TEMPLATE_BUILTIN_FILTERS: &[&str] = &[

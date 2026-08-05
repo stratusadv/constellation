@@ -1,0 +1,9 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+cross-project links: 2 shown of 2
+
+shop -> platform: 2
+  [imports] models.py (orders/models.py:1) -> TimeStamped (platform_core/models.py:4)
+  [imports] models.py (orders/models.py:1) -> AuditLog (platform_core/models.py:11)

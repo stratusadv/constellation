@@ -1,0 +1,15 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+[platform] platform (2 files, 9 symbols)
+  django: 2 models
+  code: 1 classes, 1 methods
+  packages: platform_core/ (2f 9s)
+
+[shop] shop (9 files, 23 symbols)
+  django: 1 models, 2 views, 2 routes, 3 templates
+  code: 1 classes, 3 methods
+  packages: orders/ (4f 15s), orders/tests/ (1f 3s), templates/orders/ (3f 3s), static/ (1f 2s)
+
+cross-project links: 2 (`links` to list)

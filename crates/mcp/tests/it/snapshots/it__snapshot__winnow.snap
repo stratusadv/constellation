@@ -1,0 +1,5 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+winnow: unknown op "is". Valid ops: contains, eq, >=, >, in, <=, <, matches (and the word forms gt, gte, lt, lte, ==)

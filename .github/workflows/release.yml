@@ -8,6 +8,81 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Built on the oldest supported runner rather than ubuntu-latest, because a
+  # glibc-linked binary runs on the glibc it was built against or newer, never
+  # older. Building on 22.04 (glibc 2.35) covers Ubuntu 22.04+, Debian 12+, and
+  # Fedora 36+; building on the newest runner would exclude every one of them.
+  build-linux:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Verify tag matches Cargo.toml version
+      run: |
+        tag="${{ github.event.release.tag_name }}"
+        tag="${tag#v}"
+        cargo=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/^version = "(.+)"/\1/')
+        if [ "$tag" != "$cargo" ]; then
+          echo "Release tag v$tag does not match Cargo.toml [workspace.package] version $cargo. Bump the version and re-tag." >&2
+          exit 1
+        fi
+        echo "version OK: $tag"
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-gnu
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build release binary
+      run: cargo build --release --verbose
+
+    # The asset name carries no version, so
+    # releases/latest/download/<name>.tar.gz is a stable URL the README can
+    # print once instead of a line that goes stale at every release.
+    - name: Package the tarball
+      run: |
+        name="constellation-x86_64-unknown-linux-gnu"
+
+        mkdir -p "dist/$name"
+        cp target/release/constellation "dist/$name/"
+        cp README.md LICENSE "dist/$name/"
+        strip "dist/$name/constellation"
+
+        tar -czf "dist/$name.tar.gz" -C dist "$name"
+        (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+
+    - name: Attach the tarball to the release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          dist/*.tar.gz
+          dist/*.tar.gz.sha256
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-windows:
     runs-on: windows-latest
     permissions:

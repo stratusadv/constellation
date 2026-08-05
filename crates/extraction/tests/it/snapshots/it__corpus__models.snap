@@ -1,0 +1,83 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: "python(\"apiary/beehive/models.py\", MODELS)"
+---
+file    apiary/beehive/models.py
+project apiary
+
+nodes (13)
+  file       models.py               apiary/beehive/models.py        1:0-41:0
+  model      Beehive                 Beehive                         10:0-40:48
+    visibility  public
+  field      apiary                  Beehive.apiary                  11:4-16:5
+    signature   ForeignKey(Apiary, on_delete=models.CASCADE, related_name='beehives', related_query_name='beehive')
+  field      tag                     Beehive.tag                     17:4-17:65
+    signature   CharField(max_length=32, blank=True, default='')
+  field      status                  Beehive.status                  18:4-22:5
+    signature   CharField(max_length=16, choices=HiveStatus.choices, default=HiveStatus.ACTIVE)
+  field      frame_count             Beehive.frame_count             23:4-23:57
+    signature   PositiveIntegerField(default=10)
+  variable   objects                 Beehive.objects                 25:4-25:42
+    visibility  public
+  class      Meta                    Beehive.Meta                    27:4-29:32
+    visibility  public
+  variable   ordering                Beehive.Meta.ordering           28:8-28:26
+    signature   [tag]
+    visibility  public
+  variable   verbose_name            Beehive.Meta.verbose_name       29:8-29:32
+    visibility  public
+  method     __str__                 Beehive.__str__                 31:4-32:23
+    signature   (self)
+    visibility  protected
+  property   is_active               Beehive.is_active               35:4-36:47
+    signature   (self)
+    decorators  property
+    visibility  public
+  method     active_for              Beehive.active_for              39:4-40:48
+    signature   (cls, apiary_id)
+    decorators  classmethod
+    visibility  public
+
+edges (12)
+  contains            apiary/beehive/models.py        -> Beehive  [extraction:python]
+  contains            Beehive                         -> Beehive.Meta  [extraction:python]
+  contains            Beehive                         -> Beehive.__str__  [extraction:python]
+  contains            Beehive                         -> Beehive.active_for  [extraction:python]
+  contains            Beehive                         -> Beehive.apiary  [extraction:python]
+  contains            Beehive                         -> Beehive.frame_count  [extraction:python]
+  contains            Beehive                         -> Beehive.is_active  [extraction:python]
+  contains            Beehive                         -> Beehive.objects  [extraction:python]
+  contains            Beehive                         -> Beehive.status  [extraction:python]
+  contains            Beehive                         -> Beehive.tag  [extraction:python]
+  contains            Beehive.Meta                    -> Beehive.Meta.ordering  [extraction:python]
+  contains            Beehive.Meta                    -> Beehive.Meta.verbose_name  [extraction:python]
+
+refs (11)
+  imports             apiary/beehive/models.py        -> "models"  @1:22
+    candidates  django.db
+  imports             apiary/beehive/models.py        -> "ActivityMixin"  @3:37
+    candidates  hivecore.activity.mixins
+  imports             apiary/beehive/models.py        -> "HistoryModelMixin"  @4:36
+    candidates  hivecore.history.mixins
+  imports             apiary/beehive/models.py        -> "HiveStatus"  @6:35
+    candidates  apiary.beehive.choices
+  imports             apiary/beehive/models.py        -> "BeehiveQuerySet"  @7:37
+    candidates  apiary.beehive.querysets
+  extends             Beehive                         -> "ActivityMixin"  @10:14
+  extends             Beehive                         -> "HistoryModelMixin"  @10:29
+  relates_to          Beehive                         -> "Apiary"  @11:4
+  reverse_accessor    Beehive                         -> "Apiary"  @11:4
+    candidates  beehives
+  calls               Beehive                         -> "as_manager"  @25:14
+    candidates  receiver-root, BeehiveQuerySet
+  calls               Beehive.active_for              -> "for_apiary"  @40:15
+    candidates  queryset-dispatch
+
+imports (5)
+  HiveStatus              HiveStatus              from apiary.beehive.choices
+  BeehiveQuerySet         BeehiveQuerySet         from apiary.beehive.querysets
+  models                  models                  from django.db
+  ActivityMixin           ActivityMixin           from hivecore.activity.mixins
+  HistoryModelMixin       HistoryModelMixin       from hivecore.history.mixins
+
+events (0)

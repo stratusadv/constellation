@@ -85,6 +85,37 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
     FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
+-- The references that already became edges, kept rather than discarded so a
+-- re-index of the file a reference points *into* can put it back in
+-- `unresolved_refs` and rebuild the edge.
+--
+-- Deleting a file's nodes cascades to every edge touching them, including the
+-- inbound ones written by files this run never looked at. Those files are not
+-- re-extracted (their content is unchanged), so without this table the
+-- reference that produced each lost edge is gone and the edge can never come
+-- back: a route whose views module is edited silently loses its view forever.
+--
+-- `target_node_id` carries no foreign key on purpose. A cascade would delete
+-- the row at exactly the moment it is needed; the requeue reads it first and
+-- moves the row back by hand.
+CREATE TABLE IF NOT EXISTS resolved_refs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id     TEXT NOT NULL,
+    from_node_id   TEXT NOT NULL,
+    target_node_id TEXT NOT NULL,
+    reference_name TEXT NOT NULL,
+    reference_kind TEXT NOT NULL,
+    line           INTEGER NOT NULL,
+    column         INTEGER NOT NULL,
+    file_path      TEXT NOT NULL,
+    language       TEXT NOT NULL,
+    candidates     TEXT,
+    FOREIGN KEY (from_node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_resolved_refs_target ON resolved_refs(target_node_id);
+
 CREATE INDEX IF NOT EXISTS idx_nodes_project    ON nodes(project_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_kind       ON nodes(kind);
 CREATE INDEX IF NOT EXISTS idx_nodes_name       ON nodes(name);
@@ -181,6 +212,19 @@ CREATE TABLE IF NOT EXISTS route_reverse_name (
 );
 CREATE INDEX IF NOT EXISTS idx_route_reverse_name ON route_reverse_name(reverse_name);
 
+-- The full mounted URL path of each route, assembled from its include chain. A
+-- route node's pattern is only the fragment its own urls.py declares (`create/`),
+-- which is not a path anyone can request; the chain of `path('x/', include(...))`
+-- prefixes above it is what makes it one. Assembled at index time because the walk
+-- needs the include map, which only the resolver holds.
+CREATE TABLE IF NOT EXISTS route_url_path (
+    project_id TEXT NOT NULL,
+    route_id   TEXT NOT NULL,
+    url_path   TEXT NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_route_url_path ON route_url_path(route_id);
+
 -- Full-text index over each file's source content, so explore can seed its
 -- structural ranking from files whose body matches a query (a name or
 -- docstring search alone misses a symbol found only by an identifier in its
@@ -261,3 +305,42 @@ CREATE TABLE IF NOT EXISTS git_symbol_revision (
 CREATE INDEX IF NOT EXISTS idx_git_symbol_revision_qualified ON git_symbol_revision(project_id, qualified_name);
 CREATE INDEX IF NOT EXISTS idx_git_symbol_revision_name      ON git_symbol_revision(project_id, name);
 CREATE INDEX IF NOT EXISTS idx_git_symbol_revision_commit    ON git_symbol_revision(project_id, commit_hash);
+
+-- Precomputed Django execution flows: one row per detected entry point, with
+-- the bounded set of symbols reachable from it through the flow edge kinds
+-- (route -> view -> template -> include, plus calls and instantiation).
+-- Derived data, rebuilt by `constellation flows`, so a stale or absent flows
+-- table degrades to an honest empty rather than a wrong answer. The reachable
+-- set is a reach set, not a single path: `reach_json` holds every member with
+-- the BFS depth it was found at, not one ordered chain.
+CREATE TABLE IF NOT EXISTS flow (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id     TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    entry_node_id  TEXT NOT NULL,
+    entry_kind     TEXT NOT NULL,
+    depth_max      INTEGER NOT NULL,
+    node_count     INTEGER NOT NULL,
+    file_count     INTEGER NOT NULL,
+    app_count      INTEGER NOT NULL,
+    project_count  INTEGER NOT NULL,
+    criticality    REAL NOT NULL,
+    truncated      INTEGER NOT NULL DEFAULT 0,
+    reach_json     TEXT NOT NULL,
+    computed_at    INTEGER NOT NULL,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (entry_node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS flow_membership (
+    flow_id  INTEGER NOT NULL,
+    node_id  TEXT NOT NULL,
+    depth    INTEGER NOT NULL,
+    PRIMARY KEY (flow_id, node_id),
+    FOREIGN KEY (flow_id) REFERENCES flow(id) ON DELETE CASCADE,
+    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_flow_project     ON flow(project_id);
+CREATE INDEX IF NOT EXISTS idx_flow_criticality ON flow(project_id, criticality);
+CREATE INDEX IF NOT EXISTS idx_flow_membership_node ON flow_membership(node_id);

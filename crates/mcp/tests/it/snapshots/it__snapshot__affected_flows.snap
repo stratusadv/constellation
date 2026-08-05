@@ -1,0 +1,8 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+flows affected by the given files: 2 flow(s) over 6 changed symbol(s), most critical first:
+[shop]
+  orders checkout/ (route) -> 5 symbols across 5 files in 2 app(s), depth 3, criticality 0.45
+  Order.audit (true_root) -> 2 symbols across 2 files in 2 app(s) crossing 1 other project(s), depth 1, criticality 0.36

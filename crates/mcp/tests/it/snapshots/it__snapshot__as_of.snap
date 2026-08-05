@@ -1,0 +1,11 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+symbols as of <commit-1> (2020-01-05): 4 alive
+orders/models.py:
+  model orders/models.py::Order
+  method orders/models.py::Order.recalculate_totals [(self)]
+  field orders/models.py::Order.reference [CharField(max_length=32)]
+orders/views.py:
+  view orders/views.py::checkout_view [(request)]

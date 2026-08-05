@@ -1,0 +1,10 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+feature slice for "Order" (3 symbols):
+  views:
+    [shop] view OrderDetailView @ orders/views.py::OrderDetailView (orders/views.py:7) [view]
+  models:
+    [shop] model Order @ orders/models.py::Order (orders/models.py:6) [model]
+    [platform] model TimeStamped @ platform_core/models.py::TimeStamped (platform_core/models.py:4) [model]

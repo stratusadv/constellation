@@ -17,7 +17,7 @@ fn main() {
     divan::main();
 }
 
-/// How many same-named `save` methods the context holds, a realistic count for
+/// The same-named `save` methods the context holds, a realistic count for
 /// a common method name across a large Django project.
 const SAME_NAME_NODES: usize = 200;
 

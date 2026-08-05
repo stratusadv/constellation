@@ -1,0 +1,33 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: "python(\"apiary/beehive/apps.py\", APPS)"
+---
+file    apiary/beehive/apps.py
+project apiary
+
+nodes (5)
+  file       apps.py                 apiary/beehive/apps.py          1:0-8:0
+  class      BeehiveConfig           BeehiveConfig                   4:0-7:28
+    visibility  public
+  variable   default_auto_field      BeehiveConfig.default_auto_field 5:4-5:56
+    visibility  public
+  variable   name                    BeehiveConfig.name              6:4-6:27
+    visibility  public
+  variable   label                   BeehiveConfig.label             7:4-7:28
+    visibility  public
+
+edges (4)
+  contains            apiary/beehive/apps.py          -> BeehiveConfig  [extraction:python]
+  contains            BeehiveConfig                   -> BeehiveConfig.default_auto_field  [extraction:python]
+  contains            BeehiveConfig                   -> BeehiveConfig.label  [extraction:python]
+  contains            BeehiveConfig                   -> BeehiveConfig.name  [extraction:python]
+
+refs (2)
+  imports             apiary/beehive/apps.py          -> "AppConfig"  @1:24
+    candidates  django.apps
+  extends             BeehiveConfig                   -> "AppConfig"  @4:20
+
+imports (1)
+  AppConfig               AppConfig               from django.apps
+
+events (0)

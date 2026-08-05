@@ -2,11 +2,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use constellation_graph::{
-    Edge, EdgeKind, Language, Node, NodeId, NodeIdentity, NodeKind, ProjectId, Span, Visibility,
+    Edge, EdgeKind, Language, Node, NodeId, NodeIdentity, NodeKind, ProjectId, RELATION_FIELDS,
+    Span, Visibility,
 };
 use constellation_resolution::{
-    COLLECTION_CONTEXT, ImportMapping, QUERYSET_DISPATCH, SERVICE_DISPATCH, TYPED_RECEIVER,
-    UnresolvedRef,
+    COLLECTION_CONTEXT, ImportMapping, QUERYSET_DISPATCH, RECEIVER_ROOT, SERVICE_DISPATCH,
+    SUPER_DISPATCH, TYPED_RECEIVER, UnresolvedRef,
 };
 use rustc_hash::FxHashSet;
 use tree_sitter::{Node as TsNode, Parser};
@@ -19,6 +20,15 @@ const WALK_ITERATIONS_MAX: u32 = 5_000_000;
 
 /// A fail-fast bound on the fan-out examined at a single tree node.
 const CHILDREN_MAX: u32 = 1_000_000;
+
+/// A bound on the same-file `References` edges one file may contribute for
+/// definitions passed as arguments, so a generated file full of callback tables
+/// cannot dominate the edge count.
+const ARGUMENT_REFERENCES_MAX: u32 = 4_000;
+
+/// A bound on the subscripts unwrapped while reducing a parameterized name
+/// (`Service['Model']`, `Mapping[str, Sequence[int]]`) to the name itself.
+const SUBSCRIPT_DEPTH_MAX: u32 = 16;
 
 /// The provenance tag on edges and references this extractor produces.
 const PROVENANCE: &str = "extraction:python";
@@ -60,12 +70,20 @@ const VIEW_ATTRIBUTES: &[&str] = &[
     "table_class",
 ];
 
-/// The Django model field constructors that declare a relation to another model;
-/// their first argument names the related model. `GenericRelation` is a reverse
-/// generic accessor (no own column) but still names a related model in its first
-/// argument and exposes a queryable attribute, so it is surfaced like the
-/// concrete relation fields rather than dropped.
-const RELATION_FIELDS: &[&str] = &["ForeignKey", "ManyToManyField", "OneToOneField", "GenericRelation"];
+
+/// The number of arguments a model field's signature keeps. A field's column is
+/// described by its first few (`max_length`, `null`, `on_delete`); the tail is
+/// validators and help text, which no schema question needs.
+const FIELD_ARGUMENTS_MAX: usize = 6;
+
+/// The length one rendered argument value is clipped to, so a field with an
+/// inline `choices=` or a long default cannot crowd out the rest of the schema.
+const FIELD_ARGUMENT_VALUE_MAX: usize = 40;
+
+/// The length a field's trailing `help_text` phrase is clipped to. Shorter than
+/// an argument value: it rides along after the schema rather than being part of
+/// it, and a whole sentence of prose would bury the column definition.
+const FIELD_PROSE_CHARS_MAX: usize = 64;
 
 /// The capitalized names from `typing` and the builtins that are type constructors,
 /// not domain classes; excluded from type-annotation edges so only user types
@@ -267,11 +285,183 @@ impl Extractor for PythonExtractor {
             process_frame(project, file_path, bytes, &file_id, frame, &mut stack, &mut output);
         }
 
+        emit_argument_references(bytes, root, &mut output);
+
         let exported = collect_dunder_all(bytes, root);
         apply_exports(&mut output, &exported);
 
         output
     }
+}
+
+/// The same-file `References` edges for definitions passed by name rather than
+/// called: `list_view(request, breadcrumbs_func=crumbs)` uses `crumbs` without
+/// calling it anywhere the graph could see.
+///
+/// Without these a callback has no incoming edge at all, so every nested helper
+/// handed to a framework entry point reads as dead code, which is the dominant
+/// false positive in orphan scanning. Both endpoints are definitions in this
+/// file, so the edge is knowable at parse time and needs no resolution pass, and
+/// nothing outside the file can be misbound. A name the file defines twice is
+/// skipped rather than guessed at, and a definition naming itself is not an edge.
+fn emit_argument_references(bytes: &[u8], root: TsNode<'_>, output: &mut ExtractionOutput) {
+    let mut definitions: Vec<(String, NodeId, u32)> = Vec::new();
+    let mut spans: Vec<(NodeId, u32, u32)> = Vec::new();
+
+    for node in &output.nodes {
+        if node.kind == NodeKind::File {
+            continue;
+        }
+
+        spans.push((node.id.clone(), node.span.start_line, node.span.end_line));
+
+        if !matches!(
+            node.kind,
+            NodeKind::Class
+                | NodeKind::Function
+                | NodeKind::Method
+                | NodeKind::Model
+                | NodeKind::View
+        ) {
+            continue;
+        }
+
+        definitions.push((node.name.clone(), node.id.clone(), node.span.start_line));
+    }
+
+    if definitions.is_empty() {
+        return;
+    }
+
+    let mut stack: Vec<TsNode<'_>> = vec![root];
+    let mut iterations: u32 = 0;
+    let mut emitted: u32 = 0;
+
+    while let Some(node) = stack.pop() {
+        iterations += 1;
+
+        if iterations > WALK_ITERATIONS_MAX || emitted >= ARGUMENT_REFERENCES_MAX {
+            break;
+        }
+
+        if node.kind() == "call"
+            && let Some(arguments) = node.child_by_field_name("arguments")
+        {
+            let mut index: u32 = 0;
+
+            while let Some(argument) = arguments.named_child(index) {
+                index += 1;
+
+                if index > CHILDREN_MAX {
+                    break;
+                }
+
+                let Some(identifier) = argument_identifier(argument) else {
+                    continue;
+                };
+
+                let name = node_text(bytes, identifier);
+                let line = line_1based(identifier.start_position().row);
+
+                let Some(target) = scoped_definition(&spans, &definitions, name, line) else {
+                    continue;
+                };
+
+                let Some(source) = innermost_definition(&spans, line, target) else {
+                    continue;
+                };
+
+                let mut edge = Edge::new(source, target.clone(), EdgeKind::References);
+                edge.line = Some(line);
+                edge.provenance = Some(PROVENANCE.to_string());
+
+                output.edges.push(edge);
+                emitted += 1;
+            }
+        }
+
+        let mut child_index: u32 = 0;
+
+        while let Some(child) = node.named_child(child_index) {
+            stack.push(child);
+            child_index += 1;
+
+            if child_index > CHILDREN_MAX {
+                break;
+            }
+        }
+    }
+}
+
+/// The identifier an argument passes by name, whether positional (`f(crumbs)`) or
+/// keyword (`f(breadcrumbs_func=crumbs)`). Anything else (a literal, a call, an
+/// attribute chain) is not a bare name and yields `None`.
+fn argument_identifier<'tree>(argument: TsNode<'tree>) -> Option<TsNode<'tree>> {
+    match argument.kind() {
+        "identifier" => Some(argument),
+        "keyword_argument" => argument
+            .child_by_field_name("value")
+            .filter(|value| value.kind() == "identifier"),
+        _ => None,
+    }
+}
+
+/// The definition `name` refers to at `line`, chosen lexically when the file
+/// defines that name more than once.
+///
+/// Several views in one module, each nesting its own `crumbs` helper, is the
+/// ordinary Django shape, so refusing every repeated name would drop exactly the
+/// callbacks this pass exists to see. The candidate whose enclosing definition
+/// also contains the reference is the one in scope. When that does not pick out
+/// exactly one, nothing is emitted rather than a guess.
+fn scoped_definition<'defs>(
+    spans: &[(NodeId, u32, u32)],
+    definitions: &'defs [(String, NodeId, u32)],
+    name: &str,
+    line: u32,
+) -> Option<&'defs NodeId> {
+    let mut matching = definitions.iter().filter(|(defined, _, _)| defined == name);
+
+    let first = matching.next()?;
+
+    if matching.next().is_none() {
+        return Some(&first.1);
+    }
+
+    let mut scoped = definitions.iter().filter(|(defined, id, start)| {
+        defined == name
+            && innermost_definition(spans, *start, id)
+                .and_then(|parent| definition_span(spans, &parent))
+                .is_some_and(|(from, to)| from <= line && line <= to)
+    });
+
+    let only = scoped.next()?;
+
+    if scoped.next().is_some() {
+        return None;
+    }
+
+    Some(&only.1)
+}
+
+/// The recorded source span of one definition.
+fn definition_span(spans: &[(NodeId, u32, u32)], id: &NodeId) -> Option<(u32, u32)> {
+    spans.iter().find(|(other, _, _)| other == id).map(|(_, start, end)| (*start, *end))
+}
+
+/// The innermost definition whose span covers `line`, the symbol a reference on
+/// that line belongs to. `target` is excluded so a definition passing its own
+/// name does not become its own caller.
+fn innermost_definition(
+    spans: &[(NodeId, u32, u32)],
+    line: u32,
+    target: &NodeId,
+) -> Option<NodeId> {
+    spans
+        .iter()
+        .filter(|(id, start, end)| *start <= line && line <= *end && id != target)
+        .min_by_key(|(_, start, end)| end.saturating_sub(*start))
+        .map(|(id, _, _)| id.clone())
 }
 
 /// Whether a node's direct children are file-, class-, or function-scoped,
@@ -556,8 +746,8 @@ fn class_attribute_types(bytes: &[u8], class_node: TsNode<'_>) -> Option<Rc<Vec<
 }
 
 /// The type-annotated parameters of a function, as `(name, type)` pairs: the
-/// first domain type named in each annotation (`order: PurchaseOrder` ->
-/// `("order", "PurchaseOrder")`, `order: Optional[PurchaseOrder]` likewise).
+/// first domain type named in each annotation (`order: Order` ->
+/// `("order", "Order")`, `order: Optional[Order]` likewise).
 /// Untyped parameters (`self`, `request`) and builtin/typing annotations
 /// contribute nothing, so only domain-typed locals seed typed-receiver dispatch.
 fn parameter_types(bytes: &[u8], def_node: TsNode<'_>) -> Vec<(String, String)> {
@@ -595,7 +785,7 @@ fn parameter_types(bytes: &[u8], def_node: TsNode<'_>) -> Vec<(String, String)> 
 }
 
 /// The parameter name of a `typed_parameter`/`typed_default_parameter`: its
-/// first identifier child (`order: PurchaseOrder` -> `order`).
+/// first identifier child (`order: Order` -> `order`).
 fn parameter_identifier<'tree>(bytes: &'tree [u8], parameter: TsNode<'tree>) -> Option<&'tree str> {
     let mut cursor = parameter.walk();
 
@@ -1132,8 +1322,8 @@ fn is_test_file(file_path: &str) -> bool {
 }
 
 /// A `Tests` reference from a `TestCase` class in a test module to the symbol
-/// it covers, inferred from the class name: `PurchaseOrderTestCase` ->
-/// `PurchaseOrder`, `CompanyModelTests` -> `Company`. The `Test`/`TestCase`/`Tests`
+/// it covers, inferred from the class name: `OrderTestCase` ->
+/// `Order`, `CompanyModelTests` -> `Company`. The `Test`/`TestCase`/`Tests`
 /// suffix is stripped, then a trailing layer noun (`Model`/`View`/`Form`/...) the
 /// test name often carries. Resolution binds the stripped name to a definition;
 /// a name that resolves to nothing emits no edge, the no-false-edge discipline.
@@ -1289,14 +1479,43 @@ fn call_ref(file_path: &str, bytes: &[u8], frame: &Frame<'_>) -> Option<Unresolv
         Language::Python,
     );
 
-    if is_self_call(bytes, function)
+    if is_super_call(bytes, function)
+        && let Some(class) = &frame.scope.enclosing_class
+    {
+        // Python defines `super().x()` as the lookup that skips the calling class,
+        // which is exactly one ancestor's method or, under ambiguous multiple
+        // inheritance, none. The sentinel routes it to the inherited-method pass:
+        // instance-method resolution would bind the class's own override instead.
+        reference.candidates.push(SUPER_DISPATCH.to_string());
+        reference.candidates.push(class.to_string());
+    } else if is_self_call(bytes, function)
         && let Some(class) = &frame.scope.enclosing_class
     {
         reference.candidates.push(class.to_string());
     } else if is_objects_manager_call(bytes, function) {
         reference.candidates.push(QUERYSET_DISPATCH.to_string());
-    } else if is_services_call(bytes, function) {
+
+        // The model the chain started from, when it can be read statically.
+        // Dispatch can then pick `OrderQuerySet.active` for `Order.objects...`
+        // rather than needing the method name to be unique across every queryset
+        // in the constellation, which it usually is not: `active` is defined on
+        // five different querysets in one real project, so every one of its 221
+        // call sites stayed unresolved.
+        if let Some(model) = queryset_model(bytes, frame.node) {
+            reference.candidates.push(model.to_string());
+        }
+    } else if let Some(receiver) = services_receiver(bytes, function) {
         reference.candidates.push(SERVICE_DISPATCH.to_string());
+
+        // The model the chain started from, when it can be read statically.
+        // Dispatch can then pick `TargetService.set_quantity_for_day` for
+        // `Target.services...` rather than needing the method name to be unique
+        // across every service in the constellation, which under this convention
+        // it systematically is not: the same method name is defined once per
+        // model, so every call site of a shared name stayed unresolved.
+        if let Some(model) = model_name_of(bytes, receiver) {
+            reference.candidates.push(model.to_string());
+        }
     } else if let Some(type_name) = typed_receiver_type(bytes, function, &frame.scope) {
         reference.candidates.push(TYPED_RECEIVER.to_string());
         reference.candidates.push(type_name);
@@ -1305,6 +1524,25 @@ fn call_ref(file_path: &str, bytes: &[u8], frame: &Frame<'_>) -> Option<Unresolv
         // as an instantiation, not a call. Resolves only to a Class/Model of that
         // name, so a rare uppercase-named function drops rather than misbinds.
         reference.reference_kind = EdgeKind::Instantiates;
+    } else if let Some(receiver) = receiver_path(bytes, function) {
+        // The receiver is a name this file bound by an import (a module, or a
+        // class whose method is inherited) or a local standing for a model. Only
+        // the import table plus the whole constellation can say which, so carry
+        // the text and let the receiver-typed pass decide. The candidate is
+        // additive: generic resolution still gets its chance first, and the pass
+        // only sees what stayed pending.
+        let root_type = receiver
+            .split_once('.')
+            .and_then(|(root, _attribute)| lookup_type(frame.scope.local_types.as_deref(), root));
+
+        reference.candidates.push(RECEIVER_ROOT.to_string());
+        reference.candidates.push(receiver);
+
+        // An annotated root types the whole chain (`order: Order` makes
+        // `order.lines` the Order.lines relation), so carry it too.
+        if let Some(root_type) = root_type {
+            reference.candidates.push(root_type);
+        }
     }
 
     Some(reference)
@@ -1312,7 +1550,7 @@ fn call_ref(file_path: &str, bytes: &[u8], frame: &Frame<'_>) -> Option<Unresolv
 
 /// The annotated type of a call's receiver, so resolution can bind the method to
 /// that class. Two receiver shapes carry a known type: a bare type-annotated
-/// local (`order.recalculate()` with `order: PurchaseOrder` in scope), and a
+/// local (`order.recalculate()` with `order: Order` in scope), and a
 /// type-annotated attribute on `self`/`cls` (`self.repository.get()` with
 /// `repository: ArticleRepository` declared on the class). `None` for any other
 /// receiver; deeper chains or computed receivers (`order.lines.first().x()`)
@@ -1422,35 +1660,38 @@ fn is_objects_manager_call(bytes: &[u8], function: TsNode<'_>) -> bool {
     }
 }
 
-/// Whether a call's function is `<x>.services.<method>` or
-/// `<x>.services.<sub>.<method>`, this codebase's service dispatch
-/// (`order.services.processor.recalculate_totals()`), routed to service-method
-/// resolution. `services` is matched as the receiver attribute one or two levels
-/// above the called method; deeper chains are left to the import-scoped path.
-fn is_services_call(bytes: &[u8], function: TsNode<'_>) -> bool {
+/// The node the `services` attribute hangs off when a call's function is
+/// `<x>.services.<method>` or `<x>.services.<sub>.<method>`, this codebase's
+/// service dispatch (`order.services.processor.recalculate_totals()`), routed to
+/// service-method resolution. `services` is matched as the receiver attribute one
+/// or two levels above the called method; deeper chains are left to the
+/// import-scoped path. `Some` identifies the call as service dispatch and carries
+/// the receiver the chain started from, which may or may not name a model.
+fn services_receiver<'tree>(bytes: &[u8], function: TsNode<'tree>) -> Option<TsNode<'tree>> {
     if function.kind() != "attribute" {
-        return false;
+        return None;
     }
 
-    let Some(object) = function.child_by_field_name("object") else {
-        return false;
-    };
+    let object = function.child_by_field_name("object")?;
 
     if object.kind() != "attribute" {
-        return false;
+        return None;
     }
 
-    let is_services =
-        |node: TsNode<'_>| node.child_by_field_name("attribute").is_some_and(|attribute| node_text(bytes, attribute) == "services");
+    let is_services = |node: TsNode<'_>| {
+        node.child_by_field_name("attribute")
+            .is_some_and(|attribute| node_text(bytes, attribute) == "services")
+    };
 
-    if is_services(object) {
-        return true;
-    }
+    let services = if is_services(object) {
+        object
+    } else {
+        object
+            .child_by_field_name("object")
+            .filter(|inner| inner.kind() == "attribute" && is_services(*inner))?
+    };
 
-    object
-        .child_by_field_name("object")
-        .filter(|inner| inner.kind() == "attribute")
-        .is_some_and(is_services)
+    services.child_by_field_name("object")
 }
 
 /// A `Renders` reference when the call is a Django render call carrying a
@@ -1614,10 +1855,12 @@ fn context_call_type<'bytes>(bytes: &'bytes [u8], call: TsNode<'_>) -> Option<(&
 
 /// The model whose default manager a queryset call chains off:
 /// `Model.objects.filter(...).order_by(...)` -> `Model`. Descends the receiver
-/// chain through each `.method(...)` hop to the base, requiring it to be exactly
-/// `<Identifier>.objects` (the default manager). `None` for any other receiver
-/// (a custom manager, a local queryset variable, a reverse accessor
-/// `obj.records.all()`), so only an unambiguous model collection is typed.
+/// chain through each `.method(...)` hop to the base, requiring it to be
+/// `<Model>.objects` (the default manager), where the model may also be reached
+/// through the module that defines it (`models.Order.objects`, this codebase's
+/// dominant spelling). `None` for any other receiver (a custom manager, a local
+/// queryset variable, a reverse accessor `obj.records.all()`), so only an
+/// unambiguous model collection is typed.
 fn queryset_model<'bytes>(bytes: &'bytes [u8], call: TsNode<'_>) -> Option<&'bytes str> {
     let mut node = call;
     let mut depth: u32 = 0;
@@ -1644,17 +1887,32 @@ fn queryset_model<'bytes>(bytes: &'bytes [u8], call: TsNode<'_>) -> Option<&'byt
                     return None;
                 }
 
-                let model = object.child_by_field_name("object")?;
-
-                if model.kind() != "identifier" {
-                    return None;
-                }
-
-                return Some(node_text(bytes, model));
+                return model_name_of(bytes, object.child_by_field_name("object")?);
             }
             _ => return None,
         }
     }
+}
+
+/// The model name a `.objects` receiver spells, whether written bare (`Order`) or
+/// through the module that defines it (`models.Order`). The final segment must
+/// read as a class name, so a lower-case attribute chain (`self.obj_class.objects`,
+/// whose model is known only at runtime) yields `None` rather than a name no model
+/// answers to.
+fn model_name_of<'bytes>(bytes: &'bytes [u8], receiver: TsNode<'_>) -> Option<&'bytes str> {
+    let name = match receiver.kind() {
+        "identifier" => node_text(bytes, receiver),
+        "attribute" => node_text(bytes, receiver.child_by_field_name("attribute")?),
+        _ => return None,
+    };
+
+    if !is_class_like(name) {
+        return None;
+    }
+
+    assert!(!name.is_empty(), "a class-like model name is not empty");
+
+    Some(name)
 }
 
 /// The `(base_local, accessor)` of a reverse-relation queryset call:
@@ -1934,6 +2192,26 @@ fn route_call(
     false
 }
 
+/// The argument node holding a URL pattern's handler: the second positional, or
+/// the `view=` keyword when the call names it that way.
+///
+/// Django's signature is `path(route, view, kwargs=None, name=None)`, so
+/// `path('list/', view=page_views.list_view, name='list')` is an ordinary call,
+/// and reading only the positional slot emits no reference for it at all. Not
+/// even an unresolved one, which is worse than a wrong edge: the route renders
+/// as unresolved with nothing to say about what it named.
+fn route_handler_node<'tree>(
+    bytes: &[u8],
+    call_node: TsNode<'tree>,
+    positional: &[TsNode<'tree>],
+) -> Option<TsNode<'tree>> {
+    if let Some(node) = positional.get(1) {
+        return Some(*node);
+    }
+
+    keyword_arg_node(bytes, call_node, "view")
+}
+
 /// The handling of `path("url", handler, ...)`.
 fn url_route(
     project: &ProjectId,
@@ -1954,7 +2232,8 @@ fn url_route(
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| if url.is_empty() { "/".to_string() } else { url.clone() });
 
-    let namespace = positional.get(1).and_then(|node| include_namespace(bytes, *node));
+    let handler = route_handler_node(bytes, frame.node, positional);
+    let namespace = handler.and_then(|node| include_namespace(bytes, node));
 
     let line = line_1based(frame.node.start_position().row);
     let spec = RouteSpec {
@@ -1965,7 +2244,7 @@ fn url_route(
     };
     let route_id = emit_route(project, file_path, spec, file_id, output);
 
-    if let Some((name, kind, receiver)) = positional.get(1).and_then(|node| handler_reference(bytes, *node)) {
+    if let Some((name, kind, receiver)) = handler.and_then(|node| handler_reference(bytes, node)) {
         let mut reference =
             UnresolvedRef::new(route_id, name, kind, line, 0, file_path, Language::Python);
 
@@ -2464,9 +2743,13 @@ fn class_field(
     let field_id = NodeId::new(project, &qualified_name);
 
     output.edges.push(contains_edge(&frame.scope.parent_id, &field_id));
-    output
-        .nodes
-        .push(make_node(project, NodeKind::Field, field_name, &qualified_name, file_path, frame.node));
+
+    let mut field_node =
+        make_node(project, NodeKind::Field, field_name, &qualified_name, file_path, frame.node);
+
+    field_node.signature = Some(field_declaration(bytes, callee, right));
+
+    output.nodes.push(field_node);
 
     if RELATION_FIELDS.contains(&callee)
         && let Some(target) = positional_args(right).first().and_then(|node| relation_target(bytes, *node))
@@ -2734,6 +3017,152 @@ fn template_strings(bytes: &[u8], node: TsNode<'_>) -> Vec<String> {
     }
 }
 
+/// A model field's declared type and the arguments that shape its column, as
+/// `CharField(max_length=255)` or `ForeignKey(Inventory, on_delete=models.CASCADE)`,
+/// followed by its `help_text` when it declares one.
+///
+/// The type is the answer `model` exists to give. A schema that lists a field's
+/// name alone says nothing about what it holds, so a reader has to open the
+/// models file the tool was built to replace; a relation field is the one case
+/// that used to carry any of this, and only its target. A relation still leads
+/// with that target, as its first argument, so the related model stays the first
+/// thing read.
+///
+/// `help_text` trails the arguments rather than sitting among them, and is
+/// budgeted separately, so the prose answers what the column means without
+/// spending the [`FIELD_ARGUMENTS_MAX`] slots `max_length`, `null`, and
+/// `on_delete` need.
+fn field_declaration(bytes: &[u8], callee: &str, call_node: TsNode<'_>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut prose = String::new();
+
+    if RELATION_FIELDS.contains(&callee)
+        && let Some(target) =
+            positional_args(call_node).first().and_then(|node| relation_target(bytes, *node))
+    {
+        parts.push(target);
+    }
+
+    let Some(arguments) = call_node.child_by_field_name("arguments") else {
+        return format!("{callee}()");
+    };
+
+    let mut cursor = arguments.walk();
+    let mut count: u32 = 0;
+
+    for argument in arguments.named_children(&mut cursor) {
+        count += 1;
+
+        assert!(count <= CHILDREN_MAX, "argument fan-out exceeded {CHILDREN_MAX}");
+
+        if argument.kind() != "keyword_argument" {
+            continue;
+        }
+
+        // Prose, not schema, so it is carried out of the argument budget entirely.
+        // `help_text` wins over `verbose_name`, which mostly restates the name.
+        let label = argument_name(bytes, argument);
+
+        if matches!(label, "help_text" | "verbose_name") {
+            if label == "help_text" || prose.is_empty() {
+                prose = field_prose(bytes, argument);
+            }
+
+            continue;
+        }
+
+        if parts.len() >= FIELD_ARGUMENTS_MAX {
+            continue;
+        }
+
+        parts.push(field_argument(bytes, argument));
+    }
+
+    let declaration = format!("{callee}({})", parts.join(", "));
+
+    if prose.is_empty() {
+        return declaration;
+    }
+
+    format!("{declaration} {prose}")
+}
+
+/// A field's `help_text` (or, failing that, its `verbose_name`) as one short
+/// quoted phrase, empty when the argument carries no readable literal.
+///
+/// The column type says what a value is; this says what it means, which for a
+/// field like `cycle_time_seconds` is the part a reader cannot infer.
+fn field_prose(bytes: &[u8], argument: TsNode<'_>) -> String {
+    let Some(value) = argument.child_by_field_name("value") else {
+        return String::new();
+    };
+
+    let text = node_text(bytes, value);
+    let unquoted = text.trim_matches(|character| matches!(character, '\'' | '"'));
+    let collapsed = unquoted.split_whitespace().collect::<Vec<&str>>().join(" ");
+
+    if collapsed.is_empty() {
+        return String::new();
+    }
+
+    format!("\"{}\"", clip_at_token(&collapsed, FIELD_PROSE_CHARS_MAX))
+}
+
+/// `text` clipped to at most `max` characters without splitting an identifier,
+/// with a trailing ellipsis when anything was dropped.
+///
+/// A hard character cut lands mid-name and prints a fragment
+/// (`MinValueValidator(CONCURRENT_STATION_CO...`) that reads as a different
+/// symbol than the one written, and that no search will find. Backing up to the
+/// token start costs a few characters and keeps every name in the output real.
+fn clip_at_token(text: &str, max: usize) -> String {
+    assert!(max > 0, "a clip keeps at least one character");
+
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+
+    let clipped: String = text.chars().take(max).collect();
+    let splits_token = text.chars().nth(max).is_some_and(is_token_char);
+
+    let kept = if splits_token {
+        clipped.trim_end_matches(is_token_char)
+    } else {
+        clipped.as_str()
+    };
+
+    // A single token longer than the whole budget has no boundary to back up to,
+    // so the hard cut stands rather than the value vanishing.
+    let kept = if kept.trim_end().is_empty() { clipped.as_str() } else { kept };
+
+    format!("{}...", kept.trim_end())
+}
+
+/// Whether a character continues an identifier, the thing a clip must not split.
+fn is_token_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+/// A keyword argument's name, or an empty string when the node carries none.
+fn argument_name<'source>(bytes: &'source [u8], argument: TsNode<'_>) -> &'source str {
+    argument.child_by_field_name("name").map(|node| node_text(bytes, node)).unwrap_or("")
+}
+
+/// A keyword argument of a field declaration, as `name=value`, with the value's
+/// whitespace collapsed and its length clipped so a multi-line `choices=` or a
+/// long default stays one short term.
+fn field_argument(bytes: &[u8], argument: TsNode<'_>) -> String {
+    let name = argument_name(bytes, argument);
+
+    let Some(value) = argument.child_by_field_name("value") else {
+        return name.to_string();
+    };
+
+    let collapsed = node_text(bytes, value).split_whitespace().collect::<Vec<&str>>().join(" ");
+
+    format!("{name}={}", clip_at_token(&collapsed, FIELD_ARGUMENT_VALUE_MAX))
+}
+
 /// A `RelatesTo` reference from the view to the symbol a CBV/DRF attribute
 /// (`model`, `form_class`, `serializer_class`, `queryset`, ...) binds to, when a
 /// view class-body assignment makes such a binding. Returns true when the
@@ -2760,10 +3189,11 @@ fn view_attribute(
 
     if let Some(right) = frame.node.child_by_field_name("right") {
         let line = line_1based(frame.node.start_position().row);
+        let owner = binding_owner_id(frame.scope.parent_id.as_ref());
 
         for symbol in rhs_symbols(bytes, right) {
             output.unresolved_refs.push(UnresolvedRef::new(
-                frame.scope.parent_id.as_ref().clone(),
+                owner.clone(),
                 symbol,
                 EdgeKind::RelatesTo,
                 line,
@@ -2775,6 +3205,24 @@ fn view_attribute(
     }
 
     true
+}
+
+/// The class a `model = …` / `form_class = …` binding belongs to.
+///
+/// A ModelForm, ModelAdmin, or serializer declares the binding inside an inner
+/// `Meta`, so the assignment's parent class is `Meta` rather than the class that
+/// means anything. Attributing the relation there puts a row reading `Meta` into
+/// the bound model's relations, which names no class a reader can act on and
+/// collides with every other `Meta` in the project. The enclosing class is the
+/// real owner, so the binding is attributed to it.
+fn binding_owner_id(parent_id: &NodeId) -> NodeId {
+    let Some(owner) = parent_id.as_str().strip_suffix(".Meta") else {
+        return parent_id.clone();
+    };
+
+    assert!(!owner.is_empty(), "a Meta class is nested inside a named owner");
+
+    NodeId::from_raw(owner.to_string())
 }
 
 /// The referenced symbol name(s) on the right of a view-attribute binding: a
@@ -3069,6 +3517,77 @@ fn is_self_call(bytes: &[u8], function: TsNode<'_>) -> bool {
         .is_some_and(|object| matches!(node_text(bytes, object), "self" | "cls"))
 }
 
+/// The receiver text of a call whose function is `<name>.method` or
+/// `<name>.<attribute>.method`, the two depths whose root is a single bare name a
+/// file can have imported or bound locally (`portal_views.template_view()`,
+/// `company.contacts.active()`). Returns the receiver only, without the called
+/// method: `portal_views`, `company.contacts`. `None` for a `self`/`cls` receiver
+/// (instance resolution owns those), for a deeper chain, and for a receiver
+/// computed by a call, none of which a name lookup can type.
+fn receiver_path(bytes: &[u8], function: TsNode<'_>) -> Option<String> {
+    if function.kind() != "attribute" {
+        return None;
+    }
+
+    let object = function.child_by_field_name("object")?;
+
+    match object.kind() {
+        "identifier" => {
+            let root = node_text(bytes, object);
+
+            if matches!(root, "self" | "cls") {
+                return None;
+            }
+
+            Some(root.to_string())
+        }
+        "attribute" => {
+            let base = object.child_by_field_name("object")?;
+
+            if base.kind() != "identifier" {
+                return None;
+            }
+
+            let root = node_text(bytes, base);
+            let attribute = node_text(bytes, object.child_by_field_name("attribute")?);
+
+            assert!(!attribute.is_empty(), "an attribute receiver names its attribute");
+
+            Some(format!("{root}.{attribute}"))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a call's function is `super().x`, a method call delegated to the
+/// enclosing class's ancestors. Matched on the bare zero-argument `super()`, the
+/// only spelling whose skipped class is the enclosing one; the explicit
+/// two-argument `super(Other, self)` names a different starting point and is left
+/// to the generic path.
+fn is_super_call(bytes: &[u8], function: TsNode<'_>) -> bool {
+    if function.kind() != "attribute" {
+        return false;
+    }
+
+    let Some(object) = function.child_by_field_name("object") else {
+        return false;
+    };
+
+    if object.kind() != "call" {
+        return false;
+    }
+
+    let names_super = object
+        .child_by_field_name("function")
+        .is_some_and(|callee| node_text(bytes, callee) == "super");
+
+    let no_arguments = object
+        .child_by_field_name("arguments")
+        .is_some_and(|arguments| arguments.named_child_count() == 0);
+
+    names_super && no_arguments
+}
+
 /// Whether a callee name reads as a class constructor (first character uppercase),
 /// so `Article()` records an `Instantiates`, while a lowercase callee
 /// (`render()`, `get_object()`) stays a `Calls`.
@@ -3076,8 +3595,13 @@ fn is_class_like(name: &str) -> bool {
     name.chars().next().is_some_and(|first| first.is_ascii_uppercase())
 }
 
-/// The final identifier of a (possibly dotted) name used as a base class.
+/// The final identifier of a (possibly dotted, possibly parameterized) name used
+/// as a base class. A subscripted base is reduced to the base itself, so
+/// `BaseDjangoModelService['HarvestLoad']` yields `BaseDjangoModelService` and
+/// still records its `Extends` edge; without this every generic base is dark.
 fn dotted_last_name<'bytes>(bytes: &'bytes [u8], node: TsNode<'_>) -> Option<&'bytes str> {
+    let node = unsubscripted(node)?;
+
     match node.kind() {
         "identifier" => Some(node_text(bytes, node)),
         "attribute" => node
@@ -3089,6 +3613,24 @@ fn dotted_last_name<'bytes>(bytes: &'bytes [u8], node: TsNode<'_>) -> Option<&'b
         }
         _ => None,
     }
+}
+
+/// The value a subscript is applied to, unwrapped until a plain name remains:
+/// `Service['Model']` -> `Service`, `Mapping[str, Sequence[int]]` -> `Mapping`.
+/// A node that is not a subscript is returned unchanged.
+fn unsubscripted(node: TsNode<'_>) -> Option<TsNode<'_>> {
+    let mut node = node;
+    let mut unwrapped: u32 = 0;
+
+    while matches!(node.kind(), "subscript" | "generic_type") {
+        unwrapped += 1;
+
+        assert!(unwrapped <= SUBSCRIPT_DEPTH_MAX, "subscript nesting exceeded {SUBSCRIPT_DEPTH_MAX}");
+
+        node = node.child_by_field_name("value").or_else(|| node.named_child(0))?;
+    }
+
+    Some(node)
 }
 
 /// The (local name, exported name) introduced by one entry in a

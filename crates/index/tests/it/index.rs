@@ -59,6 +59,45 @@ fn watch_ignores_store_and_skip_dirs() {
 }
 
 #[test]
+fn a_source_directory_named_target_is_indexed_and_a_cargo_one_is_not() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let app = directory.path().join("app").join("schedule").join("target");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("models.py"), "class ScheduleTarget:\n    pass\n").unwrap();
+
+    let build = directory.path().join("rust").join("target");
+    std::fs::create_dir_all(&build).unwrap();
+    std::fs::write(directory.path().join("rust").join("Cargo.toml"), "[package]\n").unwrap();
+    std::fs::write(build.join("generated.py"), "class Generated:\n    pass\n").unwrap();
+
+    assert!(!is_ignored_path(&app), "a Django app named target is not a build directory");
+    assert!(is_ignored_path(&build), "a target beside a Cargo.toml is a build directory");
+
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("proj");
+
+    index_project(&store, &project, "proj", directory.path()).unwrap();
+
+    let names: Vec<String> = store
+        .all_nodes(Some(&project))
+        .unwrap()
+        .into_iter()
+        .map(|node| node.name)
+        .collect();
+
+    assert!(
+        names.iter().any(|name| name == "ScheduleTarget"),
+        "a model under a source directory named target must be indexed, got {names:?}",
+    );
+
+    assert!(
+        !names.iter().any(|name| name == "Generated"),
+        "a cargo build directory must stay skipped, got {names:?}",
+    );
+}
+
+#[test]
 fn incremental_reindex_handles_change_and_deletion() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("a.py"), "def a():\n    return 1\n").unwrap();
@@ -531,6 +570,166 @@ fn queryset_method_dispatch_resolves_custom_methods() {
 }
 
 #[test]
+fn service_method_dispatch_disambiguates_by_the_receiving_model() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+
+    // Two services defining the SAME method name, this codebase's dominant shape:
+    // one service per model, method names repeated across them. Uniqueness cannot
+    // pick one, so the receiving model is the only thing that can.
+    std::fs::write(
+        root.join("app").join("models.py"),
+        concat!(
+            "from django.db import models\n",
+            "\n",
+            "\n",
+            "class TargetService:\n",
+            "    def set_quantity(self, quantity):\n",
+            "        return quantity\n",
+            "\n",
+            "\n",
+            "class QuotaService:\n",
+            "    def set_quantity(self, quantity):\n",
+            "        return quantity\n",
+            "\n",
+            "\n",
+            "class Target(models.Model):\n",
+            "    services = TargetService()\n",
+            "\n",
+            "\n",
+            "class Quota(models.Model):\n",
+            "    services = QuotaService()\n",
+        ),
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("app").join("views.py"),
+        concat!(
+            "from app.models import Target\n",
+            "\n",
+            "\n",
+            "def set_target(quantity):\n",
+            "    return Target.services.set_quantity(quantity)\n",
+        ),
+    )
+    .unwrap();
+
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("proj");
+
+    index_project(&store, &project, "proj", root).unwrap();
+
+    let view = store
+        .all_nodes(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "set_target")
+        .expect("set_target node");
+
+    let callees: Vec<(String, String)> = store
+        .callees(&view.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| (node.name, node.qualified_name))
+        .collect();
+
+    let bound_to_target = callees
+        .iter()
+        .any(|(name, owner)| name == "set_quantity" && owner.contains("TargetService"));
+
+    assert!(bound_to_target, "the receiving model picks its own service, got {callees:?}");
+
+    assert!(
+        !callees.iter().any(|(_, owner)| owner.contains("QuotaService")),
+        "and never binds to another model's service of the same name, got {callees:?}",
+    );
+}
+
+#[test]
+fn a_definition_passed_as_an_argument_is_referenced_rather_than_orphaned() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+
+    // `crumbs` is never called here, only handed over. Without a reference edge it
+    // has no incoming edge at all and reads as dead code, which is the dominant
+    // false positive in orphan scanning.
+    // Two views in one module, each nesting its own `crumbs`, is the ordinary
+    // Django shape. A file-global name check would call that ambiguous and give
+    // up on exactly the callbacks this is meant to see, so scope decides.
+    std::fs::write(
+        root.join("app").join("views.py"),
+        concat!(
+            "def list_view(request):\n",
+            "    def crumbs(breadcrumbs):\n",
+            "        return breadcrumbs\n",
+            "\n",
+            "    return build(request, breadcrumbs_func=crumbs)\n",
+            "\n",
+            "\n",
+            "def detail_view(request):\n",
+            "    def crumbs(breadcrumbs):\n",
+            "        return breadcrumbs\n",
+            "\n",
+            "    return build(request, breadcrumbs_func=crumbs)\n",
+        ),
+    )
+    .unwrap();
+
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("proj");
+
+    index_project(&store, &project, "proj", root).unwrap();
+
+    let callbacks: Vec<_> = store
+        .all_nodes(Some(&project))
+        .unwrap()
+        .into_iter()
+        .filter(|node| node.name == "crumbs")
+        .collect();
+
+    assert_eq!(callbacks.len(), 2, "both nested callbacks were indexed");
+
+    for callback in &callbacks {
+        let referrers: Vec<String> = store
+            .callers(&callback.id)
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, _)| *kind == EdgeKind::References)
+            .map(|(_, node)| node.name)
+            .collect();
+
+        let owner = callback.qualified_name.rsplit("::").next().unwrap_or_default().to_string();
+
+        assert_eq!(
+            referrers.len(),
+            1,
+            "{owner} is referenced once, by its own view and no other, got {referrers:?}",
+        );
+
+        assert!(
+            owner.starts_with(referrers[0].as_str()),
+            "and by the view that nests it, got {owner} referenced by {referrers:?}",
+        );
+    }
+
+    let orphans: Vec<String> = store
+        .orphan_definitions(&project, 32)
+        .unwrap()
+        .into_iter()
+        .map(|node| node.name)
+        .collect();
+
+    assert!(
+        !orphans.iter().any(|name| name == "crumbs"),
+        "so it is no longer a dead-code candidate, got {orphans:?}",
+    );
+}
+
+#[test]
 fn route_resolution_honors_the_view_module_import() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
@@ -893,9 +1092,9 @@ fn resolves_a_method_call_on_a_type_annotated_parameter() {
 
     std::fs::write(
         directory.path().join("services.py"),
-        "class PurchaseOrder:\n    \
+        "class Order:\n    \
 def recalculate(self):\n        return 1\n\n\
-def process(order: PurchaseOrder):\n    return order.recalculate()\n",
+def process(order: Order):\n    return order.recalculate()\n",
     )
     .unwrap();
 
@@ -918,12 +1117,12 @@ def process(order: PurchaseOrder):\n    return order.recalculate()\n",
         .any(|(kind, node)| {
             kind == EdgeKind::Calls
                 && node.name == "recalculate"
-                && node.qualified_name.contains("PurchaseOrder")
+                && node.qualified_name.contains("Order")
         });
 
     assert!(
         resolved,
-        "order.recalculate() must bind to PurchaseOrder.recalculate via the annotated parameter type",
+        "order.recalculate() must bind to Order.recalculate via the annotated parameter type",
     );
 }
 
@@ -2531,4 +2730,438 @@ fn a_reference_only_version_still_links_out_to_canonical() {
         importers.iter().any(|project| project == "consumer@next"),
         "the reference-only consumer's import resolves to the canonical base, got {importers:?}",
     );
+}
+
+#[test]
+fn a_call_binds_to_the_method_a_cross_project_base_class_defines() {
+    let store = Store::open_in_memory().unwrap();
+
+    // The library owns the base queryset and the base test case, under the
+    // package directory its consumers spell in an import.
+    let library = tempfile::tempdir().unwrap();
+    std::fs::create_dir(library.path().join("spire")).unwrap();
+    std::fs::write(
+        library.path().join("spire").join("querysets.py"),
+        "class HistoryQuerySet:\n    def active(self):\n        return self\n",
+    )
+    .unwrap();
+    std::fs::write(
+        library.path().join("spire").join("cases.py"),
+        "class BaseTestCase:\n    def setUp(self):\n        return 1\n",
+    )
+    .unwrap();
+
+    index_project(&store, &ProjectId::new("spire"), "spire", library.path()).unwrap();
+
+    // The app subclasses both and calls the inherited methods three ways.
+    let app = tempfile::tempdir().unwrap();
+    std::fs::write(
+        app.path().join("querysets.py"),
+        "from spire.querysets import HistoryQuerySet\n\n\nclass ArticleQuerySet(HistoryQuerySet):\n\
+         \x20   def recent(self):\n        return self.active()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.path().join("views.py"),
+        "import models\n\n\ndef listing(request):\n\
+         \x20   return models.Article.objects.active()\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.path().join("tests.py"),
+        "from spire.cases import BaseTestCase\n\n\nclass ArticleTestCase(BaseTestCase):\n\
+         \x20   def setUp(self):\n        super().setUp()\n",
+    )
+    .unwrap();
+    std::fs::write(app.path().join("models.py"), "class Article:\n    pass\n").unwrap();
+
+    index_project(&store, &ProjectId::new("app"), "app", app.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let library_project = ProjectId::new("spire");
+    let nodes = store.all_nodes(Some(&library_project)).unwrap();
+
+    let active = nodes
+        .iter()
+        .find(|node| node.name == "active" && node.kind == NodeKind::Method)
+        .expect("HistoryQuerySet.active");
+
+    let set_up = nodes
+        .iter()
+        .find(|node| node.name == "setUp" && node.kind == NodeKind::Method)
+        .expect("BaseTestCase.setUp");
+
+    let callers_of = |id: &NodeId| -> Vec<String> {
+        store
+            .callers(id)
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, _)| *kind == EdgeKind::Calls)
+            .map(|(_, node)| node.qualified_name.clone())
+            .collect()
+    };
+
+    let active_callers = callers_of(&active.id);
+
+    assert!(
+        active_callers.iter().any(|name| name.ends_with("ArticleQuerySet.recent")),
+        "self.active() binds to the base queryset's method, got {active_callers:?}",
+    );
+
+    assert!(
+        active_callers.iter().any(|name| name.ends_with("listing")),
+        "models.Article.objects.active() binds through the model's queryset, got {active_callers:?}",
+    );
+
+    let set_up_callers = callers_of(&set_up.id);
+
+    assert!(
+        set_up_callers.iter().any(|name| name.ends_with("ArticleTestCase.setUp")),
+        "super().setUp() binds to the base, not to the overriding method, got {set_up_callers:?}",
+    );
+}
+
+#[test]
+fn an_ambiguous_base_leaves_an_inherited_call_unresolved() {
+    let store = Store::open_in_memory().unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("mixins.py"),
+        "class LeftMixin:\n    def render(self):\n        return 1\n\n\n\
+         class RightMixin:\n    def render(self):\n        return 2\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("views.py"),
+        "from mixins import LeftMixin, RightMixin\n\n\n\
+         class PageView(LeftMixin, RightMixin):\n    def get(self):\n        return super().render()\n",
+    )
+    .unwrap();
+
+    let project = ProjectId::new("app");
+
+    index_project(&store, &project, "app", directory.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let nodes = store.all_nodes(Some(&project)).unwrap();
+
+    let renders: Vec<&NodeId> = nodes
+        .iter()
+        .filter(|node| node.name == "render" && node.kind == NodeKind::Method)
+        .map(|node| &node.id)
+        .collect();
+
+    assert_eq!(renders.len(), 2, "both mixins define render");
+
+    for render in renders {
+        let callers: Vec<String> = store
+            .callers(render)
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, _)| *kind == EdgeKind::Calls)
+            .map(|(_, node)| node.qualified_name.clone())
+            .collect();
+
+        assert!(
+            callers.is_empty(),
+            "two mixins at the same depth define render, so neither may be bound, got {callers:?}",
+        );
+    }
+}
+
+#[test]
+fn a_module_qualified_call_binds_to_the_function_that_module_defines() {
+    let store = Store::open_in_memory().unwrap();
+
+    let library = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(library.path().join("spire/generic")).unwrap();
+    std::fs::write(
+        library.path().join("spire/generic/portal_views.py"),
+        "def template_view(request):\n    return 1\n",
+    )
+    .unwrap();
+    // A same-named function elsewhere must not win; only the named module counts.
+    std::fs::write(
+        library.path().join("spire/decoy.py"),
+        "def template_view(request):\n    return 2\n",
+    )
+    .unwrap();
+
+    index_project(&store, &ProjectId::new("spire"), "spire", library.path()).unwrap();
+
+    let app = tempfile::tempdir().unwrap();
+    std::fs::write(
+        app.path().join("views.py"),
+        "from spire.generic import portal_views\n\n\ndef listing(request):\n\
+         \x20   return portal_views.template_view(request)\n",
+    )
+    .unwrap();
+
+    index_project(&store, &ProjectId::new("app"), "app", app.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let target = store
+        .all_nodes(Some(&ProjectId::new("spire")))
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "template_view" && node.file_path.ends_with("portal_views.py"))
+        .expect("template_view in portal_views");
+
+    let callers: Vec<String> = store
+        .callers(&target.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| node.qualified_name.clone())
+        .collect();
+
+    assert!(
+        callers.iter().any(|name| name.ends_with("listing")),
+        "portal_views.template_view() binds to the function that module defines, got {callers:?}",
+    );
+
+    let decoy = store
+        .all_nodes(Some(&ProjectId::new("spire")))
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "template_view" && node.file_path.ends_with("decoy.py"))
+        .expect("decoy template_view");
+
+    let decoy_callers: Vec<String> = store
+        .callers(&decoy.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| node.qualified_name.clone())
+        .collect();
+
+    assert!(
+        decoy_callers.is_empty(),
+        "the same-named function in another module must not be bound, got {decoy_callers:?}",
+    );
+}
+
+#[test]
+fn a_call_through_a_model_relation_binds_to_the_related_models_queryset() {
+    let store = Store::open_in_memory().unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("querysets.py"),
+        "class LocationQuerySet:\n    def lots(self):\n        return self\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("models.py"),
+        "from django.db import models\n\n\n\
+         class Location(models.Model):\n    name = models.CharField(max_length=10)\n\n\n\
+         class HarvestLoad(models.Model):\n\
+         \x20   locations = models.ManyToManyField('location.Location', related_name='harvest_loads')\n\n\
+         \x20   @property\n\
+         \x20   def lot_display(self):\n        return self.locations.lots()\n",
+    )
+    .unwrap();
+
+    let project = ProjectId::new("app");
+
+    index_project(&store, &project, "app", directory.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let lots = store
+        .all_nodes(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "lots" && node.kind == NodeKind::Method)
+        .expect("LocationQuerySet.lots");
+
+    let callers: Vec<String> = store
+        .callers(&lots.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| node.qualified_name.clone())
+        .collect();
+
+    assert!(
+        callers.iter().any(|name| name.ends_with("HarvestLoad.lot_display")),
+        "self.locations.lots() types the field as Location and binds its queryset, got {callers:?}",
+    );
+}
+
+#[test]
+fn a_call_through_an_annotated_local_and_related_name_binds() {
+    let store = Store::open_in_memory().unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("querysets.py"),
+        "class ContactQuerySet:\n    def without_location(self):\n        return self\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("models.py"),
+        "from django.db import models\n\n\n\
+         class Company(models.Model):\n    name = models.CharField(max_length=10)\n\n\n\
+         class Contact(models.Model):\n\
+         \x20   company = models.ForeignKey('company.Company', related_name='contacts', on_delete=models.CASCADE)\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("views.py"),
+        "from models import Company\n\n\n\
+         def listing(request, company: Company):\n\
+         \x20   return company.contacts.without_location()\n",
+    )
+    .unwrap();
+
+    let project = ProjectId::new("app");
+
+    index_project(&store, &project, "app", directory.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let target = store
+        .all_nodes(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|node| node.name == "without_location")
+        .expect("ContactQuerySet.without_location");
+
+    let callers: Vec<String> = store
+        .callers(&target.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| node.qualified_name.clone())
+        .collect();
+
+    assert!(
+        callers.iter().any(|name| name.ends_with("listing")),
+        "an annotated local plus a related_name types the receiver, got {callers:?}",
+    );
+}
+
+#[test]
+fn a_cross_project_base_survives_a_re_index() {
+    let store = Store::open_in_memory().unwrap();
+
+    let library = tempfile::tempdir().unwrap();
+    let package = library.path().join("django_spire");
+    std::fs::create_dir_all(package.join("history")).unwrap();
+
+    std::fs::write(
+        package.join("history").join("mixins.py"),
+        "from django.db import models
+
+
+class HistoryModelMixin(models.Model):
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        abstract = True
+",
+    )
+    .unwrap();
+
+    index_project(&store, &ProjectId::new("django-spire"), "django-spire", &package).unwrap();
+
+    let app = tempfile::tempdir().unwrap();
+    let models = app.path().join("app").join("inventory").join("models.py");
+    std::fs::create_dir_all(models.parent().unwrap()).unwrap();
+    std::fs::write(app.path().join("manage.py"), "# django
+").unwrap();
+
+    let source = "from django.db import models
+
+from django_spire.history.mixins import HistoryModelMixin
+
+
+class Inventory(HistoryModelMixin):
+    name = models.CharField(max_length=255)
+";
+
+    std::fs::write(&models, source).unwrap();
+
+    index_project(&store, &ProjectId::new("portal"), "portal", app.path()).unwrap();
+
+    link_constellation(&store).unwrap();
+
+    // The edit a watcher serves. Re-indexing re-derives the portal's external stubs,
+    // so `Inventory` extends a fresh un-unified stub again; the first link already
+    // consumed the reference rows that produced it, so an un-relinked re-index does
+    // not delay this edge, it loses it permanently.
+    std::fs::write(&models, format!("{source}    sku = models.CharField(max_length=64)
+")).unwrap();
+
+    index_project(&store, &ProjectId::new("portal"), "portal", app.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let nodes = store.all_nodes(None).unwrap();
+
+    let base = nodes
+        .iter()
+        .find(|node| node.name == "HistoryModelMixin" && node.kind != NodeKind::External)
+        .expect("the companion HistoryModelMixin is indexed");
+
+    let callers = store.callers(&base.id).unwrap();
+
+    assert!(
+        callers.iter().any(|(kind, node)| *kind == EdgeKind::Extends && node.name == "Inventory"),
+        "a re-indexed model must still extend the companion base, got {:?}",
+        callers.iter().map(|(k, n)| (*k, n.name.clone())).collect::<Vec<_>>(),
+    );
+}
+
+/// Django's `path(route, view, ...)` takes its handler by keyword as readily as
+/// positionally, and django-spire writes it that way. Reading only the
+/// positional slot emitted no reference at all, so the route rendered
+/// unresolved with nothing to say about what it had named: the one shape the
+/// diagnostic cannot explain, and the reason this is a test rather than a note.
+#[test]
+fn a_handler_passed_as_the_view_keyword_still_binds() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+
+    std::fs::create_dir_all(root.join("app/notification/views")).unwrap();
+    std::fs::create_dir_all(root.join("app/notification/urls")).unwrap();
+
+    std::fs::write(
+        root.join("app/notification/views/page_views.py"),
+        "def notification_list_view(request):\n    return None\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        root.join("app/notification/urls/page_urls.py"),
+        "from django.urls import path\n\n\
+         from app.notification.views import page_views\n\n\n\
+         urlpatterns = [\n\
+         \x20   path('list/',\n\
+         \x20       view=page_views.notification_list_view,\n\
+         \x20       name='list')\n\
+         ]\n",
+    )
+    .unwrap();
+
+    let store = Store::open_in_memory().unwrap();
+    let project = ProjectId::new("portal");
+
+    index_project(&store, &project, "portal", root).unwrap();
+
+    let route = store
+        .all_nodes(Some(&project))
+        .unwrap()
+        .into_iter()
+        .find(|node| node.kind == NodeKind::Route && node.name == "list")
+        .expect("the route node");
+
+    let views: Vec<String> = store
+        .callees(&route.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::RoutesTo)
+        .map(|(_, node)| node.name)
+        .collect();
+
+    assert_eq!(views, ["notification_list_view"], "the keyword handler binds like a positional one");
 }

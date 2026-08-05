@@ -1,0 +1,24 @@
+# One target repository for `constellation-eval`.
+#
+#   cargo run -p constellation-eval -- --config eval/configs/example.toml
+#
+# Copy this per repository you evaluate against. Paths are resolved relative to
+# this file unless absolute.
+
+# The name used in the report header and the result filenames.
+name = "example"
+
+# The constellation database to evaluate against. Build it with
+# `constellation init` in the target project first.
+database = "../../.constellation/index.db"
+
+# The curated question set, version controlled alongside this config.
+goldset = "../goldsets/example.toml"
+
+# The project id the project-scoped benchmarks run against. Omit when only one
+# project is indexed, which is the usual case for a workspace.
+# project = "workspace"
+
+# How many commits the history-driven benchmarks (impact_accuracy,
+# token_efficiency) sample. Requires `constellation history` to have been run.
+commits_max = 50

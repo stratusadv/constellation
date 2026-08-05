@@ -1,0 +1,32 @@
+---
+source: crates/extraction/tests/it/snapshot.rs
+expression: text
+---
+file    shop/static/order_card.js
+project shop
+
+nodes (4)
+  file       order_card.js           shop/static/order_card.js       1:0-17:0
+  function   orderCard               alpine::orderCard               3:0-12:3
+  method     total                   alpine::orderCard.total         5:4-7:5
+  method     remove                  alpine::orderCard.remove        8:4-11:5
+
+edges (3)
+  contains            shop/static/order_card.js       -> alpine::orderCard  [extraction:javascript]
+  contains            alpine::orderCard               -> alpine::orderCard.remove  [extraction:javascript]
+  contains            alpine::orderCard               -> alpine::orderCard.total  [extraction:javascript]
+
+refs (6)
+  imports             shop/static/order_card.js       -> "formatMoney"  @1:0
+    candidates  ./money.js
+  calls               alpine::orderCard.total         -> "formatMoney"  @6:15
+  calls               alpine::orderCard.remove        -> "filter"  @9:21
+  calls               alpine::orderCard.remove        -> "$dispatch"  @10:8
+  calls               shop/static/order_card.js       -> "addEventListener"  @14:0
+  calls               shop/static/order_card.js       -> "log"  @15:4
+
+imports (1)
+  formatMoney             formatMoney             from ./money.js
+
+events (1)
+  dispatch   order-changed           alpine::orderCard.remove  @10:8

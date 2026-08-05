@@ -1,0 +1,21 @@
+[package]
+name = "constellation-eval"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "constellation-eval"
+path = "src/main.rs"
+
+[dependencies]
+constellation-graph.workspace = true
+constellation-index.workspace = true
+constellation-mcp.workspace = true
+constellation-store.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

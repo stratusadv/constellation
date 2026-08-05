@@ -1,0 +1,15 @@
+# The CI fixture: a tiny Django project built fresh by the workflow, so the
+# retrieval-quality gate depends on nothing outside this repository and its
+# numbers stay comparable run to run.
+#
+# The regression floor lives in .github/workflows/ci.yml, not here, because the
+# gate is a CI policy rather than a property of the fixture. Raise it when a
+# change genuinely improves retrieval; never lower it without saying why.
+
+name = "ci-fixture"
+database = "../fixture/.constellation/index.db"
+goldset = "../goldsets/ci-fixture.toml"
+
+# The fixture has no git history of its own, so the history-driven benchmarks
+# report an honest "no ingested history" rather than a zero.
+commits_max = 10
