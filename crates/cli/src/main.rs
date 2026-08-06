@@ -37,6 +37,7 @@ Commands:
                                                --supervise survives a rebuild, no reconnect
   history [db] [--symbols]                     ingest git history, for reads over time
   flows [db] [--project id] [--depth n]        trace and rank Django execution flows
+  tools                                        list the MCP tools the server advertises
   install [--no-hooks] / uninstall             register the MCP server with your agents
   hook pre-tool-use                            the Claude Code hook entry point
 
@@ -61,6 +62,7 @@ fn main() -> Result<()> {
         Some((command, rest)) if command == "serve" => commands::serve::serve_command(rest),
         Some((command, rest)) if command == "history" => commands::history::history_command(rest),
         Some((command, rest)) if command == "flows" => commands::flows::flows_command(rest),
+        Some((command, rest)) if command == "tools" => commands::tools::tools_command(rest),
         Some((command, rest)) if command == "hook" => hook::hook_command(rest),
         Some((command, rest)) if command == "install" => bootstrap::install(rest),
         Some((command, _)) if command == "uninstall" => bootstrap::uninstall(),

@@ -11,3 +11,4 @@ pub(crate) mod link;
 pub(crate) mod serve;
 pub(crate) mod supervise;
 pub(crate) mod sync;
+pub(crate) mod tools;

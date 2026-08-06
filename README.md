@@ -53,6 +53,7 @@ builds from source.
 | `constellation serve [db] [--supervise]` | Serve the graph over MCP (stdio) and watch for changes; registered by `install` |
 | `constellation history [db] [--symbols]` | Ingest git history so the graph can be read over time |
 | `constellation flows [db] [--project id] [--depth n] [--include-tests]` | Trace and rank every Django execution flow |
+| `constellation tools` | List the MCP tools the server advertises, with their descriptions |
 | `constellation install [--no-hooks]` / `uninstall` | Register or unregister the MCP server and this repo's search hook |
 
 `serve` and `sync` find the database by walking up from the working directory, or
