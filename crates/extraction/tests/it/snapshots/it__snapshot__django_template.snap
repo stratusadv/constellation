@@ -1,0 +1,28 @@
+---
+source: crates/extraction/tests/it/snapshot.rs
+expression: text
+---
+file    shop/templates/orders/detail.html
+project shop
+
+nodes (1)
+  template   orders/detail.html      orders/detail.html              1:0-1:0
+
+edges (0)
+
+refs (8)
+  extends_template    orders/detail.html              -> "base.html"  @1:0
+  loop_binding        orders/detail.html              -> "order"  @1:0
+    candidates  line, lines
+  styles              orders/detail.html              -> "order-card"  @5:0
+  accesses_member     orders/detail.html              -> "customer"  @6:0
+    candidates  order
+  accesses_member     orders/detail.html              -> "total"  @9:0
+    candidates  line
+  styles              orders/detail.html              -> "total"  @9:0
+  resolves            orders/detail.html              -> "orders:detail"  @13:0
+  includes_template   orders/detail.html              -> "orders/_summary.html"  @16:0
+
+imports (0)
+
+events (0)

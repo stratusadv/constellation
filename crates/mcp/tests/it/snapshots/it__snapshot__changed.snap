@@ -1,0 +1,9 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+changed symbols by review risk (3 of 3):
+  [shop] method verify_password @ Order.verify_password (orders/models.py:11)  risk 0.53 (no tests, security-sensitive (password), 1 lines changed)
+  [shop] model Order @ orders/models.py::Order (orders/models.py:4)  risk 0.34 (no tests, 2 callers, 2 lines changed)
+  [shop] method recalculate_totals @ Order.recalculate_totals (orders/models.py:8)  risk 0.34 (no tests, 1 callers, 1 lines changed)
+note: shop scored without flow participation (run `constellation flows`); remaining weights renormalized

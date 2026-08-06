@@ -1,0 +1,28 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: text
+---
+file    apiary/templates/apiary/beehive/page/detail.html
+project apiary
+
+nodes (1)
+  template   apiary/beehive/page/detail.html apiary/beehive/page/detail.html 1:0-1:0
+
+edges (0)
+
+refs (8)
+  extends_template    apiary/beehive/page/detail.html -> "hivecore/base/page.html"  @1:0
+  loop_binding        apiary/beehive/page/detail.html -> "beehive"  @1:0
+    candidates  inspection, inspections
+  styles              apiary/beehive/page/detail.html -> "beehive-card"  @5:0
+  accesses_member     apiary/beehive/page/detail.html -> "tag"  @6:0
+    candidates  beehive
+  accesses_member     apiary/beehive/page/detail.html -> "outcome"  @9:0
+    candidates  inspection
+  styles              apiary/beehive/page/detail.html -> "inspection-row"  @9:0
+  resolves            apiary/beehive/page/detail.html -> "apiary:beehive:page:collapse"  @13:0
+  includes_template   apiary/beehive/page/detail.html -> "apiary/beehive/partial/form.html"  @16:0
+
+imports (0)
+
+events (0)

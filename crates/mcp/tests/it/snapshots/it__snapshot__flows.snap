@@ -1,0 +1,9 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+execution flows (3 of 3 shown, most critical first):
+[shop]
+  orders <int:pk>/ (route) -> 4 symbols across 4 files in 2 app(s), depth 3, criticality 0.46
+  orders checkout/ (route) -> 5 symbols across 5 files in 2 app(s), depth 3, criticality 0.45
+  Order.audit (true_root) -> 2 symbols across 2 files in 2 app(s) crossing 1 other project(s), depth 1, criticality 0.36

@@ -1,0 +1,11 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+[shop] method recalculate_totals @ Order.recalculate_totals (orders/models.py:10)
+  signature: (self)
+  import: from orders.models import Order
+  callers: 2 (2 calls)  callees: 0
+  called by:
+    [calls] [shop] view checkout_view @ orders/views.py::checkout_view (orders/views.py:12)
+    [calls] [shop] method test_recalculate_totals @ OrderTestCase.test_recalculate_totals (orders/tests/test_orders.py:7)

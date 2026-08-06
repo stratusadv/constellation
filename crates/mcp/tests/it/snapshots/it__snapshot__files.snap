@@ -1,0 +1,14 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+[platform] platform (2 files, 9 symbols)
+  platform_core/ (2 files, 9 symbols)
+  (pass project=<id> to focus a single project, or pattern=<text> to list files)
+
+[shop] shop (9 files, 23 symbols)
+  orders/ (4 files, 15 symbols)
+  orders/tests/ (1 files, 3 symbols)
+  templates/orders/ (3 files, 3 symbols)
+  static/ (1 files, 2 symbols)
+  (pass project=<id> to focus a single project, or pattern=<text> to list files)

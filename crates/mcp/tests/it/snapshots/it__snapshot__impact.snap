@@ -1,0 +1,8 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+impact of recalculate_totals (depth 2): 2 non-test caller(s)
+L1 [calls] [shop] view checkout_view @ orders/views.py::checkout_view (orders/views.py:12)
+L2 [routes_to] [shop] route checkout @ orders/urls.py::route::checkout/ (orders/urls.py:8)
+(1 test caller(s) omitted)

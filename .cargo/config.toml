@@ -3,5 +3,16 @@
 # Windows machines that lack that DLL, where a dynamically linked binary fails to
 # start with a blocking "DLL not found" dialog. Static linkage makes constellation
 # a self-contained executable that runs on a bare Windows install.
+#
+# The static CRT names a PDB that is not distributed with it, so the linker
+# reports LNK4099 once per object it links. The warning is about debug info for
+# Microsoft's own code, nothing this workspace can act on, and it buries real
+# diagnostics under a hundred lines.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/ignore:4099"]
+
+# Build automation lives in the workspace as a Rust binary, not in shell. One
+# implementation runs on every platform a contributor uses, the compiler checks
+# it, and there is no second toolchain to install before the first build.
+[alias]
+xtask = "run --package xtask --quiet --"

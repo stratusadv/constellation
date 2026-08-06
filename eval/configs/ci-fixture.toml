@@ -1,0 +1,21 @@
+# The fixture: a tiny Django project committed under eval/fixture, so a run
+# depends on nothing outside this repository and its numbers stay comparable
+# run to run.
+#
+# No CI job runs this today (see ARCHITECTURE.md, Testing). Build the graph and
+# measure by hand:
+#
+#   constellation init eval/fixture
+#   constellation flows eval/fixture/.constellation/index.db
+#   cargo run -p constellation-eval -- --config eval/configs/ci-fixture.toml
+#
+# When the gate is restored, the regression floor belongs in the workflow rather
+# than here, because it is a CI policy rather than a property of the fixture.
+
+name = "ci-fixture"
+database = "../fixture/.constellation/index.db"
+goldset = "../goldsets/ci-fixture.toml"
+
+# The fixture has no git history of its own, so the history-driven benchmarks
+# report an honest "no ingested history" rather than a zero.
+commits_max = 10

@@ -1,0 +1,7 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+[shop] view checkout_view @ orders/views.py::checkout_view (orders/views.py:12)
+  [calls] [shop] method recalculate_totals @ Order.recalculate_totals (orders/models.py:10)
+  [renders] [shop] template orders/checkout.html @ orders/checkout.html (templates/orders/checkout.html:1)

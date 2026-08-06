@@ -1,0 +1,45 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: text
+---
+file    apiary/beehive/urls/__init__.py
+project apiary
+
+nodes (6)
+  file       __init__.py             apiary/beehive/urls/__init__.py 1:0-10:0
+  variable   app_name                app_name                        3:0-3:20
+    signature   beehive
+    visibility  public
+  variable   urlpatterns             urlpatterns                     5:0-9:1
+    visibility  public
+  route      page/                   route::page/                    6:0-6:0
+    signature   page
+  route      form/                   route::form/                    7:0-7:0
+    signature   form
+  route      json/                   route::json/                    8:0-8:0
+    signature   json
+
+edges (5)
+  contains            apiary/beehive/urls/__init__.py -> app_name  [extraction:python]
+  contains            apiary/beehive/urls/__init__.py -> route::form/  [extraction:python]
+  contains            apiary/beehive/urls/__init__.py -> route::json/  [extraction:python]
+  contains            apiary/beehive/urls/__init__.py -> route::page/  [extraction:python]
+  contains            apiary/beehive/urls/__init__.py -> urlpatterns  [extraction:python]
+
+refs (8)
+  imports             apiary/beehive/urls/__init__.py -> "include"  @1:24
+    candidates  django.urls
+  imports             apiary/beehive/urls/__init__.py -> "path"  @1:33
+    candidates  django.urls
+  imports             route::page/                    -> "apiary.beehive.urls.page_urls"  @6:0
+  calls               apiary/beehive/urls/__init__.py -> "include"  @6:18
+  imports             route::form/                    -> "apiary.beehive.urls.form_urls"  @7:0
+  calls               apiary/beehive/urls/__init__.py -> "include"  @7:18
+  imports             route::json/                    -> "apiary.beehive.urls.json_urls"  @8:0
+  calls               apiary/beehive/urls/__init__.py -> "include"  @8:18
+
+imports (2)
+  include                 include                 from django.urls
+  path                    path                    from django.urls
+
+events (0)

@@ -1,0 +1,28 @@
+# The fixture goldset.
+#
+# Deliberately small and deliberately easy: this is a regression check, not a
+# capability measurement. Every question here must be answerable by a correct
+# index of the fixture committed under eval/fixture, so a failure means
+# something broke rather than something is hard.
+#
+# The real goldsets, against real repositories, live beside this file and are
+# run by hand. See eval/goldsets/example.toml for their shape.
+
+[[question]]
+query = "Order model"
+expected = "orders/models.py::Order"
+
+[[question]]
+query = "recalculate_totals"
+expected = "Order.recalculate_totals"
+
+[[question]]
+query = "checkout_view"
+expected = "orders/views.py::checkout_view"
+
+# Route to view: the answer is one hop from the query's anchor, and only the
+# graph carries the edge.
+[[question]]
+query = "checkout route view"
+expected = "orders/views.py::checkout_view"
+hops = 2

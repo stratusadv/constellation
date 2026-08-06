@@ -8,22 +8,24 @@ name = "constellation"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.102"
-constellation-graph = { path = "../graph" }
-constellation-index = { path = "../index" }
-constellation-mcp = { path = "../mcp" }
-constellation-store = { path = "../store" }
-dirs = "6.0.0"
-mimalloc = "0.1.52"
-serde_json = "1.0.150"
+anyhow.workspace = true
+constellation-graph.workspace = true
+constellation-index.workspace = true
+constellation-mcp.workspace = true
+constellation-store.workspace = true
+dirs.workspace = true
+mimalloc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile.workspace = true
+toml.workspace = true
 
 [build-dependencies]
-ico = "0.5.0"
-resvg = { version = "0.47.0", default-features = false }
-winresource = "0.1.31"
+ico.workspace = true
+resvg.workspace = true
+winresource.workspace = true

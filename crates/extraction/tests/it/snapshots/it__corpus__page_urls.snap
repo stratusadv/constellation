@@ -1,0 +1,42 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: text
+---
+file    apiary/beehive/urls/page_urls.py
+project apiary
+
+nodes (6)
+  file       page_urls.py            apiary/beehive/urls/page_urls.py 1:0-12:0
+  variable   app_name                app_name                        5:0-5:17
+    signature   page
+    visibility  public
+  variable   urlpatterns             urlpatterns                     7:0-11:1
+    visibility  public
+  route      list                    route::                         8:0-8:0
+  route      detail                  route::<int:pk>/                9:0-9:0
+  route      collapse                route::<int:pk>/collapse/       10:0-10:0
+
+edges (5)
+  contains            apiary/beehive/urls/page_urls.py -> app_name  [extraction:python]
+  contains            apiary/beehive/urls/page_urls.py -> route::  [extraction:python]
+  contains            apiary/beehive/urls/page_urls.py -> route::<int:pk>/  [extraction:python]
+  contains            apiary/beehive/urls/page_urls.py -> route::<int:pk>/collapse/  [extraction:python]
+  contains            apiary/beehive/urls/page_urls.py -> urlpatterns  [extraction:python]
+
+refs (5)
+  imports             apiary/beehive/urls/page_urls.py -> "path"  @1:24
+    candidates  django.urls
+  imports             apiary/beehive/urls/page_urls.py -> "page_views"  @3:33
+    candidates  apiary.beehive.views
+  routes_to           route::                         -> "beehive_list_view"  @8:0
+    candidates  page_views
+  routes_to           route::<int:pk>/                -> "beehive_detail_view"  @9:0
+    candidates  page_views
+  routes_to           route::<int:pk>/collapse/       -> "beehive_collapse_view"  @10:0
+    candidates  page_views
+
+imports (2)
+  page_views              page_views              from apiary.beehive.views
+  path                    path                    from django.urls
+
+events (0)

@@ -1,5 +1,6 @@
 # Rust build output
 /target
+/target-*
 
 # Generated graph indices (constellation indexing itself)
 .constellation/
@@ -12,9 +13,13 @@
 # Inno Setup installer output
 assets/Output/
 
-# Editors
 .idea/
 .vscode/
+.claude/
+.codegraph/
+CLAUDE.md
+AGENTS.md
+STYLE-REVIEW-PLAN.md
 
 # OS
 .DS_Store
@@ -28,3 +33,21 @@ Desktop.ini
 
 manifests/
 scripts/
+
+# Rejected snapshots. A failing snapshot test writes the text it actually
+# produced beside the recorded one; `cargo insta review` then accepts it (which
+# overwrites the .snap) or discards it. Either way the .new file is scratch, and
+# committing one would check in an unreviewed result.
+*.snap.new
+
+# Eval harness output (regenerate with `cargo run -p constellation-eval`).
+eval/results/
+
+# The retrieval-quality fixture's source is committed (eval/fixture/orders,
+# eval/fixture/templates) so `constellation init eval/fixture` reproduces the
+# graph the ci-fixture goldset is written against. Only the graph it builds is
+# generated, and `.constellation/` above already covers that.
+
+# The fixture survey's corpus: absolute paths to indexed repositories on one
+# developer's disk. `cargo xtask fixtures survey` writes a template on first run.
+fixtures.toml

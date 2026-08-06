@@ -1,0 +1,48 @@
+---
+source: crates/extraction/tests/it/snapshot.rs
+expression: text
+---
+file    shop/orders/urls.py
+project shop
+
+nodes (6)
+  file       urls.py                 shop/orders/urls.py             1:0-12:0
+  variable   app_name                app_name                        5:0-5:19
+    signature   orders
+    visibility  public
+  variable   urlpatterns             urlpatterns                     7:0-11:1
+    visibility  public
+  route      checkout                route::                         8:0-8:0
+  route      detail                  route::<int:pk>/                9:0-9:0
+  route      archive/                route::archive/                 10:0-10:0
+    signature   archive
+
+edges (5)
+  contains            shop/orders/urls.py             -> app_name  [extraction:python]
+  contains            shop/orders/urls.py             -> route::  [extraction:python]
+  contains            shop/orders/urls.py             -> route::<int:pk>/  [extraction:python]
+  contains            shop/orders/urls.py             -> route::archive/  [extraction:python]
+  contains            shop/orders/urls.py             -> urlpatterns  [extraction:python]
+
+refs (8)
+  imports             shop/orders/urls.py             -> "include"  @1:24
+    candidates  django.urls
+  imports             shop/orders/urls.py             -> "path"  @1:33
+    candidates  django.urls
+  imports             shop/orders/urls.py             -> "views"  @3:24
+    candidates  shop.orders
+  routes_to           route::                         -> "checkout_view"  @8:0
+    candidates  views
+  routes_to           route::<int:pk>/                -> "OrderDetailView"  @9:0
+    candidates  views
+  calls               shop/orders/urls.py             -> "as_view"  @9:22
+    candidates  receiver-root, views.OrderDetailView
+  imports             route::archive/                 -> "shop.orders.archive_urls"  @10:0
+  calls               shop/orders/urls.py             -> "include"  @10:21
+
+imports (3)
+  include                 include                 from django.urls
+  path                    path                    from django.urls
+  views                   views                   from shop.orders
+
+events (0)

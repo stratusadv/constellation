@@ -1,0 +1,63 @@
+---
+source: crates/extraction/tests/it/snapshot.rs
+expression: text
+---
+file    shop/orders/views.py
+project shop
+
+nodes (5)
+  file       views.py                shop/orders/views.py            1:0-28:0
+  view       OrderDetailView         OrderDetailView                 8:0-16:22
+    visibility  public
+  method     get_context_data        OrderDetailView.get_context_data 12:4-16:22
+    signature   (self, **kwargs)
+    visibility  public
+  view       checkout_view           checkout_view                   19:0-23:68
+    signature   (request)
+    visibility  public
+  view       cancel_view             cancel_view                     26:0-27:56
+    signature   (request, pk)
+    visibility  public
+
+edges (4)
+  contains            shop/orders/views.py            -> OrderDetailView  [extraction:python]
+  contains            shop/orders/views.py            -> cancel_view  [extraction:python]
+  contains            shop/orders/views.py            -> checkout_view  [extraction:python]
+  contains            OrderDetailView                 -> OrderDetailView.get_context_data  [extraction:python]
+
+refs (16)
+  imports             shop/orders/views.py            -> "redirect"  @1:29
+    candidates  django.shortcuts
+  imports             shop/orders/views.py            -> "render"  @1:39
+    candidates  django.shortcuts
+  imports             shop/orders/views.py            -> "reverse"  @2:24
+    candidates  django.urls
+  imports             shop/orders/views.py            -> "DetailView"  @3:33
+    candidates  django.views.generic
+  imports             shop/orders/views.py            -> "Order"  @5:31
+    candidates  shop.orders.models
+  extends             OrderDetailView                 -> "DetailView"  @8:22
+  relates_to          OrderDetailView                 -> "Order"  @9:0
+  renders             OrderDetailView                 -> "orders/detail.html"  @10:0
+  calls               OrderDetailView.get_context_data -> "get_context_data"  @13:18
+    candidates  super-dispatch, shop/orders/views.py::OrderDetailView
+  calls               OrderDetailView.get_context_data -> "open_orders"  @14:26
+    candidates  receiver-root, Order
+  context_type        checkout_view                   -> "Order"  @20:4
+    candidates  order
+  calls               checkout_view                   -> "first"  @20:12
+    candidates  queryset-dispatch, Order
+  calls               checkout_view                   -> "notify"  @21:4
+    candidates  receiver-root, order
+  renders             checkout_view                   -> "orders/checkout.html"  @23:11
+  calls               cancel_view                     -> "redirect"  @27:11
+  resolves            cancel_view                     -> "orders:detail"  @27:20
+
+imports (5)
+  redirect                redirect                from django.shortcuts
+  render                  render                  from django.shortcuts
+  reverse                 reverse                 from django.urls
+  DetailView              DetailView              from django.views.generic
+  Order                   Order                   from shop.orders.models
+
+events (0)

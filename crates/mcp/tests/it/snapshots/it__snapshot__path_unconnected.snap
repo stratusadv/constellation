@@ -1,0 +1,5 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+no flow path between "checkout_view" and "AuditLog" within 6 hops (call / route / render / instantiate / inherit / template-inherit edges)

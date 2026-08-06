@@ -24,7 +24,7 @@ const FILES_PER_COMMIT_MAX: usize = 4_096;
 /// lines that follow it.
 const FIELD_SEPARATOR: char = '\u{1f}';
 
-/// One repository's commit history, newest first, capped at `max` commits,
+/// A repository's commit history, newest first, capped at `max` commits,
 /// reporting `(done, total)` commits through `on_progress` as they stream in so a
 /// caller can draw a progress bar. Empty when `root` is not the top of its own git
 /// repository: a non-git directory, or a subdirectory of a larger repo (a `.venv`
@@ -187,7 +187,7 @@ fn parse_lines(
     commits
 }
 
-/// One numstat line appended to the in-progress commit, if any and under the
+/// A numstat line appended to the in-progress commit, if any and under the
 /// per-commit file cap. A line before the first header (no current commit) or a
 /// malformed entry is ignored.
 fn append_numstat(current: Option<&mut CommitRecord>, line: &str) {

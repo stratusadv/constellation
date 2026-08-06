@@ -16,7 +16,7 @@ use constellation_graph::ProjectId;
 use constellation_index::{ingest_history, ingest_symbol_revisions};
 use constellation_store::Store;
 
-/// One Python module's source at revision `rev`, sized by `repeat`. Each revision
+/// A Python module's source at revision `rev`, sized by `repeat`. Each revision
 /// changes a field default, a method body, and adds a revision-numbered method, so
 /// consecutive revisions differ and the diff produces added/modified rows.
 fn module(file_index: usize, rev: usize, repeat: usize) -> String {

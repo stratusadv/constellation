@@ -1,0 +1,45 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: "python(\"apiary/beehive/admin.py\", ADMIN)"
+---
+file    apiary/beehive/admin.py
+project apiary
+
+nodes (5)
+  file       admin.py                apiary/beehive/admin.py         1:0-13:0
+  class      BeehiveAdmin            BeehiveAdmin                    9:0-12:30
+    decorators  admin.register(Beehive)
+    visibility  public
+  variable   list_display            BeehiveAdmin.list_display       10:4-10:51
+    signature   [tag, status, frame_count]
+    visibility  public
+  variable   search_fields           BeehiveAdmin.search_fields      11:4-11:27
+    signature   [tag]
+    visibility  public
+  variable   raw_id_fields           BeehiveAdmin.raw_id_fields      12:4-12:30
+    signature   [apiary]
+    visibility  public
+
+edges (4)
+  contains            apiary/beehive/admin.py         -> BeehiveAdmin  [extraction:python]
+  contains            BeehiveAdmin                    -> BeehiveAdmin.list_display  [extraction:python]
+  contains            BeehiveAdmin                    -> BeehiveAdmin.raw_id_fields  [extraction:python]
+  contains            BeehiveAdmin                    -> BeehiveAdmin.search_fields  [extraction:python]
+
+refs (6)
+  imports             apiary/beehive/admin.py         -> "admin"  @1:27
+    candidates  django.contrib
+  imports             apiary/beehive/admin.py         -> "HiveModelAdmin"  @3:32
+    candidates  hivecore.core.admin
+  imports             apiary/beehive/admin.py         -> "Beehive"  @5:34
+    candidates  apiary.beehive.models
+  admin_of            BeehiveAdmin                    -> "Beehive"  @8:0
+  decorates           BeehiveAdmin                    -> "register"  @9:0
+  extends             BeehiveAdmin                    -> "HiveModelAdmin"  @9:19
+
+imports (3)
+  Beehive                 Beehive                 from apiary.beehive.models
+  admin                   admin                   from django.contrib
+  HiveModelAdmin          HiveModelAdmin          from hivecore.core.admin
+
+events (0)

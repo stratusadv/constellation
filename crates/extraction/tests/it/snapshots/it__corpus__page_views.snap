@@ -1,0 +1,69 @@
+---
+source: crates/extraction/tests/it/corpus.rs
+expression: text
+---
+file    apiary/beehive/views/page_views.py
+project apiary
+
+nodes (4)
+  file       page_views.py           apiary/beehive/views/page_views.py 1:0-34:0
+  view       beehive_list_view       beehive_list_view               12:0-17:5
+    signature   (request)
+    decorators  login_required()
+    visibility  public
+  view       beehive_detail_view     beehive_detail_view             21:0-26:5
+    signature   (request, pk)
+    decorators  login_required()
+    visibility  public
+  view       beehive_collapse_view   beehive_collapse_view           30:0-33:69
+    signature   (request, pk)
+    decorators  login_required()
+    visibility  public
+
+edges (3)
+  contains            apiary/beehive/views/page_views.py -> beehive_collapse_view  [extraction:python]
+  contains            apiary/beehive/views/page_views.py -> beehive_detail_view  [extraction:python]
+  contains            apiary/beehive/views/page_views.py -> beehive_list_view  [extraction:python]
+
+refs (20)
+  imports             apiary/beehive/views/page_views.py -> "login_required"  @1:43
+    candidates  django.contrib.auth.decorators
+  imports             apiary/beehive/views/page_views.py -> "redirect"  @2:29
+    candidates  django.shortcuts
+  imports             apiary/beehive/views/page_views.py -> "reverse"  @3:24
+    candidates  django.urls
+  imports             apiary/beehive/views/page_views.py -> "page_views"  @5:32
+    candidates  hivecore.core.views
+  imports             apiary/beehive/views/page_views.py -> "Beehive"  @7:34
+    candidates  apiary.beehive.models
+  imports             apiary/beehive/views/page_views.py -> "BeehiveService"  @8:35
+    candidates  apiary.beehive.service
+  decorates           beehive_list_view               -> "login_required"  @12:0
+  calls               beehive_list_view               -> "list_view"  @13:11
+    candidates  receiver-root, hive_page_views
+  renders             beehive_list_view               -> "apiary/beehive/page/list.html"  @13:11
+  calls               beehive_list_view               -> "active"  @16:17
+    candidates  queryset-dispatch, Beehive
+  decorates           beehive_detail_view             -> "login_required"  @21:0
+  calls               beehive_detail_view             -> "detail_view"  @22:11
+    candidates  receiver-root, hive_page_views
+  renders             beehive_detail_view             -> "apiary/beehive/page/detail.html"  @22:11
+  calls               beehive_detail_view             -> "get"  @25:12
+    candidates  queryset-dispatch, Beehive
+  decorates           beehive_collapse_view           -> "login_required"  @30:0
+  calls               beehive_collapse_view           -> "collapse"  @31:4
+  instantiates        beehive_collapse_view           -> "BeehiveService"  @31:4
+  calls               beehive_collapse_view           -> "get"  @31:19
+    candidates  queryset-dispatch, Beehive
+  calls               beehive_collapse_view           -> "redirect"  @33:11
+  resolves            beehive_collapse_view           -> "apiary:beehive:page:detail"  @33:20
+
+imports (6)
+  Beehive                 Beehive                 from apiary.beehive.models
+  BeehiveService          BeehiveService          from apiary.beehive.service
+  login_required          login_required          from django.contrib.auth.decorators
+  redirect                redirect                from django.shortcuts
+  reverse                 reverse                 from django.urls
+  hive_page_views         page_views              from hivecore.core.views
+
+events (0)

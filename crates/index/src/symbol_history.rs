@@ -123,7 +123,7 @@ fn extractors() -> Vec<Box<dyn Extractor>> {
     ]
 }
 
-/// One entry in a file revision's symbol set: the attributes that decide whether
+/// An entry in a file revision's symbol set: the attributes that decide whether
 /// the symbol changed between revisions.
 struct SymbolEntry {
     name: String,
@@ -210,7 +210,7 @@ fn diff_into(
     }
 }
 
-/// One [`SymbolRevision`] built from a diffed symbol entry.
+/// A [`SymbolRevision`] built from a diffed symbol entry.
 fn revision(
     commit_hash: &str,
     file_path: &str,

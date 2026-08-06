@@ -1,0 +1,8 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+orders/models.py:11 (innermost first):
+[shop] method recalculate_totals @ Order.recalculate_totals (orders/models.py:10)
+[shop] model Order @ orders/models.py::Order (orders/models.py:6)
+[shop] file models.py @ orders/models.py (orders/models.py:1)

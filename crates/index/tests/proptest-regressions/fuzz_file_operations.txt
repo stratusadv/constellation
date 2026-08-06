@@ -1,0 +1,24 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c843fb8266f5c1fbfed913c46846a29433841d563963484e487d4d743fb41a91 # shrinks to operations = [Delete(3), Delete(4), Delete(0), Create(2), Create(1), Modify(5), Create(0), Delete(2), Create(2), Rename(5, 5), Modify(0)]
+cc 7f0f1bf3643434576ad5e44fee1cb7963f4566eca190b8d13faa4f7b9386799f # shrinks to operations = [Delete(4), Modify(1), Delete(3), Delete(5), Modify(3)]
+cc 5ca5961bc3ff866c0b0b3bf358842fb16ef826898d64ac4c4e722499443c657b # shrinks to operations = [Create(5), Modify(2), Modify(4), Delete(1)]
+cc 6f7404e410b5190f1a3fbe1847196192ee13168adff57d95437ced61aa2a9d0f # shrinks to operations = [Delete(5), Modify(1), Modify(5), Create(1)]
+cc 435a39b0e71ecf9e32deda663f7e95607495027b353a81685691ab699311322a # shrinks to operations = [Rename(0, 5), Rename(1, 4), Delete(3), Delete(3), Rename(0, 4), Create(1), Rename(3, 5)]
+cc a8f767b813040e44c7807e884b51df0ab36384148fd5642b8bb7534469d67f27 # shrinks to operations = [Modify(5), Create(4)]
+cc 292ca7fead996d55f08f628249c558d6602396931c70c35592c768c0da5b7c16 # shrinks to operations = [Modify(1), Delete(5)]
+cc f23ddd99704a3dbc8fcd8098e5fc68ff00375b09b47581efa53b7d418a1a6dfb # shrinks to operations = [Create(5), Modify(0), Rename(2, 2), Rename(5, 2), Rename(2, 3), Modify(4), Modify(0), Modify(4), Modify(4)]
+cc 50a12ce2036d2c14b4fa69f844d35142865563b4dc68ecd75936f048f478cde9 # shrinks to operations = [Rename(5, 2), Rename(2, 5), Rename(3, 5), Create(3), Rename(1, 0), Modify(3), Delete(1), Modify(5), Delete(2), Create(2)]
+cc 555f56daa9ca1d6dd8fd53f6b734fffb1d48fdb8a1d7e009d358c702691590a0 # shrinks to operations = [Create(0), Create(4), Create(4), Delete(2), Modify(1), Modify(4), Create(5)]
+cc 4cbdfa2352506ecba70f65bb2cb6efc4ed59cb63e574a60719e7c3873f2ed3e0 # shrinks to operations = [Delete(4), Create(1), Rename(0, 3), Modify(5), Modify(3)]
+cc c1f5815696ae919a9f653c0417c01dc69a7c93d93f12f73b4b1b4efbcb70cf88 # shrinks to operations = [Delete(4), Modify(3), Create(3), Create(5), Rename(3, 1), Rename(3, 1), Create(2), Modify(0), Create(3), Delete(1), Modify(0)]
+cc 2f6b2c6a7e778f593d23e07a07847a0ab029e420362f669df91f26b0ddf2196b # shrinks to operations = [Delete(3), Modify(5), Delete(3), Rename(0, 1), Create(3), Rename(4, 4), Rename(2, 4)]
+cc bb4a55411d185c7c4508b48b79f968ce3e6ffd576a7709d8b5c8974f4aea8963 # shrinks to operations = [Rename(0, 0), Delete(1), Rename(4, 2), Create(4), Create(2), Create(4), Create(3), Rename(0, 0), Create(4)]
+cc 8c3be62d0a2e91fe372b2c952001688cb7e0cdb9db32e13823d55ff96eca3a87 # shrinks to operations = [Create(5), Modify(3), Delete(0), Modify(3), Rename(2, 4), Modify(3)]
+cc e14c536805b37b1e7d49c960931fc8dc15de6587a93bbc8d01f4dc64fc47795d # shrinks to operations = [Rename(2, 5), Delete(0), Rename(3, 3), Create(5), Rename(1, 1), Rename(2, 3), Create(0), Create(4), Delete(2), Modify(1)]
+cc f6372c5c843c96ff358d488fd12fa55f2a74addb700e871a93f0ad2fa9fe9021 # shrinks to operations = [Delete(3), Delete(3), Create(2)]
+cc 36bffcea1c5df5e4535a9096ffa74d86326c917035123e5905a3a2db45e8c5c3 # shrinks to operations = [Rename(4, 3), Delete(5), Modify(2)]

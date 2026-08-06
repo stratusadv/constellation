@@ -1,0 +1,9 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+[shop] shop (2 routes)
+  orders:checkout
+    checkout/  →  checkout_view  →  orders/checkout.html
+  orders:detail
+    <int:pk>/  →  OrderDetailView  →  orders/detail.html

@@ -11,8 +11,28 @@ use crate::refs::{ResolvedBy, ResolvedRef, UnresolvedRef};
 /// the generic path would (correctly, for that path) drop it.
 pub const QUERYSET_DISPATCH: &str = "\u{1}queryset-dispatch";
 
+/// The prefix every dispatch sentinel below carries, the marker that tells a
+/// routing candidate apart from a real class or model name in the same list.
+pub const SENTINEL_PREFIX: char = '\u{1}';
+
+/// The sentinel candidate the extractor tags onto a `super().method()` call, with
+/// the enclosing class's qualified name following it. Python defines `super()` as
+/// a lookup that *skips* the calling class, so this must never bind to the class's
+/// own method: it is resolved by the inherited-method pass, which walks the base
+/// chain and refuses anything but a single ancestor definition.
+pub const SUPER_DISPATCH: &str = "\u{1}super-dispatch";
+
+/// The sentinel candidate the extractor tags onto a call whose receiver is a bare
+/// name it cannot type on its own (`portal_views.template_view()`,
+/// `AssetTypeChoices.to_glue_choices()`). The receiver's dotted text follows it.
+/// Typing the receiver needs the file's import bindings and the whole
+/// constellation's classes, so the inherited/receiver-typed pass resolves it;
+/// generic name resolution deliberately drops these, because the name is reached
+/// through an object rather than an import of the name itself.
+pub const RECEIVER_ROOT: &str = "\u{1}receiver-root";
+
 /// The sentinel candidate the extractor tags onto a call whose receiver is a
-/// type-annotated parameter (`def view(self, order: PurchaseOrder): order.x()`).
+/// type-annotated parameter (`def view(self, order: Order): order.x()`).
 /// The annotated type name follows it in the candidate list, so resolution can
 /// bind the method to that exact class (typed-receiver dispatch, the annotated
 /// analogue of `self.x()` instance-method resolution).
@@ -23,7 +43,19 @@ pub const TYPED_RECEIVER: &str = "\u{1}typed-receiver";
 /// convention (`order.services.processor.recalculate_totals()`). The service class
 /// is reached through a model attribute, not an import, so the import-scoped path
 /// drops it; this routes it to service-method dispatch instead.
+///
+/// The receiving model's name follows it in the candidate list when the receiver
+/// is written as a class (`Order.services.x()`), letting dispatch pick that
+/// model's service among the many that define the same method name.
 pub const SERVICE_DISPATCH: &str = "\u{1}service-dispatch";
+
+/// The prefix a [`TYPED_RECEIVER`] candidate carries when the receiver's type is
+/// not written in the file but is whatever a call returns (`demo = Demo.start(...)`
+/// makes `demo` a `Demo`). The callee's dotted text follows it. Generic resolution
+/// cannot follow one: the callee's return annotation lives with the callee, in
+/// another file and often another project, so only the link pass, which holds
+/// every project's `returns` edges, turns it into a class.
+pub const RETURNS_OF: &str = "\u{1}returns-of:";
 
 /// The sentinel candidate on a `ContextType` reference whose variable is a
 /// *collection* of the model: a queryset (`Model.objects.filter(...)`) or a
@@ -36,19 +68,60 @@ pub const COLLECTION_CONTEXT: &str = "\u{1}collection-context";
 /// The base service method names dispatched on every model through the external base
 /// service (`obj.services.save_model_obj()`). The base defines them, so binding by
 /// a sole local override would false-attribute every model's call to whichever app
-/// service happens to override it. Dropped from dispatch.
+/// service happens to override it. Barred from the by-name path only: a call that
+/// names its receiving model resolves through that model's own service, which is
+/// evidence rather than uniqueness.
 const SERVICE_BUILTINS: &[&str] = &["save_model_obj", "save_model_objs"];
 
 /// The Django QuerySet/Manager builtin method names, dispatched dynamically by
-/// Django with no project-local definition to bind to. Filtered out so a
-/// builtin like `order_by` never binds to some app's custom queryset that
-/// overrides it (the C-1 false-edge class).
+/// Django with no project-local definition to bind to. Barred from the by-name
+/// path so a builtin like `order_by` never binds to some app's custom queryset
+/// that overrides it (the C-1 false-edge class); a model-scoped call still binds
+/// to that model's own queryset, where an override is the definition that runs.
+///
+/// The list shares most of its names with the `mcp` crate's `DISPATCH_METHOD_NAMES`
+/// without being it: that one calls a name's dark-caller count noise, this one bars a
+/// name from the by-name path. They are kept apart deliberately, and the cost of that
+/// is a name added here is not a name added there, so both are worth a look when
+/// either changes.
 pub const QUERYSET_BUILTINS: &[&str] = &[
-    "aggregate", "all", "annotate", "bulk_create", "bulk_update", "contains", "count", "create",
-    "defer", "delete", "difference", "distinct", "earliest", "exclude", "exists", "filter",
-    "first", "get", "get_or_create", "in_bulk", "intersection", "iterator", "last", "latest",
-    "none", "only", "order_by", "prefetch_related", "raw", "reverse", "select_related", "union",
-    "update", "update_or_create", "using", "values", "values_list",
+    "aggregate",
+    "all",
+    "annotate",
+    "bulk_create",
+    "bulk_update",
+    "contains",
+    "count",
+    "create",
+    "defer",
+    "delete",
+    "difference",
+    "distinct",
+    "earliest",
+    "exclude",
+    "exists",
+    "filter",
+    "first",
+    "get",
+    "get_or_create",
+    "in_bulk",
+    "intersection",
+    "iterator",
+    "last",
+    "latest",
+    "none",
+    "only",
+    "order_by",
+    "prefetch_related",
+    "raw",
+    "reverse",
+    "select_related",
+    "union",
+    "update",
+    "update_or_create",
+    "using",
+    "values",
+    "values_list",
 ];
 
 /// A fail-fast bound on directory depth compared between two paths, far past any
@@ -127,6 +200,15 @@ fn resolve_by_name(
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
     assert!(!reference.reference_name.is_empty(), "reference_name must not be empty");
+
+    // A `super()` call names a method the enclosing class deliberately skips, so
+    // neither instance-method nor generic name resolution may see it: the first
+    // would bind the class's own override, the second any same-named method in the
+    // project. Only the inherited-method pass, which walks the base chain with the
+    // whole constellation loaded, can bind it.
+    if reference.candidates.iter().any(|candidate| candidate == SUPER_DISPATCH) {
+        return None;
+    }
 
     if reference.reference_kind == EdgeKind::Calls
         && reference.candidates.iter().any(|candidate| candidate == QUERYSET_DISPATCH)
@@ -377,15 +459,13 @@ fn resolve_import(
         return resolve_js_import(reference, context);
     }
 
-    assert!(reference.language != Language::JavaScript, "javascript imports handled above");
-
     let name = reference.reference_name.as_str();
     let module = reference.candidates.first().map_or("", String::as_str);
     let module_stem = module.rsplit('.').next().unwrap_or(module).trim_start_matches('.');
 
     if !module_stem.is_empty() {
         let mut symbols = context.nodes_by_name(name);
-        symbols.retain(|node| node.kind != NodeKind::Import && file_stem(&node.file_path) == module_stem);
+        symbols.retain(|node| is_definition(node.kind) && file_stem(&node.file_path) == module_stem);
 
         if let Some(node) = symbols.into_iter().next() {
             return Some(ResolvedRef::new(reference, node.id.clone(), 0.9, ResolvedBy::Import));
@@ -423,11 +503,9 @@ fn resolve_import(
     }
 
     let mut anywhere = context.nodes_by_name(name);
-    anywhere.retain(|node| node.kind != NodeKind::Import);
+    anywhere.retain(|node| is_definition(node.kind));
 
     if anywhere.len() == 1 {
-        assert!(!anywhere.is_empty(), "a sole candidate is present to remove");
-
         let node = anywhere.remove(0);
 
         return Some(ResolvedRef::new(reference, node.id.clone(), 0.8, ResolvedBy::Import));
@@ -465,14 +543,12 @@ fn resolve_js_symbol(
         return None;
     }
 
-    assert!(module.starts_with('.'), "only relative specifiers reach the symbol lookup");
-
     let stem = js_module_stem(module);
     let mut candidates = context.nodes_by_name(&reference.reference_name);
 
     candidates.retain(|node| {
         node.language == Language::JavaScript
-            && node.kind != NodeKind::Import
+            && is_definition(node.kind)
             && node.kind != NodeKind::File
     });
 
@@ -482,6 +558,7 @@ fn resolve_js_symbol(
 
     if candidates.len() == 1 {
         let node = candidates.swap_remove(0);
+
         return Some(ResolvedRef::new(reference, node.id.clone(), 0.7, ResolvedBy::Import));
     }
 
@@ -505,8 +582,6 @@ fn resolve_js_module(
     if stem.is_empty() {
         return None;
     }
-
-    assert!(!stem.is_empty(), "module stem is non-empty past the guard");
 
     let mut files = context.nodes_by_kind(NodeKind::File);
     files.retain(|node| node.language == Language::JavaScript && file_stem(&node.file_path) == stem);
@@ -549,7 +624,7 @@ fn match_candidates(
     assert!(confidence_ambiguous <= 1.0, "ambiguous confidence stays within range");
 
     let mut candidates = candidates;
-    candidates.retain(|node| node.kind != NodeKind::Import);
+    candidates.retain(|node| is_definition(node.kind));
 
     if candidates.is_empty() {
         return None;
@@ -632,21 +707,86 @@ fn resolve_queryset_method(
 ) -> Option<ResolvedRef> {
     assert!(!reference.reference_name.is_empty(), "queryset method name must not be empty");
 
-    if QUERYSET_BUILTINS.contains(&reference.reference_name.as_str()) {
-        return None;
-    }
-
     let mut candidates = context.nodes_by_name(&reference.reference_name);
     candidates.retain(|node| node.kind == NodeKind::Method && owner_is_manager(&node.qualified_name));
 
-    if candidates.len() == 1 {
+    // A builtin name is dispatched by Django on every queryset in the project, so
+    // the sole project-local definition of it is an override on one unrelated
+    // queryset, not the target: binding by uniqueness alone would false-attribute
+    // every `order_by` in the codebase to it. The model-scoped test below is
+    // different evidence entirely (this model's own queryset), so it still runs.
+    let builtin = QUERYSET_BUILTINS.contains(&reference.reference_name.as_str());
+
+    if !builtin && candidates.len() == 1 {
         let node = candidates.swap_remove(0);
 
         return Some(ResolvedRef::new(reference, node.id.clone(), 0.85, ResolvedBy::Framework));
     }
 
-    None
+    // Several querysets define the name, so uniqueness cannot pick one. The
+    // model the chain started from can: `Order.objects.active()` wants
+    // `OrderQuerySet.active`, not `FileQuerySet.active`. Still conservative, and
+    // still one edge or none: a model whose name matches two owners resolves to
+    // neither.
+    let model = reference.candidates.iter().find(|candidate| {
+        candidate.as_str() != QUERYSET_DISPATCH && !candidate.is_empty()
+    })?;
+
+    candidates.retain(|node| owner_matches_model(&node.qualified_name, model, MANAGER_SUFFIXES));
+
+    if candidates.len() != 1 {
+        return None;
+    }
+
+    let node = candidates.swap_remove(0);
+
+    Some(ResolvedRef::new(reference, node.id.clone(), 0.8, ResolvedBy::Framework))
 }
+
+/// Whether a companion class owner belongs to `model`, by the naming convention
+/// that binds them: `Order` owns `OrderQuerySet`, `OrderManager`, and
+/// `OrderQuerySetManager` under [`MANAGER_SUFFIXES`], and `OrderService`,
+/// `OrderFactoryService`, and the rest under [`SERVICE_SUFFIXES`]. Convention
+/// rather than a declared link, because the `objects = OrderQuerySet.as_manager()`
+/// and `services = OrderService()` assignments that would prove it are not
+/// something the extractor follows today.
+///
+/// The name past the model prefix must be exactly one of `suffixes`, not merely
+/// start with the model: a bare prefix test also matches a *sibling* model's
+/// companion, so `Inventory` would own `InventoryRecordQuerySet` and a method
+/// only that sibling defines would bind to the wrong class. Requiring the whole
+/// remainder keeps one model's companion from standing in for another's.
+fn owner_matches_model(qualified_name: &str, model: &str, suffixes: &[&str]) -> bool {
+    assert!(!model.is_empty(), "model name must not be empty");
+    assert!(!suffixes.is_empty(), "at least one companion suffix");
+
+    let owner = top_owner(qualified_name);
+
+    if owner.len() <= model.len() || !owner.starts_with(model) {
+        return false;
+    }
+
+    suffixes.contains(&&owner[model.len()..])
+}
+
+/// The class-name suffixes Django's convention appends to a model name to form
+/// its queryset or manager, the remainder [`owner_matches_model`] accepts. Shared
+/// with the inherited-method pass, which builds the same names to find the
+/// classes a model dispatches through.
+pub const MANAGER_SUFFIXES: &[&str] = &["Manager", "QuerySet", "QuerySetManager"];
+
+/// The class-name suffixes this codebase's convention appends to a model name to
+/// form its service classes, the service-dispatch counterpart of
+/// [`MANAGER_SUFFIXES`]. A model reaches the plain `Service` directly
+/// (`obj.services.x()`) and the rest through a named sub-service
+/// (`obj.services.processor.x()`), so both spellings must map back to the model.
+pub const SERVICE_SUFFIXES: &[&str] = &[
+    "FactoryService",
+    "IntelligenceService",
+    "ProcessorService",
+    "Service",
+    "TransformationService",
+];
 
 /// Whether a method's top-level owning class names a Django queryset or manager
 /// (ends with `QuerySet` or `Manager`).
@@ -660,33 +800,54 @@ fn owner_is_manager(qualified_name: &str) -> bool {
 /// attribute resolves to (`order.services.processor.recalculate_totals()`). The service object
 /// is reached through chained attributes, not statically followable, so this binds
 /// the method's (rare, custom) name to the sole `*Service`-owned method of that
-/// name. Base methods are excluded; an ambiguous name (two services define it)
-/// stays unresolved rather than guess, the same false-edge guard as queryset
-/// dispatch, justified by ~98% of service method names being unique to one class.
+/// name, and failing that to the service the receiving model owns. Base methods
+/// are excluded; a name that stays ambiguous under both tests resolves to nothing
+/// rather than guess, the same false-edge guard as queryset dispatch.
 fn resolve_service_method(
     reference: &UnresolvedRef,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
     assert!(!reference.reference_name.is_empty(), "service method name must not be empty");
 
-    if SERVICE_BUILTINS.contains(&reference.reference_name.as_str()) {
-        return None;
-    }
-
     let mut candidates = context.nodes_by_name(&reference.reference_name);
     candidates.retain(|node| node.kind == NodeKind::Method && owner_is_service(&node.qualified_name));
 
-    if candidates.len() == 1 {
+    // A base method every service inherits (`save_model_obj`) is defined once
+    // upstream and overridden by a handful of app services, so a sole local match
+    // is whichever service happens to override it, not this call's target. The
+    // model-scoped test below names the receiving model's own service, which is
+    // exact evidence rather than uniqueness, so a builtin still resolves there.
+    let builtin = SERVICE_BUILTINS.contains(&reference.reference_name.as_str());
+
+    if !builtin && candidates.len() == 1 {
         let node = candidates.swap_remove(0);
 
         return Some(ResolvedRef::new(reference, node.id.clone(), 0.85, ResolvedBy::Framework));
     }
 
-    None
+    // Several services define the name, so uniqueness cannot pick one. The model
+    // the chain started from can: `Target.services.set_quantity_for_day()` wants
+    // `TargetService.set_quantity_for_day`, not the quota or forecast service's
+    // method of the same name. Whole families of service methods share a name by
+    // design here (one per model), so without this the convention that carries
+    // most of the business logic stays entirely unresolved.
+    let model = reference.candidates.iter().find(|candidate| {
+        candidate.as_str() != SERVICE_DISPATCH && !candidate.is_empty()
+    })?;
+
+    candidates.retain(|node| owner_matches_model(&node.qualified_name, model, SERVICE_SUFFIXES));
+
+    if candidates.len() != 1 {
+        return None;
+    }
+
+    let node = candidates.swap_remove(0);
+
+    Some(ResolvedRef::new(reference, node.id.clone(), 0.8, ResolvedBy::Framework))
 }
 
 /// The method of the exact class a call on a type-annotated receiver resolves to
-/// (`order.recalculate()` where `order: PurchaseOrder`). Binds only
+/// (`order.recalculate()` where `order: Order`). Binds only
 /// when a single method/function of that name is owned by a class whose name
 /// equals the annotated type, so it never guesses across same-named methods on
 /// other classes. The annotated type name is carried as the candidate following
@@ -741,6 +902,12 @@ fn resolve_instance_method(
 
     for class in &reference.candidates {
         assert!(!class.is_empty(), "candidate class qualified name must not be empty");
+
+        // A dispatch sentinel and the receiver text that trails it are routing
+        // data, not a class to look a method up under.
+        if class.starts_with(SENTINEL_PREFIX) {
+            return None;
+        }
 
         qualified.clear();
         qualified.push_str(class);
@@ -849,13 +1016,24 @@ fn is_resolvable_target(kind: NodeKind) -> bool {
 /// or parameter is a class member or a local, never reachable by `from m import
 /// x`, so an import alias resolving to one is a name collision (`from datetime
 /// import date` colliding with a model's `date` field). Constants and variables
-/// can be module-level, so they stay importable; only members and import nodes
-/// are excluded.
+/// can be module-level, so they stay importable; only members, import nodes, and
+/// synthesized stubs are excluded.
 fn is_importable(kind: NodeKind) -> bool {
-    !matches!(
-        kind,
-        NodeKind::Field | NodeKind::Property | NodeKind::Parameter | NodeKind::Import
-    )
+    is_definition(kind)
+        && !matches!(kind, NodeKind::Field | NodeKind::Property | NodeKind::Parameter)
+}
+
+/// Whether a node kind is a definition resolution may bind a reference to.
+///
+/// An `Import` names something defined elsewhere, and an `External` is a
+/// synthesized stub for a symbol no indexed project defines. Neither is a
+/// definition, and the stub in particular is *derived*: the synthesis pass
+/// clears every external node and re-derives it from whatever stayed pending, so
+/// a reference bound to one is bound to the previous run's output. The edge dies
+/// with the stub on the next index and the reference that produced it is already
+/// spent, which makes a re-index disagree with a cold index over the same tree.
+fn is_definition(kind: NodeKind) -> bool {
+    !matches!(kind, NodeKind::Import | NodeKind::External)
 }
 
 /// A file path's base name without its extension: `app/models.py` -> `models`.
@@ -1062,7 +1240,7 @@ fn package_initializers(
     context
         .all_files()
         .into_iter()
-        .filter(|path| is_init_file(path) && dir_basename(path) == package)
+        .filter(|path| is_init_file(path) && directory_basename(path) == package)
         .collect()
 }
 
@@ -1086,7 +1264,7 @@ fn parent_directory(path: &str) -> &str {
 }
 
 /// The final directory segment of a path's parent: `a/b/__init__.py` -> `b`.
-fn dir_basename(path: &str) -> &str {
+fn directory_basename(path: &str) -> &str {
     let directory = parent_directory(path);
     let base = directory.rsplit(['/', '\\']).next().unwrap_or(directory);
 

@@ -1,5 +1,6 @@
 use constellation_extraction::{ExtractionOutput, Extractor, PythonExtractor};
 use constellation_graph::{EdgeKind, NodeKind, ProjectId};
+use constellation_resolution::SUPER_DISPATCH;
 
 const SOURCE: &str = "from django.db import models
 from .utils import helper as do_help
@@ -372,6 +373,88 @@ fn typed_self_attribute_dispatches_to_its_class() {
 }
 
 #[test]
+fn a_model_reached_through_its_module_still_names_the_queryset_dispatch() {
+    let extractor = PythonExtractor::new();
+    let project = ProjectId::new("blog");
+
+    let source = "def listing(request):
+    return models.Article.objects.published()
+";
+
+    let output = extractor.extract(&project, "blog/views.py", source);
+
+    let dispatched = output.unresolved_refs.iter().any(|reference| {
+        reference.reference_kind == EdgeKind::Calls
+            && reference.reference_name == "published"
+            && reference.candidates.iter().any(|candidate| candidate == "Article")
+    });
+
+    assert!(dispatched, "models.Article.objects.published() names Article as the dispatch model");
+}
+
+#[test]
+fn a_runtime_manager_receiver_names_no_dispatch_model() {
+    let extractor = PythonExtractor::new();
+    let project = ProjectId::new("blog");
+
+    let source = "class Factory:
+    def build(self):
+        return self.obj_class.objects.published()
+";
+
+    let output = extractor.extract(&project, "blog/factory.py", source);
+
+    let named = output.unresolved_refs.iter().any(|reference| {
+        reference.reference_name == "published"
+            && reference.candidates.iter().any(|candidate| candidate == "obj_class")
+    });
+
+    assert!(!named, "a lower-case runtime receiver must not be taken for a model name");
+}
+
+#[test]
+fn a_super_call_carries_the_enclosing_class_and_its_sentinel() {
+    let extractor = PythonExtractor::new();
+    let project = ProjectId::new("blog");
+
+    let source = "class ArticleTestCase(BaseTestCase):
+    def setUp(self):
+        super().setUp()
+";
+
+    let output = extractor.extract(&project, "blog/tests.py", source);
+
+    let marked = output.unresolved_refs.iter().any(|reference| {
+        reference.reference_kind == EdgeKind::Calls
+            && reference.reference_name == "setUp"
+            && reference.candidates.first().is_some_and(|first| first == SUPER_DISPATCH)
+            && reference.candidates.iter().any(|candidate| candidate.ends_with("ArticleTestCase"))
+    });
+
+    assert!(marked, "super().setUp() carries the super sentinel and the enclosing class");
+}
+
+#[test]
+fn an_explicit_two_argument_super_is_left_to_the_generic_path() {
+    let extractor = PythonExtractor::new();
+    let project = ProjectId::new("blog");
+
+    let source = "class Article(Base):
+    def save(self):
+        super(Other, self).save()
+";
+
+    let output = extractor.extract(&project, "blog/models.py", source);
+
+    let marked = output.unresolved_refs.iter().any(|reference| {
+        reference.reference_name == "save"
+            && reference.candidates.iter().any(|candidate| candidate == SUPER_DISPATCH)
+    });
+
+    assert!(!marked, "super(Other, self) names a different class to skip, so it is not marked");
+}
+
+#[test]
 fn malformed_source_does_not_panic() {
     let extractor = PythonExtractor::new();
     let project = ProjectId::new("blog");
@@ -640,4 +723,61 @@ fn static_and_class_method_decorators_are_captured() {
     );
 
     assert!(!plain.is_static, "an undecorated method is not static");
+}
+
+#[test]
+fn a_field_carries_its_help_text_and_never_clips_mid_identifier() {
+    let extractor = PythonExtractor::new();
+    let project = ProjectId::new("workspace");
+
+    let source = concat!(
+        "from django.core.validators import MinValueValidator\n",
+        "from django.db import models\n",
+        "\n",
+        "\n",
+        "class ProductionLine(models.Model):\n",
+        "    cycle_time_seconds = models.IntegerField(\n",
+        "        default=900,\n",
+        "        help_text='Time for material to travel from the hopper.',\n",
+        "    )\n",
+        "\n",
+        "    concurrent_station_count = models.IntegerField(\n",
+        "        default=CONCURRENT_STATION_COUNT_MIN,\n",
+        "        validators=[MinValueValidator(CONCURRENT_STATION_COUNT_MIN)],\n",
+        "    )\n",
+    );
+
+    let output = extractor.extract(&project, "app/production/line/models.py", source);
+
+    let signature_of = |name: &str| {
+        output
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::Field && node.name == name)
+            .and_then(|node| node.signature.clone())
+            .unwrap_or_default()
+    };
+
+    let cycle_time = signature_of("cycle_time_seconds");
+
+    assert!(cycle_time.contains("default=900"), "the schema argument leads, got {cycle_time:?}");
+
+    assert!(
+        cycle_time.contains("\"Time for material to travel from the hopper.\""),
+        "and the help text rides along after it, got {cycle_time:?}",
+    );
+
+    // The clip has to fall on a boundary. A cut mid-name prints a fragment that
+    // reads as a different symbol and that no search will ever find.
+    let stations = signature_of("concurrent_station_count");
+
+    assert!(
+        !stations.contains("CONCURRENT_STATION_CO..."),
+        "a value is never clipped mid-identifier, got {stations:?}",
+    );
+
+    assert!(
+        stations.contains("validators=[MinValueValidator(..."),
+        "it backs up to the last boundary instead, got {stations:?}",
+    );
 }

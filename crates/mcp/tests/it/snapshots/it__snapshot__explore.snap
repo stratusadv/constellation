@@ -1,0 +1,44 @@
+---
+source: crates/mcp/tests/it/snapshot.rs
+expression: fixture.render(&text)
+---
+note: no covering tests for: checkout_view, OrderDetailView (verify before editing)
+
+# [shop] model Order (orders/models.py:6)
+6	class Order(TimeStamped):
+7	    reference = models.CharField(max_length=32)
+8	    total = models.DecimalField(max_digits=10, decimal_places=2)
+9	
+10	    def recalculate_totals(self):
+11	        return self.total
+12	
+13	    def audit(self):
+14	        return AuditLog().record('order.saved')
+
+# (below: files matching only part of a query word, e.g. `line` from `production_line_type`; signatures only. Name one of these to read it.)
+
+# [shop] view OrderDetailView (orders/views.py:7)
+# [shop] view checkout_view (orders/views.py:12)  (request)
+
+# [platform] model TimeStamped (platform_core/models.py:4)
+#   [platform] field created_at (platform_core/models.py:5)  DateTimeField(auto_now_add=True)
+#   [platform] class Meta (platform_core/models.py:7)
+# [platform] model AuditLog (platform_core/models.py:11)
+#   [platform] field action (platform_core/models.py:12)  CharField(max_length=64)
+#   [platform] method record (platform_core/models.py:14)  (self, action)
+#   (+1 more symbol(s) here, not shown; `node` or `model` for the rest)
+
+# [shop] template orders/checkout.html (templates/orders/checkout.html:1)
+
+# [shop] external django.test.TestCase (<external>/django.test:1)
+
+# [shop] template orders/detail.html (templates/orders/detail.html:1)
+
+# [shop] variable app_name (orders/urls.py:5)  orders
+# [shop] variable urlpatterns (orders/urls.py:7)
+#   [shop] route checkout (orders/urls.py:8)
+#   [shop] route detail (orders/urls.py:9)
+
+# [shop] external django.views.generic.DetailView (<external>/django.views.generic:1)
+
+next: `tests` to check what covers the uncovered symbols above
