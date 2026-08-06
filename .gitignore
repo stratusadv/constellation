@@ -43,8 +43,10 @@ scripts/
 # Eval harness output (regenerate with `cargo run -p constellation-eval`).
 eval/results/
 
-# The CI retrieval-quality fixture, rebuilt by the workflow on every run.
-eval/fixture/
+# The retrieval-quality fixture's source is committed (eval/fixture/orders,
+# eval/fixture/templates) so `constellation init eval/fixture` reproduces the
+# graph the ci-fixture goldset is written against. Only the graph it builds is
+# generated, and `.constellation/` above already covers that.
 
 # The fixture survey's corpus: absolute paths to indexed repositories on one
 # developer's disk. `cargo xtask fixtures survey` writes a template on first run.

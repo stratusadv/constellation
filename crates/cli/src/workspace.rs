@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use constellation_graph::{PROFILE_NAME_DEFAULT, PROFILE_NAMES, Profile};
 
 /// A fail-fast bound on directory levels walked while discovering the database.
 const DISCOVER_DEPTH_MAX: u32 = 4_096;
@@ -110,9 +111,9 @@ pub(crate) fn resolve_root(root: &Path) -> Result<PathBuf> {
 }
 
 /// A commented starter `.constellation/config.toml`, written only when none
-/// exists, so a developer discovers where to enable companion packages and add
-/// extra version sources. Best-effort: a write failure is reported, never fatal,
-/// and an existing config is never clobbered.
+/// exists, so a developer discovers where to select a profile, enable companion
+/// packages, and add extra version sources. Best-effort: a write failure is
+/// reported, never fatal, and an existing config is never clobbered.
 pub(crate) fn scaffold_config(root: &Path) {
     let path = root.join(".constellation").join("config.toml");
 
@@ -120,24 +121,55 @@ pub(crate) fn scaffold_config(root: &Path) {
         return;
     }
 
-    let starter = "\
+    let starter = starter_config(&Profile::default());
+
+    if let Err(error) = std::fs::write(&path, starter) {
+        eprintln!("constellation: could not write starter config: {error}");
+    }
+}
+
+/// The package name the samples use when the profile names none of its own.
+const SAMPLE_PACKAGE: &str = "your-library";
+
+/// The repository url the samples use when the profile names none of its own.
+const SAMPLE_REPOSITORY: &str = "https://github.com/your-org/your-library";
+
+/// The starter config, with each profile-derived value marked `@name@` for
+/// [`starter_config`] to substitute. A constant rather than a literal inside
+/// that function, so the text reads as the file it becomes and the function
+/// reads as the substitution it performs.
+const STARTER_TEMPLATE: &str = "\
 # Constellation configuration.
 # Lines starting with # are comments. Uncomment a setting to change it from its
 # default value.
 
 
+[profile]
+# The set of company conventions this project is indexed and served under: the
+# framework hook names its base classes add, and the libraries it installs.
+# One of \"@profile_names@\". \"generic\" is plain Django, with no conventions at all.
+name = \"@profile_name@\"
+
+# Method and class names the framework calls with no call site in your code, on
+# top of Django's own (save, delete, clean, ready, handle, Meta,
+# get_absolute_url). Symbols named here are not reported as dead code.
+# Defaults to the profile's list; set this to state your own instead.
+# hook_names_extra = @hook_names_extra@
+
+
 [companions]
-# Index the libraries this project installs (django-spire, etc.) alongside it, so
-# imports into them resolve to real definitions instead of <external> stubs.
+# Index the libraries this project installs alongside it, so imports into them
+# resolve to real definitions instead of <external> stubs.
 # Set to false to index this project only.
 enabled = true
 
-# The libraries to index, by name. Defaults to the four below when omitted; give
-# your own list, or [] to index none while leaving companions enabled.
-# packages = [\"django-spire\", \"django-glue\", \"robit\", \"dandy\"]
+# The libraries to index, by name. Defaults to the profile's list (below) when
+# omitted; give your own list, or [] to index none while leaving companions
+# enabled.
+# packages = @packages@
 
-# Libraries to leave out of the default set, without having to re-list the rest.
-# exclude = [\"robit\"]
+# Libraries to leave out of the profile's list, without re-listing the rest.
+# exclude = @excluded@
 
 # The virtual-environment folder the libraries are installed in, relative to this
 # project or absolute. Defaults to \".venv\".
@@ -146,14 +178,13 @@ enabled = true
 # Extra versions of a library to index side by side for comparison while
 # refactoring. Each package = \"git-ref\" entry checks out that ref as its own
 # read-only project, from the library's repository (see repositories below).
-# versions = { django-spire = \"v1/base\" }
+# versions = { @sample_package@ = \"v1/base\" }
 
 # The git repository for each library, used to fetch its commit history at the tag
-# matching the installed version, no local clone needed. Defaults to the
-# django-spire / django-glue / robit / dandy repos, so library history works out of the
-# box; set this to override those or add your own. Cloned into
-# .constellation/sources/ and cached.
-# repositories = { django-spire = \"https://github.com/stratusadv/django-spire\" }
+# matching the installed version, no local clone needed. Defaults to the profile's
+# own repositories, so library history works out of the box; set this to override
+# those or add your own. Cloned into .constellation/sources/ and cached.
+# repositories = { @repository_package@ = \"@repository_url@\" }
 
 
 [history]
@@ -177,16 +208,89 @@ enabled = true
 # commits_max = 20000
 ";
 
-    if let Err(error) = std::fs::write(&path, starter) {
-        eprintln!("constellation: could not write starter config: {error}");
-    }
+/// The starter config text for `profile`: the commented defaults a developer
+/// edits, with the profile's own package list and repository substituted into
+/// the samples rather than restated here. Naming a library in this file would be
+/// a second copy of what `constellation_graph::Profile` already holds, and the
+/// two would drift.
+fn starter_config(profile: &Profile) -> String {
+    let sample = profile.companion_packages.first().map_or(SAMPLE_PACKAGE, String::as_str);
+
+    let (repository_package, repository_url) = profile
+        .companion_repositories
+        .first()
+        .map_or((SAMPLE_PACKAGE, SAMPLE_REPOSITORY), |(package, url)| {
+            (package.as_str(), url.as_str())
+        });
+
+    let excluded = profile.companion_packages.last().map(std::slice::from_ref);
+
+    let text = STARTER_TEMPLATE
+        .replace("@profile_names@", &PROFILE_NAMES.join("\", \""))
+        .replace("@profile_name@", PROFILE_NAME_DEFAULT)
+        .replace("@hook_names_extra@", &toml_string_array(&profile.hook_names_extra))
+        .replace("@packages@", &toml_string_array(&profile.companion_packages))
+        .replace("@excluded@", &toml_string_array(excluded.unwrap_or_default()))
+        .replace("@repository_package@", repository_package)
+        .replace("@repository_url@", repository_url)
+        .replace("@sample_package@", sample);
+
+    assert!(!text.contains('@'), "every starter-config placeholder is substituted");
+
+    text
+}
+
+/// A list of strings as a TOML array literal (`[\"a\", \"b\"]`), for writing a
+/// profile's own values into the sample lines of the starter config.
+fn toml_string_array(values: &[String]) -> String {
+    let quoted: Vec<String> = values.iter().map(|value| format!("\"{value}\"")).collect();
+
+    format!("[{}]", quoted.join(", "))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{project_name, resolve_root};
+    use super::{PROFILE_NAME_DEFAULT, Profile, project_name, resolve_root, starter_config};
 
     use std::path::Path;
+
+    #[test]
+    fn the_starter_config_parses_and_states_only_its_defaults() {
+        let text = starter_config(&Profile::default());
+        let parsed: toml::Value = toml::from_str(&text).expect("the starter config is valid TOML");
+
+        let selected =
+            parsed.get("profile").and_then(|section| section.get("name")).and_then(toml::Value::as_str);
+
+        assert_eq!(
+            selected,
+            Some(PROFILE_NAME_DEFAULT),
+            "the one uncommented profile key states the default, so scaffolding changes nothing",
+        );
+
+        assert_eq!(
+            parsed.get("companions").and_then(|section| section.get("packages")),
+            None,
+            "the package list stays commented out, so the profile keeps supplying it",
+        );
+    }
+
+    #[test]
+    fn the_starter_config_names_no_company_under_the_generic_profile() {
+        let text = starter_config(&Profile::generic());
+
+        for package in Profile::stratus().companion_packages {
+            assert!(
+                !text.contains(&package),
+                "a generic starter config names no company package, found {package:?}",
+            );
+        }
+
+        assert!(
+            text.contains("your-library"),
+            "the samples fall back to a placeholder rather than emptying out",
+        );
+    }
 
     #[test]
     fn project_name_takes_the_last_path_segment() {

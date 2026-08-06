@@ -20,7 +20,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Verify tag matches Cargo.toml version
       run: |
@@ -39,19 +39,19 @@ jobs:
         targets: x86_64-unknown-linux-gnu
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/registry
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache cargo index
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache cargo build
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -75,7 +75,7 @@ jobs:
         (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 
     - name: Attach the tarball to the release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: |
           dist/*.tar.gz
@@ -91,7 +91,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Verify tag matches Cargo.toml version
       run: |
@@ -109,25 +109,42 @@ jobs:
         targets: x86_64-pc-windows-msvc
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/registry
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache cargo index
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Cache cargo build
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: target
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build release binary
       run: cargo build --release --verbose
+
+    # The same shape as the Linux tarball: a versionless archive name, so
+    # releases/latest/download/<name>.zip is a stable URL, and a sha256 beside
+    # it in the same `<hash>  <file>` format sha256sum writes.
+    - name: Package the zip
+      run: |
+        $name = "constellation-x86_64-pc-windows-msvc"
+
+        New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+        Copy-Item target/release/constellation.exe "dist/$name/"
+        Copy-Item README.md, LICENSE "dist/$name/"
+
+        Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
+
+        $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+        Set-Content -Encoding ascii "dist/$name.zip.sha256" "$hash  $name.zip"
+      shell: pwsh
 
     - name: Install Inno Setup
       run: choco install innosetup -y
@@ -153,7 +170,7 @@ jobs:
 
     - name: Upload installer artifact for signing
       id: installer_artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: constellation-setup
         path: assets/Output/constellation-setup-${{ steps.get_version.outputs.version }}.exe
@@ -173,7 +190,7 @@ jobs:
 
     - name: Attach signed installer to release
       if: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: signed/*.exe
       env:
@@ -181,16 +198,19 @@ jobs:
 
     - name: Attach unsigned installer to release
       if: ${{ vars.SIGNPATH_ORGANIZATION_ID == '' }}
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: assets/Output/constellation-setup-${{ steps.get_version.outputs.version }}.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Attach binary to release
-      uses: softprops/action-gh-release@v1
+    - name: Attach the zip and the bare binary to the release
+      uses: softprops/action-gh-release@v3
       with:
-        files: target/release/constellation.exe
+        files: |
+          dist/*.zip
+          dist/*.zip.sha256
+          target/release/constellation.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

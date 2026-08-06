@@ -3,7 +3,10 @@
 //!
 //! The schema is rebuilt rather than migrated. A database written by an older
 //! or newer version is discarded and recreated, because the index is derived
-//! data and re-deriving it is cheaper than being wrong about it.
+//! data and re-deriving it is cheaper than being wrong about it. What survives
+//! the discard is each project's identity (its id, name, and root path), so the
+//! rebuilt database still knows which repositories it indexed and the next
+//! refresh re-derives every graph from disk instead of coming up empty.
 //!
 //! The query families are `impl Store` blocks in the modules beside this one.
 
@@ -129,6 +132,74 @@ fn tune_for_reads(connection: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The most project rows salvaged from a database about to be discarded, a
+/// fail-fast bound on a table that should hold a handful of rows.
+const SALVAGE_PROJECTS_MAX: usize = 4_096;
+
+/// The identity a project keeps across a schema rebuild: enough to re-seed its
+/// row so the next refresh re-derives its graph from disk.
+struct ProjectSeed {
+    id: String,
+    name: String,
+    root_path: String,
+    reference_only: bool,
+}
+
+/// The project identities read out of a database about to be discarded, so the
+/// rebuilt database remembers which repositories it indexed. Without them,
+/// `sync` and the serve watcher iterate an empty project table and re-derive
+/// nothing: the discard would demand a manual `init` (and `link`) to recover.
+///
+/// Best-effort by design. The schema is by definition one this build does not
+/// fully understand, so any failure (a missing table, a renamed column) yields
+/// an empty list and the discard proceeds as a plain rebuild. Only identity is
+/// read, never graph content: rows that cannot be trusted are the reason the
+/// database is being discarded at all.
+fn salvage_projects(connection: &Connection) -> Vec<ProjectSeed> {
+    const WITH_FLAG: &str = "SELECT id, name, root_path, reference_only FROM projects";
+    const BARE: &str = "SELECT id, name, root_path, 0 FROM projects";
+
+    let mut statement = match connection.prepare(WITH_FLAG).or_else(|_| connection.prepare(BARE)) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+
+    let rows = statement.query_map([], |row| {
+        Ok(ProjectSeed {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            root_path: row.get(2)?,
+            reference_only: row.get::<_, i64>(3)? != 0,
+        })
+    });
+
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+
+    let mut seeds: Vec<ProjectSeed> = Vec::new();
+
+    for row in rows.take(SALVAGE_PROJECTS_MAX) {
+        let Ok(seed) = row else {
+            continue;
+        };
+
+        if seed.id.is_empty() || seed.id.contains("::") {
+            continue;
+        }
+
+        if seed.name.is_empty() || seed.root_path.is_empty() {
+            continue;
+        }
+
+        seeds.push(seed);
+    }
+
+    assert!(seeds.len() <= SALVAGE_PROJECTS_MAX, "salvage honors its bound");
+
+    seeds
+}
+
 /// The stale database file and its WAL sidecars removed, so the next open rebuilds
 /// from the current schema. Best-effort: a failed delete leaves the next open to
 /// fail clearly rather than silently use an incompatible file.
@@ -159,6 +230,11 @@ impl Store {
     /// older than [`SCHEMA_VERSION_MIN`], or newer than this build, is discarded
     /// and rebuilt. Opening is a read path for most callers, so it must not
     /// destroy an index that merely predates a new table.
+    ///
+    /// A discard keeps each project's identity (see [`salvage_projects`]) and
+    /// nothing else, so the rebuilt database starts empty but self-heals: the
+    /// next `sync` or serve refresh walks every remembered root and re-derives
+    /// the whole graph, no manual `init` required.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         assert!(!path.as_os_str().is_empty(), "store path must not be empty");
 
@@ -169,13 +245,39 @@ impl Store {
         let connection = Connection::open(path)?;
 
         if schema_action(&connection, fresh)? == SchemaAction::Discard {
+            let seeds = salvage_projects(&connection);
+
             drop(connection);
             discard_database(path);
 
-            return Self::init(Connection::open(path)?);
+            let store = Self::init(Connection::open(path)?)?;
+
+            store.reseed_projects(&seeds)?;
+
+            return Ok(store);
         }
 
         Self::init(connection)
+    }
+
+    /// The salvaged project identities re-recorded after a rebuild, so the next
+    /// refresh walks every previously indexed root. Graph content is deliberately
+    /// not carried over: the empty `index_version` and empty file table make the
+    /// next index of each project a full re-extraction.
+    fn reseed_projects(&self, seeds: &[ProjectSeed]) -> Result<(), StoreError> {
+        assert!(seeds.len() <= SALVAGE_PROJECTS_MAX, "seeds stay within the salvage bound");
+
+        for seed in seeds {
+            let id = ProjectId::new(seed.id.clone());
+
+            self.upsert_project(&id, &seed.name, &seed.root_path)?;
+
+            if seed.reference_only {
+                self.set_reference_only(&id, true)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// An additional read-only connection to an already-initialized database.
@@ -485,6 +587,7 @@ mod tests {
             let store = Store::open(&path).unwrap();
 
             store.upsert_project(&project, "blog", "/tmp/blog").unwrap();
+            store.set_index_version(&project, "stamp-of-the-old-binary").unwrap();
 
             assert_eq!(store.all_projects().unwrap().len(), 1, "the project is seeded");
         }
@@ -499,14 +602,49 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
 
-        assert!(
-            store.all_projects().unwrap().is_empty(),
-            "a database under a different schema is discarded and rebuilt empty",
-        );
         assert_eq!(
             store.schema_version().unwrap(),
             u32::try_from(SCHEMA_VERSION).unwrap(),
             "the rebuilt database carries the current schema version",
+        );
+        assert_eq!(store.count_nodes(&project).unwrap(), 0, "the graph itself is rebuilt empty");
+
+        let projects = store.all_projects().unwrap();
+
+        assert_eq!(projects.len(), 1, "the project's identity survives the discard");
+        assert_eq!(projects[0].root_path, "/tmp/blog", "with the root the next refresh walks");
+        assert_eq!(
+            store.index_version(&project).unwrap(),
+            "",
+            "and no extractor stamp, so that refresh re-extracts every file",
+        );
+    }
+
+    #[test]
+    fn a_reference_only_project_stays_reference_only_across_a_rebuild() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("index.db");
+        let version_copy = ProjectId::new("django-spire@next");
+
+        {
+            let store = Store::open(&path).unwrap();
+
+            store.upsert_project(&version_copy, "django-spire@next", "/tmp/spire-next").unwrap();
+            store.set_reference_only(&version_copy, true).unwrap();
+        }
+
+        {
+            let connection = Connection::open(&path).unwrap();
+
+            connection.pragma_update(None, "user_version", SCHEMA_VERSION_MIN - 1).unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+
+        assert_eq!(
+            store.reference_only_project_ids().unwrap(),
+            vec![version_copy.as_str().to_string()],
+            "a version copy is still excluded from link targets after the rebuild",
         );
     }
 }

@@ -17,8 +17,13 @@ const SEPARATORS: [char; 2] = ['/', '\\'];
 
 /// The directory names holding machine-generated, vendored, or collected output
 /// rather than hand-written source.
-const GENERATED_DIRECTORIES: [&str; 5] =
-    ["migrations", "node_modules", "static_files", "staticfiles", "vendor"];
+const GENERATED_DIRECTORIES: [&str; 5] = [
+    "migrations",
+    "node_modules",
+    "static_files",
+    "staticfiles",
+    "vendor",
+];
 
 /// The file-name suffixes of a minified or bundled asset: vendor code with no
 /// readable structure left in it.

@@ -1,8 +1,8 @@
-//! Companion-library discovery: when a Django workspace is indexed, locate the
-//! company packages it installs (`django-spire`, `django-glue`, `robit`, `dandy`) inside
-//! its virtual environment and register each as its own project, so the workspace's
-//! imports of them resolve across a project boundary instead of dead-ending at an
-//! external stub.
+//! Companion-library discovery and the workspace config file it reads: when a
+//! Django workspace is indexed, locate the packages its profile names (see
+//! [`constellation_graph::Profile`]) inside its virtual environment and register
+//! each as its own project, so the workspace's imports of them resolve across a
+//! project boundary instead of dead-ending at an external stub.
 //!
 //! A wheel install sits as real source under `.venv/Lib/site-packages/<package>/`;
 //! that package directory is indexed as a standalone project rooted at itself. Its
@@ -18,6 +18,11 @@
 //! package list, and name extra versions to index side by side for comparison:
 //!
 //! ```toml
+//! [profile]
+//! # The built-in set of company conventions this workspace indexes under:
+//! # "stratus" (the default) or "generic", which names no company at all.
+//! name = "stratus"
+//!
 //! [companions]
 //! enabled = true
 //! packages = ["django-spire", "django-glue", "robit", "dandy"]
@@ -30,6 +35,10 @@
 //! versions = { django-spire = "refactor/next", django-glue = "v1.2.0" }
 //! ```
 //!
+//! `[companions] packages` and `repositories` are the override mechanism for what
+//! a profile names: an unstated key takes the profile's value, and a stated one
+//! replaces it outright.
+//!
 //! A local working copy takes precedence over the `.venv`: if the workspace's
 //! `pyproject.toml` pins a package to a path under `[tool.uv.sources]`, or a
 //! `development.env`/`.env` sets `PYTHONPATH_APPEND` to a directory holding it,
@@ -40,27 +49,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use constellation_graph::{PROFILE_NAME_DEFAULT, PROFILE_NAMES, Profile};
 use constellation_store::Store;
 use rustc_hash::FxHashSet;
 use serde::Deserialize;
 
 use crate::IndexError;
-
-/// The companion packages registered by default when none are configured. Each is
-/// a project id (hyphenated); the import package name is the id with hyphens
-/// replaced by underscores (`django-spire` -> `django_spire`).
-const COMPANIONS_DEFAULT: &[&str] = &["django-spire", "django-glue", "robit", "dandy"];
-
-/// The default git repository for each default companion, used to fetch its
-/// history (at the tag matching the installed version) when `[companions]
-/// repositories` is not set, so companion history works with no configuration.
-/// The config key overrides this.
-const COMPANION_REPOSITORIES_DEFAULT: &[(&str, &str)] = &[
-    ("django-spire", "https://github.com/stratusadv/django-spire"),
-    ("django-glue", "https://github.com/stratusadv/django-glue"),
-    ("robit", "https://github.com/stratusadv/robit"),
-    ("dandy", "https://github.com/stratusadv/dandy"),
-];
 
 /// The fail-fast bound on companions resolved in one discovery pass.
 const COMPANION_COUNT_MAX: u32 = 64;
@@ -90,31 +84,119 @@ pub struct CompanionTarget {
     pub reference_only: bool,
 }
 
-/// The `[companions]` section of `.constellation/config.toml`.
+/// The `[companions]` section of `.constellation/config.toml` as written. A
+/// `packages` or `repositories` the file leaves out is `None` rather than empty,
+/// so the selected profile supplies it; an explicit `[]` says "none", which is a
+/// different instruction.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
+struct CompanionsSection {
+    enabled: bool,
+    exclude: Vec<String>,
+    packages: Option<Vec<String>>,
+    repositories: Option<BTreeMap<String, String>>,
+    venv: Option<String>,
+    versions: BTreeMap<String, String>,
+}
+
+impl Default for CompanionsSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            exclude: Vec::new(),
+            packages: None,
+            repositories: None,
+            venv: None,
+            versions: BTreeMap::new(),
+        }
+    }
+}
+
+impl CompanionsSection {
+    /// The section resolved against `profile`: a `packages` or `repositories`
+    /// the file omitted is taken from the profile, and one it states is kept
+    /// exactly as written.
+    fn resolve(self, profile: &Profile) -> CompanionsConfig {
+        let packages = self.packages.unwrap_or_else(|| profile.companion_packages.clone());
+
+        let repositories = self.repositories.unwrap_or_else(|| {
+            profile
+                .companion_repositories
+                .iter()
+                .map(|(package, url)| (package.clone(), url.clone()))
+                .collect()
+        });
+
+        CompanionsConfig {
+            enabled: self.enabled,
+            exclude: self.exclude,
+            packages,
+            repositories,
+            venv: self.venv,
+            versions: self.versions,
+        }
+    }
+}
+
+/// The `[companions]` configuration a discovery pass runs against, after the
+/// selected profile has supplied whatever the file left out.
+#[derive(Clone, Debug)]
 struct CompanionsConfig {
     enabled: bool,
-    packages: Vec<String>,
     exclude: Vec<String>,
+    packages: Vec<String>,
     repositories: BTreeMap<String, String>,
     venv: Option<String>,
     versions: BTreeMap<String, String>,
 }
 
-impl Default for CompanionsConfig {
+/// The `[profile]` section of `.constellation/config.toml`: which built-in
+/// profile of company conventions a workspace indexes under, and the framework
+/// hook names it states for itself instead of taking that profile's.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct ProfileSection {
+    hook_names_extra: Option<Vec<String>>,
+    name: String,
+}
+
+impl Default for ProfileSection {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            packages: COMPANIONS_DEFAULT.iter().map(|name| name.to_string()).collect(),
-            exclude: Vec::new(),
-            repositories: COMPANION_REPOSITORIES_DEFAULT
-                .iter()
-                .map(|(package, url)| (package.to_string(), url.to_string()))
-                .collect(),
-            venv: None,
-            versions: BTreeMap::new(),
+        Self { hook_names_extra: None, name: PROFILE_NAME_DEFAULT.to_string() }
+    }
+}
+
+impl ProfileSection {
+    /// The built-in profile this section selects, with its hook extras replaced
+    /// when the file states its own. A blank or unrecognized name falls back to
+    /// the default profile (the unrecognized one with a message on stderr), since
+    /// an optional config must never fail an index.
+    fn resolve(self) -> Profile {
+        let named = if self.name.is_empty() {
+            Some(Profile::default())
+        } else {
+            Profile::named(&self.name)
+        };
+
+        let mut profile = match named {
+            Some(profile) => profile,
+            None => {
+                eprintln!(
+                    "constellation: unknown [profile] name {:?}; using {PROFILE_NAME_DEFAULT:?} \
+                     (known profiles: {})",
+                    self.name,
+                    PROFILE_NAMES.join(", "),
+                );
+
+                Profile::default()
+            }
+        };
+
+        if let Some(extras) = self.hook_names_extra {
+            profile.hook_names_extra = extras;
         }
+
+        profile
     }
 }
 
@@ -149,13 +231,26 @@ impl Default for HistoryConfig {
     }
 }
 
-/// The whole config file: its `[companions]` and `[history]` sections.
+/// The whole config file as written: its `[companions]`, `[history]`, and
+/// `[profile]` sections, before the selected profile's defaults are folded in.
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
-    companions: CompanionsConfig,
+    companions: CompanionsSection,
     #[serde(default)]
     history: HistoryConfig,
+    #[serde(default)]
+    profile: ProfileSection,
+}
+
+impl ConfigFile {
+    /// The `[companions]` configuration this file states, resolved against the
+    /// profile it selects.
+    fn companions(self) -> CompanionsConfig {
+        let profile = self.profile.resolve();
+
+        self.companions.resolve(&profile)
+    }
 }
 
 /// The companion packages a workspace uses, located for indexing and returned as a
@@ -210,17 +305,40 @@ pub fn discover_companions(
     Ok(targets)
 }
 
-/// The `[companions]` section read from `.constellation/config.toml`. A missing file
-/// yields the defaults (discovery on, the four company packages); a malformed file
-/// also yields the defaults: an optional config must never fail an index.
+/// The `[companions]` section read from `.constellation/config.toml`, resolved
+/// against the profile the file selects. A missing file yields the defaults
+/// (discovery on, the default profile's packages); a malformed file also yields
+/// the defaults: an optional config must never fail an index.
 fn load_config(workspace_root: &Path) -> CompanionsConfig {
-    read_config_file(workspace_root).companions
+    read_config_file(workspace_root).companions()
 }
 
 /// The `[history]` configuration for the workspace at `workspace_root`, or the defaults
 /// when the config file is absent or omits the section.
 pub fn load_history_config(workspace_root: &Path) -> HistoryConfig {
     read_config_file(workspace_root).history
+}
+
+/// The [`Profile`] of company conventions the workspace at `workspace_root`
+/// indexes and is served under: the built-in its `[profile] name` selects, with
+/// whatever that section overrides applied. [`PROFILE_NAME_DEFAULT`] when the
+/// config file is absent, malformed, or omits the section.
+pub fn load_profile(workspace_root: &Path) -> Profile {
+    read_config_file(workspace_root).profile.resolve()
+}
+
+/// The [`load_profile`] of the workspace holding `database`, which is its
+/// `.constellation/index.db`: two levels up from the file is the workspace root
+/// the config sits under. The default profile when `database` is somewhere else,
+/// so a server opened against a database in any other layout still runs.
+pub fn load_profile_for_database(database: &Path) -> Profile {
+    assert!(!database.as_os_str().is_empty(), "a database path must not be empty");
+
+    let Some(workspace_root) = database.parent().and_then(Path::parent) else {
+        return Profile::default();
+    };
+
+    load_profile(workspace_root)
 }
 
 /// The parsed `.constellation/config.toml`, or the defaults when it is absent or
@@ -237,9 +355,10 @@ fn read_config_file(workspace_root: &Path) -> ConfigFile {
 
 /// The `[companions] repositories` map (package -> git url) for the workspace: the
 /// remotes companion git history is fetched from, since a `.venv` wheel records
-/// none. Empty when unconfigured.
+/// none. The selected profile's repositories when the file states none, and empty
+/// when that profile names none either.
 pub fn load_companion_repositories(workspace_root: &Path) -> BTreeMap<String, String> {
-    read_config_file(workspace_root).companions.repositories
+    load_config(workspace_root).repositories
 }
 
 /// The full-history checkout of `package`'s repository at the installed version,
@@ -1006,15 +1125,22 @@ fn sanitize_segment(spec: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The `[companions]` section of `text`, resolved the way a real load does.
+    fn companions_of(text: &str) -> CompanionsConfig {
+        toml::from_str::<ConfigFile>(text).expect("the fixture config parses").companions()
+    }
+
     #[test]
     fn config_defaults_when_the_file_is_empty() {
         let config: ConfigFile = toml::from_str("").unwrap();
+        let default_profile = Profile::default();
+        let companions = config.clone().companions();
 
-        assert!(config.companions.enabled);
-        assert_eq!(config.companions.packages.len(), COMPANIONS_DEFAULT.len());
-        assert!(config.companions.exclude.is_empty());
-        assert_eq!(config.companions.repositories.len(), COMPANION_REPOSITORIES_DEFAULT.len());
-        assert!(config.companions.repositories.contains_key("django-spire"));
+        assert!(companions.enabled);
+        assert_eq!(companions.packages, default_profile.companion_packages);
+        assert!(companions.exclude.is_empty());
+        assert_eq!(companions.repositories.len(), default_profile.companion_repositories.len());
+        assert!(companions.repositories.contains_key("django-spire"));
         assert!(config.history.enabled);
         assert!(config.history.symbols);
         assert!(config.history.companions);
@@ -1034,9 +1160,16 @@ companions = false
 commits_max = 5
 ";
         let config: ConfigFile = toml::from_str(text).unwrap();
+        let companions = config.clone().companions();
 
-        assert_eq!(config.companions.exclude, vec!["robit".to_string()]);
-        assert!(config.companions.enabled, "untouched fields keep their defaults");
+        assert_eq!(companions.exclude, vec!["robit".to_string()]);
+        assert!(companions.enabled, "untouched fields keep their defaults");
+
+        assert!(
+            !companions.packages.is_empty(),
+            "an unstated packages list still comes from the profile",
+        );
+
         assert!(!config.history.enabled);
         assert!(config.history.symbols);
         assert!(!config.history.companions);
@@ -1046,11 +1179,93 @@ commits_max = 5
     #[test]
     fn config_parses_companion_repositories() {
         let text = "[companions.repositories]\ndjango-spire = \"https://example.com/django-spire\"\n";
-        let config: ConfigFile = toml::from_str(text).unwrap();
+        let companions = companions_of(text);
 
         assert_eq!(
-            config.companions.repositories.get("django-spire").map(String::as_str),
+            companions.repositories.get("django-spire").map(String::as_str),
             Some("https://example.com/django-spire"),
+            "a stated repositories map replaces the profile's rather than merging into it",
+        );
+
+        assert_eq!(companions.repositories.len(), 1, "the profile's other urls are not folded in");
+    }
+
+    #[test]
+    fn the_profile_section_selects_the_built_in_and_its_companions() {
+        let generic = companions_of("[profile]\nname = \"generic\"\n");
+
+        assert!(generic.packages.is_empty(), "the generic profile discovers no companions");
+        assert!(generic.repositories.is_empty(), "and names no repositories");
+        assert!(generic.enabled, "discovery is still on; it simply has nothing to find");
+
+        let stratus = companions_of("[profile]\nname = \"stratus\"\n");
+
+        assert_eq!(stratus.packages, Profile::stratus().companion_packages);
+    }
+
+    #[test]
+    fn an_explicit_packages_list_wins_over_the_profile() {
+        let text = "\
+[profile]
+name = \"generic\"
+
+[companions]
+packages = [\"robit\"]
+";
+        let companions = companions_of(text);
+
+        assert_eq!(companions.packages, vec!["robit".to_string()], "the file states the list");
+
+        let none = companions_of("[companions]\npackages = []\n");
+
+        assert!(
+            none.packages.is_empty(),
+            "an explicit empty list means none, not 'use the profile'",
+        );
+    }
+
+    #[test]
+    fn the_profile_section_overrides_hook_names_and_survives_a_bad_name() {
+        let stated: ConfigFile =
+            toml::from_str("[profile]\nhook_names_extra = [\"crumbs\"]\n").unwrap();
+
+        assert_eq!(
+            stated.profile.resolve().hook_names_extra,
+            vec!["crumbs".to_string()],
+            "a stated hook list replaces the profile's",
+        );
+
+        let unknown: ConfigFile = toml::from_str("[profile]\nname = \"nonesuch\"\n").unwrap();
+
+        assert_eq!(
+            unknown.profile.resolve(),
+            Profile::default(),
+            "an unrecognized profile name falls back rather than failing the index",
+        );
+    }
+
+    #[test]
+    fn load_profile_reads_the_workspace_config() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join(".constellation");
+
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("config.toml"), "[profile]\nname = \"generic\"\n").unwrap();
+
+        assert_eq!(load_profile(workspace.path()), Profile::generic());
+
+        assert_eq!(
+            load_profile_for_database(&directory.join("index.db")),
+            Profile::generic(),
+            "the workspace root is two levels up from its database",
+        );
+
+        let bare = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            load_profile(bare.path()),
+            Profile::default(),
+            "a workspace with no config file gets the default profile",
         );
     }
 
@@ -1085,10 +1300,9 @@ commits_max = 5
 
     #[test]
     fn config_parses_versions_map() {
-        let text = "[companions.versions]\ndjango-spire = \"v1/base\"\n";
-        let config: ConfigFile = toml::from_str(text).unwrap();
+        let companions = companions_of("[companions.versions]\ndjango-spire = \"v1/base\"\n");
 
-        assert_eq!(config.companions.versions.get("django-spire").map(String::as_str), Some("v1/base"));
+        assert_eq!(companions.versions.get("django-spire").map(String::as_str), Some("v1/base"));
     }
 
     #[test]

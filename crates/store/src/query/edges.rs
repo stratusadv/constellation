@@ -151,6 +151,40 @@ impl Store {
         Ok(edges)
     }
 
+    /// The resolved `returns` edges whose source is in `project`, as
+    /// `(callable_id, returned_node_id)`: the annotated return type of every
+    /// function and method. Backs typing a local from the call that produced it
+    /// (`demo = Demo.start(...)`), which needs the callee's annotation and so
+    /// cannot be read from the calling file. `None` spans every project, since a
+    /// factory often lives across a boundary from its caller.
+    pub fn returns_edges(
+        &self,
+        project: Option<&ProjectId>,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let scope = project.map(|project| project.as_str().to_string());
+
+        let mut statement = self.connection.prepare_cached(
+            "SELECT e.source, e.target FROM edges e
+             JOIN nodes s ON e.source = s.id
+             WHERE e.kind = 'returns' AND (?1 IS NULL OR s.project_id = ?1)",
+        )?;
+
+        let rows = statement.query_map(params![scope], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut edges: Vec<(String, String)> = Vec::new();
+        let mut count: u32 = 0;
+
+        for row in rows {
+            charge(&mut count, ROWS_LOADED_MAX, "returns load")?;
+
+            edges.push(row?);
+        }
+
+        Ok(edges)
+    }
+
     /// The `(id, name)` of every method node in `project`, the symbols the
     /// override synthesis matches by name against each class's ancestors. `None`
     /// spans every project, so a walk can land on a base class a companion

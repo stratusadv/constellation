@@ -1,31 +1,21 @@
 use crate::edge::EdgeKind;
 use crate::paths::{is_management_command_path, is_migration_path, is_test_path};
-
-/// The method and class names Django (and django_spire) invoke with no static
-/// call site: lifecycle hooks, protocol methods, and app configuration entry
-/// points. One definition serves two opposite readers. Dead-code detection uses
-/// it to suppress false positives, since a symbol here has no caller by design;
-/// flow detection uses it as the framework entry-point set, which is the same
-/// list read the other way round.
-pub const FRAMEWORK_HOOK_NAMES: &[&str] = &[
-    "base_breadcrumb",
-    "breadcrumbs",
-    "clean",
-    "delete",
-    "get_absolute_url",
-    "handle",
-    "Meta",
-    "ready",
-    "save",
-];
+use crate::profile::{DJANGO_HOOK_NAMES, Profile};
 
 /// The class-name suffixes Django resolves by convention rather than by import:
 /// an `AppConfig`, a migration class, an admin registration.
 pub const FRAMEWORK_CLASS_SUFFIXES: &[&str] = &["Admin", "Config", "Migration"];
 
-/// Whether a symbol name is one the framework calls without a static call site.
-pub fn is_framework_hook_name(name: &str) -> bool {
-    FRAMEWORK_HOOK_NAMES.contains(&name)
+/// Whether a symbol name is one the framework calls without a static call site:
+/// a lifecycle hook, a protocol method, or an app configuration entry point.
+///
+/// The effective set is [`DJANGO_HOOK_NAMES`] plus the profile's own extras, and
+/// it serves two opposite readers. Dead-code detection uses it to suppress false
+/// positives, since a symbol here has no caller by design; flow detection reads
+/// the same list the other way round, as the framework entry-point set.
+pub fn is_framework_hook_name(profile: &Profile, name: &str) -> bool {
+    DJANGO_HOOK_NAMES.contains(&name)
+        || profile.hook_names_extra.iter().any(|hook| hook.as_str() == name)
 }
 
 /// Whether a symbol name is a dunder (`__init__`, `__str__`), which the language
@@ -42,9 +32,9 @@ pub fn has_framework_class_suffix(name: &str) -> bool {
 /// Whether a symbol is reached by the framework rather than by a static call, so
 /// its lack of callers proves nothing. `true` covers tests, migrations,
 /// management commands, package initializers and admin registration modules,
-/// dunder methods, the lifecycle hook names, and the conventional class
-/// suffixes.
-pub fn is_framework_reached(name: &str, file_path: &str) -> bool {
+/// dunder methods, the hook names the `profile` makes effective, and the
+/// conventional class suffixes.
+pub fn is_framework_reached(profile: &Profile, name: &str, file_path: &str) -> bool {
     let path = file_path.replace('\\', "/");
 
     if is_test_path(&path) || is_migration_path(&path) || is_management_command_path(&path) {
@@ -55,7 +45,9 @@ pub fn is_framework_reached(name: &str, file_path: &str) -> bool {
         return true;
     }
 
-    is_dunder_name(name) || is_framework_hook_name(name) || has_framework_class_suffix(name)
+    is_dunder_name(name)
+        || is_framework_hook_name(profile, name)
+        || has_framework_class_suffix(name)
 }
 
 /// Whether a reference covers its target as a test: a `Tests` edge (a `TestCase`
@@ -69,8 +61,12 @@ pub fn is_covering_ref(kind: EdgeKind, caller_path: &str) -> bool {
 
 /// The Django model field constructors that declare a relation to another model,
 /// naming it in their first argument.
-pub const RELATION_FIELDS: &[&str] =
-    &["ForeignKey", "ManyToManyField", "OneToOneField", "GenericRelation"];
+pub const RELATION_FIELDS: &[&str] = &[
+    "ForeignKey",
+    "ManyToManyField",
+    "OneToOneField",
+    "GenericRelation",
+];
 
 /// The related model a field's declaration names
 /// (`ForeignKey(Location, related_name='lots')` -> `Location`), or `None` when the
@@ -99,6 +95,7 @@ pub fn relation_field_target(signature: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use crate::edge::EdgeKind;
+    use crate::profile::Profile;
 
     use super::{
         has_framework_class_suffix, is_covering_ref, is_dunder_name, is_framework_hook_name,
@@ -127,11 +124,30 @@ mod tests {
 
     #[test]
     fn lifecycle_hooks_are_framework_reached() {
+        let generic = Profile::generic();
+
         for name in ["save", "clean", "delete", "ready", "handle", "Meta", "get_absolute_url"] {
-            assert!(is_framework_hook_name(name), "{name:?} is a framework hook");
+            assert!(is_framework_hook_name(&generic, name), "{name:?} is a framework hook");
         }
 
-        assert!(!is_framework_hook_name("recalculate_totals"), "ordinary code is not a hook");
+        assert!(
+            !is_framework_hook_name(&generic, "recalculate_totals"),
+            "ordinary code is not a hook",
+        );
+    }
+
+    #[test]
+    fn a_profile_extends_the_hook_set_without_replacing_it() {
+        let generic = Profile::generic();
+        let stratus = Profile::stratus();
+
+        assert!(
+            !is_framework_hook_name(&generic, "breadcrumbs"),
+            "a profile hook is not a hook under a profile that does not name it",
+        );
+
+        assert!(is_framework_hook_name(&stratus, "breadcrumbs"), "the profile adds its extras");
+        assert!(is_framework_hook_name(&stratus, "save"), "and keeps Django's own");
     }
 
     #[test]
@@ -152,14 +168,24 @@ mod tests {
 
     #[test]
     fn framework_reach_covers_paths_and_names_together() {
-        assert!(is_framework_reached("run", "app/tests/test_run.py"), "a test is framework-reached");
-        assert!(is_framework_reached("Migration", "app/migrations/0001.py"));
-        assert!(is_framework_reached("handle", "app/management/commands/sync.py"));
-        assert!(is_framework_reached("anything", "app/__init__.py"));
-        assert!(is_framework_reached("save", "app/models.py"), "a lifecycle hook anywhere");
+        let profile = Profile::generic();
 
         assert!(
-            !is_framework_reached("recalculate_totals", "app/services.py"),
+            is_framework_reached(&profile, "run", "app/tests/test_run.py"),
+            "a test is framework-reached",
+        );
+
+        assert!(is_framework_reached(&profile, "Migration", "app/migrations/0001.py"));
+        assert!(is_framework_reached(&profile, "handle", "app/management/commands/sync.py"));
+        assert!(is_framework_reached(&profile, "anything", "app/__init__.py"));
+
+        assert!(
+            is_framework_reached(&profile, "save", "app/models.py"),
+            "a lifecycle hook anywhere",
+        );
+
+        assert!(
+            !is_framework_reached(&profile, "recalculate_totals", "app/services.py"),
             "ordinary code is a real dead-code candidate",
         );
     }

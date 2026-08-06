@@ -15,6 +15,7 @@ mod flows;
 mod fuzz_file_operations;
 mod fuzz_watcher_stress;
 mod index;
+mod profile;
 mod reindex_inbound_edges;
 mod watcher_delete;
 mod watcher_git_checkout;

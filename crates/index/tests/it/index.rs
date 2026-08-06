@@ -3165,3 +3165,508 @@ fn a_handler_passed_as_the_view_keyword_still_binds() {
 
     assert_eq!(views, ["notification_list_view"], "the keyword handler binds like a positional one");
 }
+
+#[test]
+fn a_typed_receiver_binds_to_the_method_an_ancestor_defines() {
+    let store = Store::open_in_memory().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+
+    // The annotated type inherits the called method rather than defining it, the
+    // shape a per-class name match misses: `Demo(DemoSession)` where the whole
+    // step vocabulary lives on the session base.
+    std::fs::write(
+        directory.path().join("session.py"),
+        "class DemoSession:\n    def hold(self):\n        return 1\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("steps.py"),
+        "from session import DemoSession\n\n\nclass Demo(DemoSession):\n    pass\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("test_flow.py"),
+        "from steps import Demo\n\n\ndef test_flow(demo: Demo):\n    demo.hold()\n",
+    )
+    .unwrap();
+
+    let project = ProjectId::new("suite");
+
+    index_project(&store, &project, "suite", directory.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let nodes = store.all_nodes(Some(&project)).unwrap();
+    let test = nodes.iter().find(|node| node.name == "test_flow").expect("the test function");
+
+    let callees: Vec<String> = store
+        .callees(&test.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| node.qualified_name)
+        .collect();
+
+    assert!(
+        callees.iter().any(|name| name.ends_with("DemoSession.hold")),
+        "an annotated receiver binds to the ancestor that defines the method, got {callees:?}",
+    );
+}
+
+#[test]
+fn a_typed_receiver_drops_a_method_no_ancestor_defines() {
+    let store = Store::open_in_memory().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+
+    // Reliability: a same-named method on an unrelated class is not an ancestor's,
+    // so the annotated receiver must bind to nothing rather than to it.
+    std::fs::write(
+        directory.path().join("models.py"),
+        "class Demo:\n    pass\n\n\nclass Unrelated:\n    def hold(self):\n        return 1\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("test_flow.py"),
+        "from models import Demo\n\n\ndef test_flow(demo: Demo):\n    demo.hold()\n",
+    )
+    .unwrap();
+
+    let project = ProjectId::new("suite");
+
+    index_project(&store, &project, "suite", directory.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let nodes = store.all_nodes(Some(&project)).unwrap();
+    let test = nodes.iter().find(|node| node.name == "test_flow").expect("the test function");
+
+    let callees: Vec<String> = store
+        .callees(&test.id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, node)| node.qualified_name)
+        .collect();
+
+    assert!(
+        !callees.iter().any(|name| name.ends_with("Unrelated.hold")),
+        "an annotated receiver never binds to an unrelated class's method, got {callees:?}",
+    );
+}
+
+/// A workspace whose app service inherits its persistence method from a base the
+/// library owns, indexed alongside that library, with `views.py` written from
+/// `view_source`. Backs the pair of service-builtin dispatch tests.
+fn service_builtin_workspace(store: &Store, view_source: &str) -> tempfile::TempDir {
+    let library = tempfile::tempdir().unwrap();
+    let package = library.path().join("spirelib");
+
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(
+        package.join("base.py"),
+        "class BaseModelService:\n    def save_model_obj(self):\n        return 1\n",
+    )
+    .unwrap();
+
+    index_project(store, &ProjectId::new("spirelib"), "spirelib", package.as_path()).unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("manage.py"), "# django\n").unwrap();
+    std::fs::create_dir_all(directory.path().join("shop")).unwrap();
+
+    std::fs::write(
+        directory.path().join("shop").join("services.py"),
+        "from spirelib.base import BaseModelService\n\n\n\
+         class WidgetService(BaseModelService):\n    pass\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("shop").join("models.py"),
+        "from django.db import models\n\n\nclass Widget(models.Model):\n    pass\n",
+    )
+    .unwrap();
+
+    std::fs::write(directory.path().join("shop").join("views.py"), view_source).unwrap();
+
+    let project = ProjectId::new("shop");
+
+    index_project(store, &project, "shop", directory.path()).unwrap();
+    link_constellation(store).unwrap();
+
+    directory
+}
+
+#[test]
+fn a_model_scoped_service_builtin_binds_to_the_base_it_inherits() {
+    let store = Store::open_in_memory().unwrap();
+
+    // `Widget.services.save_model_obj()` names the receiving model, which is exact
+    // evidence rather than uniqueness: the base is the definition that runs.
+    service_builtin_workspace(
+        &store,
+        "from shop.models import Widget\n\n\n\
+         def named():\n    Widget.services.save_model_obj()\n",
+    );
+
+    let nodes = store.all_nodes(Some(&ProjectId::new("shop"))).unwrap();
+    let named = nodes.iter().find(|node| node.name == "named").expect("the naming view");
+
+    let bound: Vec<String> = store
+        .callees(&named.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| node.qualified_name)
+        .collect();
+
+    assert!(
+        bound.iter().any(|name| name.ends_with("BaseModelService.save_model_obj")),
+        "a model-scoped service builtin binds to the inherited base, got {bound:?}",
+    );
+}
+
+#[test]
+fn a_service_builtin_with_no_receiving_model_stays_unbound() {
+    let store = Store::open_in_memory().unwrap();
+
+    // Reliability: an untyped local names no model, so the builtin every service
+    // inherits must bind to nothing rather than pick one at random.
+    service_builtin_workspace(
+        &store,
+        "def unnamed(widget):\n    widget.services.save_model_obj()\n",
+    );
+
+    let nodes = store.all_nodes(Some(&ProjectId::new("shop"))).unwrap();
+    let unnamed = nodes.iter().find(|node| node.name == "unnamed").expect("the untyped view");
+
+    let dropped: Vec<String> = store
+        .callees(&unnamed.id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, node)| node.name)
+        .collect();
+
+    assert!(
+        !dropped.iter().any(|name| name == "save_model_obj"),
+        "a service builtin with no receiving model stays unbound, got {dropped:?}",
+    );
+}
+
+#[test]
+fn a_namespace_alias_receiver_binds_into_the_package_it_names() {
+    let store = Store::open_in_memory().unwrap();
+
+    // The companion is indexed rooted at its own package directory, so its file
+    // paths carry no package prefix and a path-suffix comparison against the
+    // import can never match: only the package identity pins the project.
+    let library = tempfile::tempdir().unwrap();
+    let package = library.path().join("gluelib");
+
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(
+        package.join("shortcuts.py"),
+        "def glue_model_object(request, obj):\n    return obj\n",
+    )
+    .unwrap();
+
+    index_project(&store, &ProjectId::new("gluelib"), "gluelib", package.as_path()).unwrap();
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("views.py"),
+        "import gluelib as gl\n\n\n\
+         def detail(request, obj):\n    gl.glue_model_object(request, obj)\n",
+    )
+    .unwrap();
+
+    let project = ProjectId::new("portal");
+
+    index_project(&store, &project, "portal", directory.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let nodes = store.all_nodes(Some(&project)).unwrap();
+    let detail = nodes.iter().find(|node| node.name == "detail").expect("the view function");
+
+    let callees: Vec<(String, String)> = store
+        .callees(&detail.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| (node.project_id.as_str().to_string(), node.name))
+        .collect();
+
+    assert!(
+        callees.iter().any(|(owner, name)| owner == "gluelib" && name == "glue_model_object"),
+        "a namespace alias binds into the package's own project, got {callees:?}",
+    );
+}
+
+#[test]
+fn a_local_built_by_construction_types_its_receiver() {
+    let store = Store::open_in_memory().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+
+    // `crumbs = Breadcrumbs()` names the type outright, so the call on it binds
+    // with nothing in the signature annotated. The method is inherited, and its
+    // base is a file the caller neither defines nor imports, so the name resolver
+    // has no path to it: only the constructed local's type reaches it.
+    std::fs::write(
+        directory.path().join("base.py"),
+        "class BaseTrail:\n    def add_breadcrumb(self, label):\n        return label\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("trail.py"),
+        "from base import BaseTrail\n\n\nclass Breadcrumbs(BaseTrail):\n    pass\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("models.py"),
+        "from trail import Breadcrumbs\n\n\n\
+         def crumbs_for():\n    crumbs = Breadcrumbs()\n    crumbs.add_breadcrumb('Home')\n",
+    )
+    .unwrap();
+
+    let project = ProjectId::new("portal");
+
+    index_project(&store, &project, "portal", directory.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let nodes = store.all_nodes(Some(&project)).unwrap();
+    let builder = nodes.iter().find(|node| node.name == "crumbs_for").expect("the builder");
+
+    let callees: Vec<String> = store
+        .callees(&builder.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| node.qualified_name)
+        .collect();
+
+    assert!(
+        callees.iter().any(|name| name.ends_with("BaseTrail.add_breadcrumb")),
+        "a constructed local types its receiver, got {callees:?}",
+    );
+}
+
+#[test]
+fn a_local_built_by_a_factory_takes_the_type_it_returns() {
+    let store = Store::open_in_memory().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+
+    // The factory's return annotation is in another file, and the method it types
+    // the receiver for lives on a base class, so only the link pass can bind this.
+    std::fs::write(
+        directory.path().join("session.py"),
+        "class DemoSession:\n    def narrate(self, line):\n        return line\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("steps.py"),
+        "from session import DemoSession\n\n\n\
+         class Demo(DemoSession):\n    @classmethod\n\
+         \x20   def start(cls) -> Demo:\n        return cls()\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("test_flow.py"),
+        "from steps import Demo\n\n\n\
+         def test_flow():\n    demo = Demo.start()\n    demo.narrate('hello')\n",
+    )
+    .unwrap();
+
+    let project = ProjectId::new("suite");
+
+    index_project(&store, &project, "suite", directory.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let nodes = store.all_nodes(Some(&project)).unwrap();
+    let test = nodes.iter().find(|node| node.name == "test_flow").expect("the test function");
+
+    let callees: Vec<String> = store
+        .callees(&test.id)
+        .unwrap()
+        .into_iter()
+        .filter(|(kind, _)| *kind == EdgeKind::Calls)
+        .map(|(_, node)| node.qualified_name)
+        .collect();
+
+    assert!(
+        callees.iter().any(|name| name.ends_with("DemoSession.narrate")),
+        "a factory-built local reaches the base method of the type it returns, got {callees:?}",
+    );
+}
+
+#[test]
+fn a_local_built_by_a_plain_function_types_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+
+    // Reliability: a lowercase callee says nothing about what it returns, so the
+    // local must stay untyped rather than reach a same-named method by guess. The
+    // method sits in a file the caller neither defines nor imports, so receiver
+    // typing is the only path that could ever reach it.
+    std::fs::write(
+        directory.path().join("models.py"),
+        "class Widget:\n    def frobnicate(self):\n        return 1\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("factory.py"),
+        "from models import Widget\n\n\ndef build_thing():\n    return Widget()\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("views.py"),
+        "from factory import build_thing\n\n\n\
+         def use():\n    thing = build_thing()\n    thing.frobnicate()\n",
+    )
+    .unwrap();
+
+    let project = ProjectId::new("portal");
+
+    index_project(&store, &project, "portal", directory.path()).unwrap();
+    link_constellation(&store).unwrap();
+
+    let nodes = store.all_nodes(Some(&project)).unwrap();
+    let user = nodes.iter().find(|node| node.name == "use").expect("the calling function");
+
+    let callees: Vec<String> = store
+        .callees(&user.id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, node)| node.qualified_name)
+        .collect();
+
+    assert!(
+        !callees.iter().any(|name| name.ends_with("Widget.frobnicate")),
+        "an unannotated plain-function result types no receiver, got {callees:?}",
+    );
+}
+
+/// A workspace whose collaborators inherit the called method from bases the
+/// calling file neither defines nor imports, so generic name resolution has no
+/// path to them and only a typed attribute reaches one. `presenter_body` is the
+/// class body under test. Backs the constructor-attribute typing tests.
+fn attribute_typing_workspace(store: &Store, presenter_body: &str) -> tempfile::TempDir {
+    let directory = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        directory.path().join("bases.py"),
+        "class CameraBase:\n    def use_page(self, page):\n        return page\n\n\n\
+         class OverlayBase:\n    def use_page(self, page):\n        return page\n",
+    )
+    .unwrap();
+
+    std::fs::write(
+        directory.path().join("parts.py"),
+        "from bases import CameraBase, OverlayBase\n\n\n\
+         class Camera(CameraBase):\n    pass\n\n\n\
+         class Overlay(OverlayBase):\n    pass\n",
+    )
+    .unwrap();
+
+    std::fs::write(directory.path().join("presenter.py"), presenter_body).unwrap();
+
+    let project = ProjectId::new("suite");
+
+    index_project(store, &project, "suite", directory.path()).unwrap();
+    link_constellation(store).unwrap();
+
+    directory
+}
+
+/// The names of everything `Presenter.attach` calls in the indexed workspace.
+fn attach_callees(store: &Store) -> Vec<String> {
+    let nodes = store.all_nodes(Some(&ProjectId::new("suite"))).unwrap();
+
+    let caller = nodes
+        .iter()
+        .find(|node| node.qualified_name.ends_with("Presenter.attach"))
+        .expect("the presenter method");
+
+    store
+        .callees(&caller.id)
+        .unwrap()
+        .into_iter()
+        .map(|(_, node)| node.qualified_name)
+        .collect()
+}
+
+#[test]
+fn an_attribute_the_constructor_assigns_types_its_receiver() {
+    let store = Store::open_in_memory().unwrap();
+
+    // Two collaborators inherit the same method name, so only the attribute's own
+    // type can tell `self._camera` from `self._overlay`.
+    attribute_typing_workspace(
+        &store,
+        "from parts import Camera, Overlay\n\n\n\
+         class Presenter:\n    def __init__(self):\n        \
+         self._camera = Camera()\n        self._overlay = Overlay()\n\n    \
+         def attach(self, page):\n        self._overlay.use_page(page)\n",
+    );
+
+    let callees = attach_callees(&store);
+
+    assert!(
+        callees.iter().any(|name| name.ends_with("OverlayBase.use_page")),
+        "a constructor-assigned attribute types its receiver, got {callees:?}",
+    );
+
+    assert!(
+        !callees.iter().any(|name| name.ends_with("CameraBase.use_page")),
+        "and never binds the sibling collaborator's same-named method, got {callees:?}",
+    );
+}
+
+#[test]
+fn an_attribute_handed_in_annotated_takes_that_type() {
+    let store = Store::open_in_memory().unwrap();
+
+    // `self._sink = sink` carries no type of its own; the annotation is on the
+    // parameter it was handed, which is where most collaborators come from.
+    attribute_typing_workspace(
+        &store,
+        "from parts import Overlay\n\n\n\
+         class Presenter:\n    def __init__(self, sink: Overlay) -> None:\n        \
+         self._sink = sink\n\n    \
+         def attach(self, page):\n        self._sink.use_page(page)\n",
+    );
+
+    let callees = attach_callees(&store);
+
+    assert!(
+        callees.iter().any(|name| name.ends_with("OverlayBase.use_page")),
+        "an attribute handed in as an annotated parameter types its receiver, got {callees:?}",
+    );
+}
+
+#[test]
+fn an_attribute_two_methods_disagree_about_types_nothing() {
+    let store = Store::open_in_memory().unwrap();
+
+    // Reliability: one attribute assigned two different types means the graph
+    // cannot say which a call reaches, so it must bind neither.
+    attribute_typing_workspace(
+        &store,
+        "from parts import Camera, Overlay\n\n\n\
+         class Presenter:\n    def __init__(self):\n        self._sink = Camera()\n\n    \
+         def swap(self):\n        self._sink = Overlay()\n\n    \
+         def attach(self, page):\n        self._sink.use_page(page)\n",
+    );
+
+    let callees = attach_callees(&store);
+
+    assert!(
+        !callees.iter().any(|name| name.ends_with("use_page")),
+        "a contradictory attribute types nothing, got {callees:?}",
+    );
+}

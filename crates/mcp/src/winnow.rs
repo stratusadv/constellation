@@ -627,8 +627,14 @@ pub enum Rank {
 
 impl Rank {
     /// The rank axes, for the error message that lists the valid values.
-    pub const ALL: [Rank; 6] =
-        [Rank::Callers, Rank::Churn, Rank::Criticality, Rank::Lines, Rank::Name, Rank::Risk];
+    pub const ALL: [Rank; 6] = [
+        Rank::Callers,
+        Rank::Churn,
+        Rank::Criticality,
+        Rank::Lines,
+        Rank::Name,
+        Rank::Risk,
+    ];
 
     /// The label a caller passes.
     pub fn as_str(self) -> &'static str {

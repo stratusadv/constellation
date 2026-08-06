@@ -16,14 +16,18 @@ Windows:
 
     winget install stratusadv.constellation
 
-Linux (x86_64), from the release tarball:
+Linux (x86_64), one command:
+
+    curl -fsSL https://raw.githubusercontent.com/stratusadv/constellation/main/assets/install.sh | sh
+
+That fetches the latest release, verifies its checksum, puts the binary in `~/.local/bin`, appends that directory to your shell's startup file so it stays on `PATH`, and runs `constellation install`. Set `CONSTELLATION_INSTALL_DIR` to install somewhere else. The script is [assets/install.sh](assets/install.sh), short enough to read before piping it to a shell, and the same four steps by hand are:
 
     curl -LO https://github.com/stratusadv/constellation/releases/latest/download/constellation-x86_64-unknown-linux-gnu.tar.gz
     tar -xzf constellation-x86_64-unknown-linux-gnu.tar.gz
     install -Dm755 constellation-x86_64-unknown-linux-gnu/constellation ~/.local/bin/constellation
-    constellation install
+    ~/.local/bin/constellation install
 
-The Windows installer registers the MCP server for you; on Linux that last line does it. Either way the server is registered with Claude Code, Codex, and OpenCode, and Grok Build discovers the configured server on its own. Make sure `~/.local/bin` is on your `PATH`, then index each repository:
+The Windows installer registers the MCP server for you; on Linux that last line does it. Either way the server is registered with Claude Code, Codex, and OpenCode, and Grok Build discovers the configured server on its own. By hand, make sure `~/.local/bin` is on your `PATH`. Then index each repository:
 
     constellation init
 
@@ -33,7 +37,7 @@ Update:
 
     winget upgrade stratusadv.constellation
 
-On Linux, take the newer tarball, or rebuild from source as below. The published binary links against glibc 2.35, so it runs on Ubuntu 22.04+, Debian 12+, Fedora 36+, and anything newer; on an older or musl-based distribution, build from source instead.
+On Linux, run the same install command again. It renames the new binary into place rather than writing over the old one, so a `serve` already running keeps its own copy and the replacement is picked up the next time a client starts one. The published binary links against glibc 2.35, so it runs on Ubuntu 22.04+, Debian 12+, Fedora 36+, and anything newer; on an older or musl-based distribution, build from source instead.
 
 ## What it indexes
 

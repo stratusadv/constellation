@@ -23,6 +23,7 @@ workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+toml.workspace = true
 
 [build-dependencies]
 ico.workspace = true

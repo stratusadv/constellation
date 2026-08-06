@@ -1,9 +1,9 @@
-# The CI fixture goldset.
+# The fixture goldset.
 #
-# Deliberately small and deliberately easy: this is a regression gate, not a
+# Deliberately small and deliberately easy: this is a regression check, not a
 # capability measurement. Every question here must be answerable by a correct
-# index of the fixture the workflow builds, so a failure means something broke
-# rather than something is hard.
+# index of the fixture committed under eval/fixture, so a failure means
+# something broke rather than something is hard.
 #
 # The real goldsets, against real repositories, live beside this file and are
 # run by hand. See eval/goldsets/example.toml for their shape.

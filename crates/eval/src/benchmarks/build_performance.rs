@@ -68,8 +68,12 @@ pub fn run(context: &Context<'_>) -> Vec<BenchmarkRow> {
 /// other kinds are counted too, but they are the general symbol total the `nodes`
 /// row already carries.
 fn django_surface_rows(counts: &[(NodeKind, u32)]) -> Vec<BenchmarkRow> {
-    const SURFACE: [NodeKind; 4] =
-        [NodeKind::Model, NodeKind::View, NodeKind::Route, NodeKind::Template];
+    const SURFACE: [NodeKind; 4] = [
+        NodeKind::Model,
+        NodeKind::View,
+        NodeKind::Route,
+        NodeKind::Template,
+    ];
 
     counts
         .iter()

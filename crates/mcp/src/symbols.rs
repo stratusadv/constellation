@@ -5,7 +5,7 @@
 //! made once here rather than re-made per tool.
 
 use constellation_graph::{
-    Language, Node, NodeKind,
+    Language, Node, NodeKind, Profile,
     is_framework_reached, is_test_path,
 };
 
@@ -16,12 +16,53 @@ use constellation_graph::{
 /// `data.get()` appear thousands of times with no statically-bound receiver, so a
 /// model method named `save` would otherwise report every `.save()` in the
 /// constellation as its dark callers.
+///
+/// The list shares most of its names with `constellation_resolution::QUERYSET_BUILTINS`
+/// without being it: that one bars a name from the resolver's by-name path, this one
+/// calls a name's dark-caller count noise. They are kept apart deliberately, and the
+/// cost of that is a name added here is not a name added there, so both are worth a
+/// look when either changes.
 const DISPATCH_METHOD_NAMES: &[&str] = &[
-    "add", "aggregate", "all", "annotate", "append", "bulk_create", "bulk_update", "clean",
-    "clean_fields", "count", "create", "defer", "delete", "distinct", "exclude", "exists",
-    "extend", "filter", "first", "full_clean", "get", "get_or_create", "items", "keys", "last",
-    "latest", "none", "only", "order_by", "pop", "prefetch_related", "refresh_from_db", "remove",
-    "save", "select_related", "setdefault", "update", "update_or_create", "values", "values_list",
+    "add",
+    "aggregate",
+    "all",
+    "annotate",
+    "append",
+    "bulk_create",
+    "bulk_update",
+    "clean",
+    "clean_fields",
+    "count",
+    "create",
+    "defer",
+    "delete",
+    "distinct",
+    "exclude",
+    "exists",
+    "extend",
+    "filter",
+    "first",
+    "full_clean",
+    "get",
+    "get_or_create",
+    "items",
+    "keys",
+    "last",
+    "latest",
+    "none",
+    "only",
+    "order_by",
+    "pop",
+    "prefetch_related",
+    "refresh_from_db",
+    "remove",
+    "save",
+    "select_related",
+    "setdefault",
+    "update",
+    "update_or_create",
+    "values",
+    "values_list",
 ];
 
 /// Whether a symbol name is a codebase-wide dynamic-dispatch method, so its
@@ -118,10 +159,11 @@ pub(crate) fn is_coverage_checkable(node: &Node) -> bool {
 /// Whether an edgeless definition is a real dead-code candidate, not a framework hook
 /// that simply has no static caller: tests, migrations, package initializers, dunder
 /// methods, app configs, and a management command's `handle` are excluded. Reads the
-/// one shared definition of the framework-reached set, the same one flow detection
-/// uses as its framework entry-point list.
-pub(crate) fn is_orphan_candidate(node: &Node) -> bool {
-    !is_framework_reached(&node.name, &node.file_path)
+/// one shared definition of the framework-reached set, under the hook names the
+/// workspace's `profile` makes effective, the same set flow detection uses as its
+/// framework entry-point list.
+pub(crate) fn is_orphan_candidate(profile: &Profile, node: &Node) -> bool {
+    !is_framework_reached(profile, &node.name, &node.file_path)
 }
 
 /// A field's type suffix (e.g. " - CharField(max_length=200)") built from its

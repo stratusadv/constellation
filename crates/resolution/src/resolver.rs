@@ -49,6 +49,14 @@ pub const TYPED_RECEIVER: &str = "\u{1}typed-receiver";
 /// model's service among the many that define the same method name.
 pub const SERVICE_DISPATCH: &str = "\u{1}service-dispatch";
 
+/// The prefix a [`TYPED_RECEIVER`] candidate carries when the receiver's type is
+/// not written in the file but is whatever a call returns (`demo = Demo.start(...)`
+/// makes `demo` a `Demo`). The callee's dotted text follows it. Generic resolution
+/// cannot follow one: the callee's return annotation lives with the callee, in
+/// another file and often another project, so only the link pass, which holds
+/// every project's `returns` edges, turns it into a class.
+pub const RETURNS_OF: &str = "\u{1}returns-of:";
+
 /// The sentinel candidate on a `ContextType` reference whose variable is a
 /// *collection* of the model: a queryset (`Model.objects.filter(...)`) or a
 /// `get_list_or_404`, not a single instance. The template member synthesis types
@@ -60,19 +68,60 @@ pub const COLLECTION_CONTEXT: &str = "\u{1}collection-context";
 /// The base service method names dispatched on every model through the external base
 /// service (`obj.services.save_model_obj()`). The base defines them, so binding by
 /// a sole local override would false-attribute every model's call to whichever app
-/// service happens to override it. Dropped from dispatch.
+/// service happens to override it. Barred from the by-name path only: a call that
+/// names its receiving model resolves through that model's own service, which is
+/// evidence rather than uniqueness.
 const SERVICE_BUILTINS: &[&str] = &["save_model_obj", "save_model_objs"];
 
 /// The Django QuerySet/Manager builtin method names, dispatched dynamically by
-/// Django with no project-local definition to bind to. Filtered out so a
-/// builtin like `order_by` never binds to some app's custom queryset that
-/// overrides it (the C-1 false-edge class).
+/// Django with no project-local definition to bind to. Barred from the by-name
+/// path so a builtin like `order_by` never binds to some app's custom queryset
+/// that overrides it (the C-1 false-edge class); a model-scoped call still binds
+/// to that model's own queryset, where an override is the definition that runs.
+///
+/// The list shares most of its names with the `mcp` crate's `DISPATCH_METHOD_NAMES`
+/// without being it: that one calls a name's dark-caller count noise, this one bars a
+/// name from the by-name path. They are kept apart deliberately, and the cost of that
+/// is a name added here is not a name added there, so both are worth a look when
+/// either changes.
 pub const QUERYSET_BUILTINS: &[&str] = &[
-    "aggregate", "all", "annotate", "bulk_create", "bulk_update", "contains", "count", "create",
-    "defer", "delete", "difference", "distinct", "earliest", "exclude", "exists", "filter",
-    "first", "get", "get_or_create", "in_bulk", "intersection", "iterator", "last", "latest",
-    "none", "only", "order_by", "prefetch_related", "raw", "reverse", "select_related", "union",
-    "update", "update_or_create", "using", "values", "values_list",
+    "aggregate",
+    "all",
+    "annotate",
+    "bulk_create",
+    "bulk_update",
+    "contains",
+    "count",
+    "create",
+    "defer",
+    "delete",
+    "difference",
+    "distinct",
+    "earliest",
+    "exclude",
+    "exists",
+    "filter",
+    "first",
+    "get",
+    "get_or_create",
+    "in_bulk",
+    "intersection",
+    "iterator",
+    "last",
+    "latest",
+    "none",
+    "only",
+    "order_by",
+    "prefetch_related",
+    "raw",
+    "reverse",
+    "select_related",
+    "union",
+    "update",
+    "update_or_create",
+    "using",
+    "values",
+    "values_list",
 ];
 
 /// A fail-fast bound on directory depth compared between two paths, far past any
@@ -658,14 +707,17 @@ fn resolve_queryset_method(
 ) -> Option<ResolvedRef> {
     assert!(!reference.reference_name.is_empty(), "queryset method name must not be empty");
 
-    if QUERYSET_BUILTINS.contains(&reference.reference_name.as_str()) {
-        return None;
-    }
-
     let mut candidates = context.nodes_by_name(&reference.reference_name);
     candidates.retain(|node| node.kind == NodeKind::Method && owner_is_manager(&node.qualified_name));
 
-    if candidates.len() == 1 {
+    // A builtin name is dispatched by Django on every queryset in the project, so
+    // the sole project-local definition of it is an override on one unrelated
+    // queryset, not the target: binding by uniqueness alone would false-attribute
+    // every `order_by` in the codebase to it. The model-scoped test below is
+    // different evidence entirely (this model's own queryset), so it still runs.
+    let builtin = QUERYSET_BUILTINS.contains(&reference.reference_name.as_str());
+
+    if !builtin && candidates.len() == 1 {
         let node = candidates.swap_remove(0);
 
         return Some(ResolvedRef::new(reference, node.id.clone(), 0.85, ResolvedBy::Framework));
@@ -757,14 +809,17 @@ fn resolve_service_method(
 ) -> Option<ResolvedRef> {
     assert!(!reference.reference_name.is_empty(), "service method name must not be empty");
 
-    if SERVICE_BUILTINS.contains(&reference.reference_name.as_str()) {
-        return None;
-    }
-
     let mut candidates = context.nodes_by_name(&reference.reference_name);
     candidates.retain(|node| node.kind == NodeKind::Method && owner_is_service(&node.qualified_name));
 
-    if candidates.len() == 1 {
+    // A base method every service inherits (`save_model_obj`) is defined once
+    // upstream and overridden by a handful of app services, so a sole local match
+    // is whichever service happens to override it, not this call's target. The
+    // model-scoped test below names the receiving model's own service, which is
+    // exact evidence rather than uniqueness, so a builtin still resolves there.
+    let builtin = SERVICE_BUILTINS.contains(&reference.reference_name.as_str());
+
+    if !builtin && candidates.len() == 1 {
         let node = candidates.swap_remove(0);
 
         return Some(ResolvedRef::new(reference, node.id.clone(), 0.85, ResolvedBy::Framework));

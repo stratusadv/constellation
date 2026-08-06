@@ -247,7 +247,7 @@ impl ConstellationServer {
         let page = cursor::resolve(args.cursor.as_deref(), generation);
 
         let text = self.with_store_text(|store| {
-            orphans_text(store, args.project.as_deref(), limit, &page, generation)
+            orphans_text(store, &self.profile, args.project.as_deref(), limit, &page, generation)
         })?;
 
         Ok(text_result(text))

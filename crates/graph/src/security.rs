@@ -6,9 +6,29 @@
 /// changed-symbol risk score and the flow criticality score must agree on what
 /// counts as sensitive.
 pub const SECURITY_KEYWORDS: &[&str] = &[
-    "auth", "billing", "credential", "csrf", "decrypt", "encrypt", "escape", "invoice", "login",
-    "logout", "passwd", "password", "payment", "permission", "pickle", "raw_sql", "sanitize",
-    "secret", "session", "signature", "subprocess", "superuser", "token",
+    "auth",
+    "billing",
+    "credential",
+    "csrf",
+    "decrypt",
+    "encrypt",
+    "escape",
+    "invoice",
+    "login",
+    "logout",
+    "passwd",
+    "password",
+    "payment",
+    "permission",
+    "pickle",
+    "raw_sql",
+    "sanitize",
+    "secret",
+    "session",
+    "signature",
+    "subprocess",
+    "superuser",
+    "token",
 ];
 
 /// The [`SECURITY_KEYWORDS`] entry a symbol's name or qualified name contains,

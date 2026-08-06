@@ -15,8 +15,15 @@ use crate::symbols::symbol_role;
 use crate::tools::search::seed_nodes;
 
 /// The labels for the feature-slice groups, indexed by [`feature_category`].
-const FEATURE_LABELS: [&str; 7] =
-    ["routes", "views", "templates", "models", "classes", "functions", "other"];
+const FEATURE_LABELS: [&str; 7] = [
+    "routes",
+    "views",
+    "templates",
+    "models",
+    "classes",
+    "functions",
+    "other",
+];
 
 /// Whether an edge kind extends a feature downstream (followed as
 /// callees): the Django request/data path (routing, rendering, template

@@ -9,16 +9,17 @@ use constellation_graph::{Edge, EdgeKind, Node, NodeId, NodeKind, ProjectId};
 use constellation_linking::{ImportLinker, LinkContext, PendingImport, is_linkable, module_matches};
 use constellation_resolution::{
     ImportMapping,
-    MANAGER_SUFFIXES, QUERYSET_BUILTINS, QUERYSET_DISPATCH, RECEIVER_ROOT,
-    SENTINEL_PREFIX, SUPER_DISPATCH, UnresolvedRef,
+    MANAGER_SUFFIXES, QUERYSET_DISPATCH, RECEIVER_ROOT, RETURNS_OF, SENTINEL_PREFIX,
+    SERVICE_DISPATCH, SERVICE_SUFFIXES, SUPER_DISPATCH, TYPED_RECEIVER, UnresolvedRef,
 };
 use constellation_store::Store;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::IndexError;
+use crate::classes::{ClassIndex, sole_class_named, sole_companion_method, sole_inherited_method};
 use crate::context::ConstellationContext;
-use crate::limits::{OVERRIDE_WALK_MAX, REFERENCE_COUNT_MAX};
-use crate::paths::{class_name_of, file_stem_is, package_root_name, template_owner};
+use crate::limits::REFERENCE_COUNT_MAX;
+use crate::paths::{class_name_of, file_stem_is, package_root_name, project_prefix, template_owner};
 use crate::synthesize::external::EXTERNAL_TEMPLATE_MARKER;
 use crate::synthesize::overrides::method_owner_id;
 
@@ -51,7 +52,7 @@ pub fn link_constellation(store: &Store) -> Result<u32, IndexError> {
     let redirects = external_redirects(&nodes, &reference_only, &package_to_project);
     let template_overrides = template_override_edges(&nodes, &reference_only);
 
-    let context = ConstellationContext::new(nodes, &reference_only, package_to_project);
+    let context = ConstellationContext::new(nodes, &reference_only, package_to_project.clone());
     let pending = store.load_unresolved(None)?;
     let linker = ImportLinker;
 
@@ -115,7 +116,7 @@ pub fn link_constellation(store: &Store) -> Result<u32, IndexError> {
 
     // Only now does every class point at its real base, including the ones a
     // companion package defines, so an inherited call can finally be bound.
-    let inherited = link_inherited_methods(store)?;
+    let inherited = link_inherited_methods(store, &package_to_project)?;
 
     // Every resolution, linking, and synthesis pass has now emitted its edges. The
     // external-synthesis and synthesized-edge passes write in bulk and never delete
@@ -151,7 +152,10 @@ pub fn link_constellation(store: &Store) -> Result<u32, IndexError> {
 /// ancestor depth that defines the name and binds only when that depth holds
 /// exactly one definition, so a diamond whose two branches both define a method
 /// stays pending.
-fn link_inherited_methods(store: &Store) -> Result<u32, IndexError> {
+fn link_inherited_methods(
+    store: &Store,
+    package_to_project: &FxHashMap<String, String>,
+) -> Result<u32, IndexError> {
     let pending = store.load_unresolved(None)?;
 
     if pending.is_empty() {
@@ -163,6 +167,7 @@ fn link_inherited_methods(store: &Store) -> Result<u32, IndexError> {
     let classes = store.class_identities()?;
     let callables = store.callable_identities()?;
     let fields = store.field_relations()?;
+    let returns = store.returns_edges(None)?;
 
     let mut imports: FxHashMap<(String, String), Vec<ImportMapping>> = FxHashMap::default();
 
@@ -175,7 +180,7 @@ fn link_inherited_methods(store: &Store) -> Result<u32, IndexError> {
         }
     }
 
-    let graph = ClassIndex::build(&extends, &methods, &classes, &callables, &fields);
+    let graph = ClassIndex::build(&extends, &methods, &classes, &callables, &fields, &returns);
     let reverse = reverse_accessor_map(&pending);
 
     let mut bound: Vec<(i64, Edge)> = Vec::new();
@@ -186,8 +191,9 @@ fn link_inherited_methods(store: &Store) -> Result<u32, IndexError> {
 
         assert!(seen <= REFERENCE_COUNT_MAX, "inheritance walk exceeded {REFERENCE_COUNT_MAX} refs");
 
-        let target = inherited_call_target(reference, &graph)
-            .or_else(|| receiver_typed_target(reference, &graph, &imports, &reverse));
+        let target = inherited_call_target(reference, &graph).or_else(|| {
+            receiver_typed_target(reference, &graph, &imports, &reverse, package_to_project)
+        });
 
         let Some(target) = target else {
             continue;
@@ -213,23 +219,6 @@ fn link_inherited_methods(store: &Store) -> Result<u32, IndexError> {
     Ok(store.commit_resolved(&bound)?)
 }
 
-/// The class hierarchy and callable pool an inheritance or receiver walk reads,
-/// built once per link and borrowed by every lookup so no pass rebuilds it.
-struct ClassIndex<'graph> {
-    /// The base class ids of each subclass id.
-    bases: FxHashMap<&'graph str, Vec<&'graph str>>,
-    /// The method id for each (owning class id, method name) pair.
-    by_owner: FxHashMap<(&'graph str, &'graph str), &'graph str>,
-    /// The class id for each class qualified name.
-    by_qualified: FxHashMap<&'graph str, &'graph str>,
-    /// The class ids for each class simple name.
-    by_name: FxHashMap<&'graph str, Vec<&'graph str>>,
-    /// The (id, defining file path) for each callable simple name.
-    callables: FxHashMap<&'graph str, Vec<(&'graph str, &'graph str)>>,
-    /// The model each (owning model id, field name) pair relates to.
-    field_types: FxHashMap<(&'graph str, &'graph str), &'graph str>,
-}
-
 /// The target a call whose receiver is a bare imported name resolves to, or
 /// `None` when the receiver cannot be typed or more than one target answers.
 ///
@@ -253,6 +242,7 @@ fn receiver_typed_target<'graph>(
     graph: &ClassIndex<'graph>,
     imports: &FxHashMap<(String, String), Vec<ImportMapping>>,
     reverse: &FxHashMap<(&str, &str), &'graph str>,
+    package_to_project: &FxHashMap<String, String>,
 ) -> Option<&'graph str> {
     if reference.reference_kind != EdgeKind::Calls {
         return None;
@@ -287,6 +277,35 @@ fn receiver_typed_target<'graph>(
             .get(&(class, name))
             .copied()
             .or_else(|| sole_inherited_method(class, name, &graph.bases, &graph.by_owner));
+    }
+
+    receiver_import_target(binding, receiver, name, graph, package_to_project)
+}
+
+/// The target a call resolves to when its receiver names the import binding
+/// itself rather than a class or a relation: an aliased package, or a module
+/// inside the package the import names. `None` when no callable of the name sits
+/// where the receiver says it does, or when more than one answers. Backs
+/// [`receiver_typed_target`], which keeps the branching and hands the two import
+/// shapes here.
+fn receiver_import_target<'graph>(
+    binding: &ImportMapping,
+    receiver: &str,
+    name: &str,
+    graph: &ClassIndex<'graph>,
+    package_to_project: &FxHashMap<String, String>,
+) -> Option<&'graph str> {
+    assert!(!binding.source.is_empty(), "an import binding names its source module");
+    assert!(!receiver.is_empty(), "a receiver-typed reference carries its receiver");
+
+    // The receiver aliases a whole package (`import django_glue as dg`), so it
+    // stands for the package root rather than a module inside it: the module test
+    // below would look for a `dg.py` that does not exist. When an indexed project
+    // owns that package, the call is a cross-project one and the package pins the
+    // project; take its sole callable of the name, the same package-evidence rule
+    // the import linker applies when a path suffix cannot be compared.
+    if binding.is_namespace {
+        return sole_package_callable(&binding.source, name, graph, package_to_project);
     }
 
     // The receiver names a module: take the callable of that name defined in it.
@@ -392,13 +411,32 @@ fn reverse_accessor_map(pending: &[(i64, UnresolvedRef)]) -> FxHashMap<(&str, &s
     claims.into_iter().filter_map(|(key, owner)| owner.map(|owner| (key, owner))).collect()
 }
 
-/// The id of the sole class named `name`, or `None` when the constellation holds
-/// none or several: an ambiguous class name types no receiver.
-fn sole_class_named<'graph>(name: &str, graph: &ClassIndex<'graph>) -> Option<&'graph str> {
-    let classes = graph.by_name.get(name)?;
+/// The id of the sole callable named `name` inside the project that owns
+/// `package`, or `None` when no indexed project owns it or more than one of its
+/// callables answers. The package-to-project map is keyed by the installed
+/// package directory name an import spells (`django_glue`), so a companion
+/// indexed rooted at that package (its file paths carry no package prefix) is
+/// still identified.
+fn sole_package_callable<'graph>(
+    package: &str,
+    name: &str,
+    graph: &ClassIndex<'graph>,
+    package_to_project: &FxHashMap<String, String>,
+) -> Option<&'graph str> {
+    assert!(!name.is_empty(), "a call reference names a callable");
 
-    match classes.as_slice() {
-        [only] => Some(only),
+    let root = package.split('.').next().unwrap_or(package);
+    let project = package_to_project.get(root)?;
+
+    let mut matched = graph
+        .callables
+        .get(name)
+        .into_iter()
+        .flatten()
+        .filter(|(id, _file_path)| project_prefix(id) == project.as_str());
+
+    match (matched.next(), matched.next()) {
+        (Some((id, _)), None) => Some(id),
         _ => None,
     }
 }
@@ -411,7 +449,7 @@ fn inherited_call_target<'graph>(
     graph: &ClassIndex<'graph>,
 ) -> Option<&'graph str> {
     let (bases, by_owner) = (&graph.bases, &graph.by_owner);
-    let (by_qualified, by_name) = (&graph.by_qualified, &graph.by_name);
+    let by_qualified = &graph.by_qualified;
 
     if reference.reference_kind != EdgeKind::Calls {
         return None;
@@ -422,8 +460,13 @@ fn inherited_call_target<'graph>(
     assert!(!name.is_empty(), "a call reference names a method");
 
     let sentinel = reference.candidates.first().map(String::as_str);
+
+    // The candidate carrying the dispatch's subject: a class or model name, or the
+    // `RETURNS_OF` form naming the callee whose return type the subject is. Every
+    // other sentinel is routing data, not a subject.
     let trailing = reference.candidates.iter().find(|candidate| {
-        !candidate.is_empty() && !candidate.starts_with(SENTINEL_PREFIX)
+        !candidate.is_empty()
+            && (!candidate.starts_with(SENTINEL_PREFIX) || candidate.starts_with(RETURNS_OF))
     })?;
 
     match sentinel {
@@ -433,11 +476,26 @@ fn inherited_call_target<'graph>(
             sole_inherited_method(class, name, bases, by_owner)
         }
         Some(QUERYSET_DISPATCH) => {
-            if QUERYSET_BUILTINS.contains(&name) {
-                return None;
-            }
+            sole_companion_method(trailing, name, MANAGER_SUFFIXES, graph)
+        }
+        Some(SERVICE_DISPATCH) => {
+            sole_companion_method(trailing, name, SERVICE_SUFFIXES, graph)
+        }
+        Some(TYPED_RECEIVER) => {
+            // The receiver's type names a class the constellation indexes; the
+            // method is that class's own, a single ancestor's, or, when the type is
+            // a model, one on the queryset its manager dispatches through. The
+            // own-class case is the resolver's, but only within the class's *own*
+            // project, so a type defined in a companion still arrives here.
+            let class = graph.receiver_class(trailing)?;
 
-            sole_manager_method(trailing, name, bases, by_owner, by_name)
+            by_owner
+                .get(&(class, name))
+                .copied()
+                .or_else(|| sole_inherited_method(class, name, bases, by_owner))
+                .or_else(|| {
+                    sole_companion_method(class_name_of(class), name, MANAGER_SUFFIXES, graph)
+                })
         }
         Some(candidate) if !candidate.starts_with(SENTINEL_PREFIX) => {
             let class = by_qualified.get(candidate)?;
@@ -452,96 +510,6 @@ fn inherited_call_target<'graph>(
         }
         _ => None,
     }
-}
-
-/// The sole method named `name` reachable from the queryset and manager classes
-/// Django's convention gives `model`, taking a class's own definition over an
-/// inherited one. `None` when the model names no such class, or when two of them
-/// reach different definitions.
-fn sole_manager_method<'graph>(
-    model: &str,
-    name: &str,
-    bases: &FxHashMap<&'graph str, Vec<&'graph str>>,
-    by_owner: &FxHashMap<(&'graph str, &'graph str), &'graph str>,
-    by_name: &FxHashMap<&str, Vec<&'graph str>>,
-) -> Option<&'graph str> {
-    assert!(!model.is_empty(), "a dispatch reference names a model");
-
-    let mut owner_name = String::new();
-    let mut found: Option<&'graph str> = None;
-
-    for suffix in MANAGER_SUFFIXES {
-        owner_name.clear();
-        owner_name.push_str(model);
-        owner_name.push_str(suffix);
-
-        for owner in by_name.get(owner_name.as_str()).into_iter().flatten() {
-            let target = by_owner
-                .get(&(*owner, name))
-                .copied()
-                .or_else(|| sole_inherited_method(owner, name, bases, by_owner));
-
-            match (target, found) {
-                (Some(target), None) => found = Some(target),
-                (Some(target), Some(previous)) if target != previous => return None,
-                _ => {}
-            }
-        }
-    }
-
-    found
-}
-
-/// The id of the method named `name` on the shallowest ancestor depth of `class`
-/// that defines it. `None` when no ancestor defines it, or when that depth holds
-/// more than one definition: an ambiguous diamond binds to neither branch rather
-/// than to whichever the walk reached first. A visited set and a hard hop bound
-/// make a cyclic hierarchy terminate.
-fn sole_inherited_method<'graph>(
-    class: &str,
-    name: &str,
-    bases: &FxHashMap<&'graph str, Vec<&'graph str>>,
-    by_owner: &FxHashMap<(&'graph str, &'graph str), &'graph str>,
-) -> Option<&'graph str> {
-    let mut level: Vec<&'graph str> = bases.get(class).cloned()?;
-    let mut visited: FxHashSet<&str> = FxHashSet::default();
-    let mut next: Vec<&'graph str> = Vec::new();
-    let mut hops: u32 = 0;
-
-    visited.insert(class);
-
-    while !level.is_empty() {
-        hops += 1;
-
-        assert!(hops <= OVERRIDE_WALK_MAX, "inheritance walk exceeded {OVERRIDE_WALK_MAX} hops");
-
-        let mut found: Option<&'graph str> = None;
-
-        for ancestor in &level {
-            if !visited.insert(ancestor) {
-                continue;
-            }
-
-            match (by_owner.get(&(*ancestor, name)).copied(), found) {
-                (Some(method), None) => found = Some(method),
-                (Some(method), Some(previous)) if method != previous => return None,
-                _ => {}
-            }
-
-            if let Some(above) = bases.get(ancestor) {
-                next.extend_from_slice(above);
-            }
-        }
-
-        if found.is_some() {
-            return found;
-        }
-
-        std::mem::swap(&mut level, &mut next);
-        next.clear();
-    }
-
-    None
 }
 
 /// The cross-project template overrides: a workspace's vendored copy of a namespaced
@@ -813,71 +781,5 @@ fn canonical_template<'nodes>(
     match (owned.next(), owned.next()) {
         (Some(definition), None) => Some(definition),
         _ => None,
-    }
-}
-
-impl<'graph> ClassIndex<'graph> {
-    pub(crate) fn build(
-        extends: &'graph [(String, String)],
-        methods: &'graph [(String, String)],
-        classes: &'graph [(String, String, String)],
-        callables: &'graph [(String, String, String)],
-        fields: &'graph [(String, String)],
-    ) -> Self {
-        let mut bases: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
-
-        for (subclass, base) in extends {
-            bases.entry(subclass.as_str()).or_default().push(base.as_str());
-        }
-
-        let mut by_owner: FxHashMap<(&str, &str), &str> = FxHashMap::default();
-
-        for (id, name) in methods {
-            if let Some(owner) = method_owner_id(id) {
-                by_owner.insert((owner, name.as_str()), id.as_str());
-            }
-        }
-
-        let mut by_qualified: FxHashMap<&str, &str> = FxHashMap::default();
-        let mut by_name: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
-
-        for (id, qualified_name, name) in classes {
-            by_qualified.insert(qualified_name.as_str(), id.as_str());
-            by_name.entry(name.as_str()).or_default().push(id.as_str());
-        }
-
-        let mut by_callable: FxHashMap<&str, Vec<(&str, &str)>> = FxHashMap::default();
-
-        for (id, name, file_path) in callables {
-            by_callable.entry(name.as_str()).or_default().push((id.as_str(), file_path.as_str()));
-        }
-
-        let mut field_types: FxHashMap<(&str, &str), &str> = FxHashMap::default();
-
-        for (id, related) in fields {
-            if let Some((owner, field)) = id.rsplit_once('.') {
-                field_types.insert((owner, field), related.as_str());
-            }
-        }
-
-        Self { bases, by_owner, by_qualified, by_name, callables: by_callable, field_types }
-    }
-
-    /// The sole method named `name` callable on `model`: the model's own method,
-    /// or one on the single queryset or manager class Django's naming convention
-    /// gives it (its own or inherited). `None` when nothing or more than one
-    /// definition answers.
-    pub(crate) fn model_method(&self, model: &str, name: &str) -> Option<&'graph str> {
-        let class = sole_class_named(model, self)?;
-
-        if let Some(method) = self.by_owner.get(&(class, name)) {
-            return Some(method);
-        }
-
-        if let Some(method) = sole_inherited_method(class, name, &self.bases, &self.by_owner) {
-            return Some(method);
-        }
-
-        sole_manager_method(model, name, &self.bases, &self.by_owner, &self.by_name)
     }
 }

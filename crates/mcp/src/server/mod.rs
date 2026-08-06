@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use constellation_graph::{EdgeKind, Node, NodeKind};
+use constellation_graph::{EdgeKind, Node, NodeKind, Profile};
 use constellation_store::{READERS_MAX, Store, StoreError, StorePool};
 use rmcp::model::CallToolResult;
 use rmcp::{ErrorData, ServiceExt, transport::stdio};
@@ -191,6 +191,11 @@ pub struct ConstellationServer {
     /// concurrent. There is no outer lock because the pool is fixed at
     /// construction and every connection inside it is `query_only`.
     store: Arc<Option<StorePool>>,
+    /// The workspace's company conventions, read once from its
+    /// `.constellation/config.toml` at startup. Query-time judgment reads it:
+    /// which names the framework reaches, and so which edgeless definition is
+    /// really dead code.
+    profile: Arc<Profile>,
     explore_cache: Arc<Mutex<Option<Arc<ExploreCache>>>>,
     generation: Arc<AtomicU64>,
     /// The last few tool names, so a hint can suggest review follow-ups during
@@ -206,19 +211,22 @@ pub struct ConstellationServer {
 
 impl ConstellationServer {
     /// The server for the database at `path`, reading through a pool sized to
-    /// the host. The form [`serve`] uses.
+    /// the host, under the profile that database's workspace configures. The
+    /// form [`serve`] uses.
     pub fn open(path: &Path) -> Result<Self, McpError> {
         let pool = StorePool::open(path, reader_count())?;
+        let profile = constellation_index::load_profile_for_database(path);
 
-        Ok(Self::with_pool(Some(pool)))
+        Ok(Self::with_pool(Some(pool), profile))
     }
 
-    /// A new server wrapping the given store.
+    /// A new server wrapping the given store, under the default profile.
     ///
     /// Reads through a pool of one, since the caller already owns the
-    /// connection. [`ConstellationServer::open`] is the concurrent form.
+    /// connection. [`ConstellationServer::open`] is the concurrent form, and the
+    /// only one that can locate a workspace config to read a profile from.
     pub fn new(store: Store) -> Self {
-        Self::with_pool(Some(StorePool::single(store)))
+        Self::with_pool(Some(StorePool::single(store)), Profile::default())
     }
 
     /// A server with no database: it completes the MCP handshake and answers
@@ -226,12 +234,13 @@ impl ConstellationServer {
     /// [`serve_unavailable`] when `serve` is launched outside any indexed project,
     /// so a global registration stays quiet in non-Django repos instead of erroring.
     pub fn unavailable() -> Self {
-        Self::with_pool(None)
+        Self::with_pool(None, Profile::default())
     }
 
-    fn with_pool(store: Option<StorePool>) -> Self {
+    fn with_pool(store: Option<StorePool>, profile: Profile) -> Self {
         Self {
             store: Arc::new(store),
+            profile: Arc::new(profile),
             explore_cache: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
             intent: Arc::new(Mutex::new(hints::SessionIntent::new())),

@@ -197,7 +197,9 @@ fn orphans() {
 
     let scope = Some(fixture.shop.as_str());
 
-    let text = orphans_text(&fixture.store, scope, LIMIT, &first(), GENERATION)
+    let profile = constellation_graph::Profile::default();
+
+    let text = orphans_text(&fixture.store, &profile, scope, LIMIT, &first(), GENERATION)
         .expect("rendering orphans");
 
     insta::assert_snapshot!("orphans", fixture.render(&text));

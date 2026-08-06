@@ -5,7 +5,7 @@
 use std::fmt::Write;
 
 use constellation_graph::{
-    EdgeKind, Node, NodeId, NodeKind, is_covering_ref, is_test_path,
+    EdgeKind, Node, NodeId, NodeKind, Profile, is_covering_ref, is_test_path,
 };
 use constellation_store::{Store, StoreError};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -231,11 +231,13 @@ pub fn subclasses_text(
 
 /// The candidate dead code in one project: definitions with no incoming edge but
 /// structural containment, after dropping framework-reached symbols that legitimately
-/// lack a static caller. Scoped to one project; over-fetched then path/name-filtered so
-/// `limit` rows of real candidates come back.
+/// lack a static caller, as the workspace's `profile` defines that set. Scoped to one
+/// project; over-fetched then path/name-filtered so `limit` rows of real candidates
+/// come back.
 #[doc(hidden)]
 pub fn orphans_text(
     store: &Store,
+    profile: &Profile,
     project: Option<&str>,
     limit: u32,
     page: &cursor::Page,
@@ -260,7 +262,7 @@ pub fn orphans_text(
     let mut candidates: Vec<Node> = Vec::new();
     let mut dispatched: usize = 0;
 
-    for node in fetched.into_iter().filter(is_orphan_candidate) {
+    for node in fetched.into_iter().filter(|node| is_orphan_candidate(profile, node)) {
         // A method reached only through a manager/service descriptor (`.objects.by_pk()`,
         // `.services.x()`) has no static caller edge but does have a dark (unresolved)
         // reference by name: it is dispatched dynamically, not dead. Asked of this

@@ -6,8 +6,8 @@ use constellation_graph::{
     Span, Visibility,
 };
 use constellation_resolution::{
-    COLLECTION_CONTEXT, ImportMapping, QUERYSET_DISPATCH, RECEIVER_ROOT, SERVICE_DISPATCH,
-    SUPER_DISPATCH, TYPED_RECEIVER, UnresolvedRef,
+    COLLECTION_CONTEXT, ImportMapping, QUERYSET_DISPATCH, RECEIVER_ROOT, RETURNS_OF,
+    SERVICE_DISPATCH, SUPER_DISPATCH, TYPED_RECEIVER, UnresolvedRef,
 };
 use rustc_hash::FxHashSet;
 use tree_sitter::{Node as TsNode, Parser};
@@ -139,13 +139,71 @@ const TYPING_NAMES: &[&str] = &[
 /// (`ValueError`, `KeyError`) read as constructors and take the `Instantiates`
 /// path instead, so they are intentionally absent here.
 const CALL_BUILTINS: &[&str] = &[
-    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes", "callable", "chr",
-    "classmethod", "complex", "delattr", "dict", "dir", "divmod", "enumerate", "eval", "exec",
-    "filter", "float", "format", "frozenset", "getattr", "globals", "hasattr", "hash", "hex", "id",
-    "input", "int", "isinstance", "issubclass", "iter", "len", "list", "locals", "map", "max",
-    "memoryview", "min", "next", "object", "oct", "open", "ord", "pow", "print", "property",
-    "range", "repr", "reversed", "round", "set", "setattr", "slice", "sorted", "staticmethod",
-    "str", "sum", "super", "tuple", "type", "vars", "zip",
+    "abs",
+    "all",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "bytearray",
+    "bytes",
+    "callable",
+    "chr",
+    "classmethod",
+    "complex",
+    "delattr",
+    "dict",
+    "dir",
+    "divmod",
+    "enumerate",
+    "eval",
+    "exec",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "globals",
+    "hasattr",
+    "hash",
+    "hex",
+    "id",
+    "input",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "list",
+    "locals",
+    "map",
+    "max",
+    "memoryview",
+    "min",
+    "next",
+    "object",
+    "oct",
+    "open",
+    "ord",
+    "pow",
+    "print",
+    "property",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "setattr",
+    "slice",
+    "sorted",
+    "staticmethod",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+    "vars",
+    "zip",
 ];
 
 /// The decorator names that are Python descriptor builtins or well-known framework
@@ -155,9 +213,21 @@ const CALL_BUILTINS: &[&str] = &[
 /// / `@transaction.atomic` come from test and ORM libraries. A custom decorator
 /// (`@ai`, a project `@action`) is not listed: it can resolve to its definition.
 const DECORATOR_BUILTINS: &[&str] = &[
-    "abstractmethod", "abstractproperty", "atomic", "cached_property", "classmethod", "deleter",
-    "django_db", "final", "fixture", "override", "parametrize", "property", "setter",
-    "staticmethod", "wraps",
+    "abstractmethod",
+    "abstractproperty",
+    "atomic",
+    "cached_property",
+    "classmethod",
+    "deleter",
+    "django_db",
+    "final",
+    "fixture",
+    "override",
+    "parametrize",
+    "property",
+    "setter",
+    "staticmethod",
+    "wraps",
 ];
 
 /// A bound on receiver-chain links walked looking for `.objects`, far past any
@@ -675,10 +745,15 @@ fn handle_function(
     })
 }
 
-/// The type-annotated locals of a function as a scope-shareable map, or `None`
-/// when it has none, so a param-less or untyped function adds no allocation.
+/// The typed locals of a function as a scope-shareable map, or `None` when it has
+/// none, so a param-less untyped function adds no allocation. Two sources, in
+/// precedence order: the parameters the signature annotates, then the locals whose
+/// assignment names their type. A written annotation is the authority, and
+/// [`lookup_type`] takes the first entry for a name, so parameters lead.
 fn typed_locals(bytes: &[u8], def_node: TsNode<'_>) -> Option<Rc<Vec<(String, String)>>> {
-    let pairs = parameter_types(bytes, def_node);
+    let mut pairs = parameter_types(bytes, def_node);
+
+    pairs.extend(assigned_locals(bytes, def_node));
 
     if pairs.is_empty() {
         return None;
@@ -738,11 +813,172 @@ fn class_attribute_types(bytes: &[u8], class_node: TsNode<'_>) -> Option<Rc<Vec<
         }
     }
 
+    pairs.extend(constructed_attribute_types(bytes, body, &pairs));
+
     if pairs.is_empty() {
         return None;
     }
 
     Some(Rc::new(pairs))
+}
+
+/// The attributes a class assigns itself inside its methods (`self.nav =
+/// Navigator(self)`, `self.presenter = Presenter.build(...)`), typed by the same
+/// rules a local assignment is: the class constructed, or the annotated return of
+/// the factory called. Most attributes a class hands its collaborators are never
+/// annotated, so without this every `self.<attr>.method()` on one is dark.
+///
+/// A name the class body already declares is skipped, the written annotation being
+/// the authority. A name two methods assign different types to is dropped
+/// entirely: an attribute that means two things types nothing rather than bind
+/// calls to whichever assignment the walk reached first.
+fn constructed_attribute_types(
+    bytes: &[u8],
+    body: TsNode<'_>,
+    declared: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+    let mut conflicted: FxHashSet<String> = FxHashSet::default();
+    let mut cursor = body.walk();
+    let mut count: u32 = 0;
+
+    for method in body.named_children(&mut cursor) {
+        count += 1;
+
+        assert!(count <= CHILDREN_MAX, "class-body fan-out exceeded {CHILDREN_MAX}");
+
+        let method = match method.kind() {
+            "decorated_definition" => method.child_by_field_name("definition"),
+            _ => Some(method),
+        };
+
+        let Some(method) = method.filter(|node| node.kind() == "function_definition") else {
+            continue;
+        };
+
+        // The method's own parameters, so `self.x = y` picks up `y`'s annotation:
+        // handing a collaborator in through the constructor is how most of these
+        // attributes are set, and the annotation is on the parameter, not the
+        // assignment.
+        let parameters = parameter_types(bytes, method);
+
+        for (name, type_name) in self_attribute_types(bytes, method, &parameters) {
+            match found.iter().find(|(key, _)| *key == name) {
+                Some((_, held)) if *held != type_name => {
+                    conflicted.insert(name);
+                }
+                Some(_) => {}
+                None => found.push((name, type_name)),
+            }
+        }
+    }
+
+    found.retain(|(name, _)| {
+        !conflicted.contains(name) && !declared.iter().any(|(key, _)| key == name)
+    });
+
+    found
+}
+
+/// The `(attribute, type)` pairs one method's `self.<attribute> = <value>`
+/// assignments name. The value is typed by [`assigned_value_type`]'s rules, so a
+/// constructed attribute and a constructed local are typed alike, or by the
+/// annotation on the parameter it was handed (`self._demo = demo` with
+/// `demo: DemoSession`).
+fn self_attribute_types(
+    bytes: &[u8],
+    method: TsNode<'_>,
+    parameters: &[(String, String)],
+) -> Vec<(String, String)> {
+    let Some(body) = method.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    for_each_assignment(body, |assignment| {
+        if let Some(pair) = self_attribute_type(bytes, assignment, parameters) {
+            pairs.push(pair);
+        }
+    });
+
+    pairs
+}
+
+/// The `assignment` nodes inside one definition's `body`, each visited once.
+/// Nested definitions are skipped, their assignments being their own scope's.
+///
+/// The two typed-receiver passes differ only in what they make of an assignment,
+/// so the walk, its [`CHILDREN_MAX`] bound, and its skip list live here once
+/// rather than in a copy apiece that can drift out of step.
+fn for_each_assignment<'tree>(body: TsNode<'tree>, mut visit: impl FnMut(TsNode<'tree>)) {
+    let mut pending: Vec<TsNode<'tree>> = vec![body];
+    let mut seen: u32 = 0;
+
+    while let Some(node) = pending.pop() {
+        seen += 1;
+
+        assert!(seen <= CHILDREN_MAX, "definition-body fan-out exceeded {CHILDREN_MAX}");
+
+        if matches!(node.kind(), "function_definition" | "class_definition" | "lambda") {
+            continue;
+        }
+
+        if node.kind() == "assignment" {
+            visit(node);
+
+            continue;
+        }
+
+        let mut cursor = node.walk();
+
+        pending.extend(node.named_children(&mut cursor));
+    }
+}
+
+/// The `(attribute, type)` a single `self.<attribute> = <value>` assignment names,
+/// or `None` when the target is not an attribute on `self` or the value names no
+/// type.
+fn self_attribute_type(
+    bytes: &[u8],
+    assignment: TsNode<'_>,
+    parameters: &[(String, String)],
+) -> Option<(String, String)> {
+    assert_eq!(assignment.kind(), "assignment", "an attribute's type is read off an assignment");
+
+    let left = assignment.child_by_field_name("left")?;
+
+    if left.kind() != "attribute" {
+        return None;
+    }
+
+    let object = left.child_by_field_name("object")?;
+
+    if node_text(bytes, object) != "self" {
+        return None;
+    }
+
+    let attribute = left.child_by_field_name("attribute")?;
+    let name = node_text(bytes, attribute).to_string();
+
+    if let Some((_, type_name)) = assigned_value_type(bytes, assignment, name.clone()) {
+        return Some((name, type_name));
+    }
+
+    let right = assignment.child_by_field_name("right")?;
+
+    if right.kind() != "identifier" {
+        return None;
+    }
+
+    let source = node_text(bytes, right);
+
+    let type_name = parameters
+        .iter()
+        .find(|(key, _)| key == source)
+        .map(|(_, type_name)| type_name.clone())?;
+
+    Some((name, type_name))
 }
 
 /// The type-annotated parameters of a function, as `(name, type)` pairs: the
@@ -782,6 +1018,118 @@ fn parameter_types(bytes: &[u8], def_node: TsNode<'_>) -> Vec<(String, String)> 
     }
 
     pairs
+}
+
+/// The locals a function body assigns a knowable type to, as the `(name, type)`
+/// pairs receiver typing reads. Three assignment shapes name a type:
+///
+/// - an annotation (`crumbs: Breadcrumbs = ...`), which says so outright;
+/// - a construction (`crumbs = Breadcrumbs()`), whose type is the class called,
+///   readable from this file alone;
+/// - a factory call (`demo = Demo.start(...)`), whose type is whatever the callee
+///   returns. That return annotation sits with the callee, in another file, so the
+///   pair carries the callee's dotted name behind [`RETURNS_OF`] and the link pass
+///   follows the callee's `returns` edge to reach the class.
+///
+/// A receiver is only ever typed from a call whose callee reads as a class
+/// (`Breadcrumbs`, `Demo.start`), never a plain function or a chain off `self`: a
+/// lowercase callee says nothing about the type of what it returns, and guessing
+/// from one would put a call on whichever same-named class happened to match.
+///
+/// Nested definitions are skipped, their locals being their own scope's.
+fn assigned_locals(bytes: &[u8], def_node: TsNode<'_>) -> Vec<(String, String)> {
+    let Some(body) = def_node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    for_each_assignment(body, |assignment| {
+        if let Some(pair) = assigned_local_type(bytes, assignment) {
+            pairs.push(pair);
+        }
+    });
+
+    pairs
+}
+
+/// The `(name, type)` one assignment contributes, or `None` when its target is not
+/// a bare local or its value names no type. Backs [`assigned_locals`].
+fn assigned_local_type(bytes: &[u8], assignment: TsNode<'_>) -> Option<(String, String)> {
+    assert_eq!(assignment.kind(), "assignment", "a local's type is read off an assignment");
+
+    let left = assignment.child_by_field_name("left")?;
+
+    if left.kind() != "identifier" {
+        return None;
+    }
+
+    let name = node_text(bytes, left).to_string();
+
+    assigned_value_type(bytes, assignment, name)
+}
+
+/// The `(name, type)` an assignment's *value* gives the target already named, the
+/// half shared by a local (`crumbs = Breadcrumbs()`) and a `self` attribute
+/// (`self.nav = Navigator(self)`).
+///
+/// An annotation is taken outright. Otherwise the value must be a call, and its
+/// callee says the type three ways: a class constructs an instance of itself; a
+/// method on a class, and a plain function, each yield whatever they are annotated
+/// to return, carried behind [`RETURNS_OF`] for the link pass to follow, since a
+/// return annotation lives with the callee rather than here.
+///
+/// A receiver reached through anything else (a subscript, a chained call, an
+/// attribute on a local) types nothing: its callee is not a name this file can
+/// hand the link pass to look up.
+fn assigned_value_type(
+    bytes: &[u8],
+    assignment: TsNode<'_>,
+    name: String,
+) -> Option<(String, String)> {
+    assert_eq!(assignment.kind(), "assignment", "a value's type is read off an assignment");
+    assert!(!name.is_empty(), "the assignment's target is named by the caller");
+
+    if let Some(type_node) = assignment.child_by_field_name("type") {
+        let type_name = annotation_type_names(bytes, type_node).into_iter().next()?;
+
+        return Some((name, type_name));
+    }
+
+    let right = assignment.child_by_field_name("right")?;
+
+    if right.kind() != "call" {
+        return None;
+    }
+
+    let function = right.child_by_field_name("function")?;
+
+    match function.kind() {
+        "identifier" => {
+            let callee = node_text(bytes, function);
+
+            is_class_like(callee).then(|| (name, callee.to_string()))
+        }
+        "attribute" => {
+            let object = function.child_by_field_name("object")?;
+            let attribute = function.child_by_field_name("attribute")?;
+
+            if object.kind() != "identifier" {
+                return None;
+            }
+
+            let owner = node_text(bytes, object);
+
+            if !is_class_like(owner) {
+                return None;
+            }
+
+            let method = node_text(bytes, attribute);
+
+            Some((name, format!("{RETURNS_OF}{owner}.{method}")))
+        }
+        _ => None,
+    }
 }
 
 /// The parameter name of a `typed_parameter`/`typed_default_parameter`: its
