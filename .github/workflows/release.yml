@@ -8,10 +8,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Built on the oldest supported runner rather than ubuntu-latest, because a
-  # glibc-linked binary runs on the glibc it was built against or newer, never
-  # older. Building on 22.04 (glibc 2.35) covers Ubuntu 22.04+, Debian 12+, and
-  # Fedora 36+; building on the newest runner would exclude every one of them.
   build-linux:
     runs-on: ubuntu-22.04
     permissions:
@@ -59,9 +55,6 @@ jobs:
     - name: Build release binary
       run: cargo build --release --verbose
 
-    # The asset name carries no version, so
-    # releases/latest/download/<name>.tar.gz is a stable URL the README can
-    # print once instead of a line that goes stale at every release.
     - name: Package the tarball
       run: |
         name="constellation-x86_64-unknown-linux-gnu"
@@ -129,9 +122,6 @@ jobs:
     - name: Build release binary
       run: cargo build --release --verbose
 
-    # The same shape as the Linux tarball: a versionless archive name, so
-    # releases/latest/download/<name>.zip is a stable URL, and a sha256 beside
-    # it in the same `<hash>  <file>` format sha256sum writes.
     - name: Package the zip
       run: |
         $name = "constellation-x86_64-pc-windows-msvc"
@@ -223,6 +213,17 @@ jobs:
     - name: Download wingetcreate
       run: Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
       shell: pwsh
+
+    - name: Sync the winget-pkgs fork with upstream
+      run: |
+        # wingetcreate's own fork sync fails once the fork drifts thousands of
+        # commits behind the very active upstream, which is guaranteed between
+        # releases. Fast-forward the fork first so the submit step never hits it.
+        $owner = gh api user --jq .login
+        gh repo sync "$owner/winget-pkgs" --source microsoft/winget-pkgs --force
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
 
     - name: Submit manifest to winget-pkgs
       run: |

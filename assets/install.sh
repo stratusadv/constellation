@@ -87,12 +87,27 @@ esac
 mkdir -p "$(dirname "$profile")"
 touch "$profile"
 
-if grep -qsF "$BIN_DIR" "$profile"; then
-    echo "  PATH     already carries $BIN_DIR in $profile"
-else
-    printf '\n%s\n' "$path_line" >> "$profile"
-    echo "  PATH     $BIN_DIR added to $profile"
-fi
+# Two checks before appending. The live PATH catches an entry contributed by
+# some other file (.profile, systemd environment), where grepping one profile
+# would miss it and append a duplicate. The grep still runs when the live PATH
+# lacks the directory, because a shell that has not sourced the profile yet
+# (cron, a fresh terminal mid-install) would otherwise re-append on every run.
+path_added=""
+
+case ":$PATH:" in
+    *":$BIN_DIR:"*)
+        echo "  PATH     already carries $BIN_DIR"
+        ;;
+    *)
+        if grep -qsF "$BIN_DIR" "$profile"; then
+            echo "  PATH     already carries $BIN_DIR in $profile"
+        else
+            printf '\n%s\n' "$path_line" >> "$profile"
+            echo "  PATH     $BIN_DIR added to $profile"
+            path_added="yes"
+        fi
+        ;;
+esac
 
 PATH="$BIN_DIR:$PATH"
 export PATH
@@ -104,5 +119,7 @@ export PATH
 # `curl | sh`, and a child that read stdin would eat the rest of it.
 "$BIN_DIR/constellation" install </dev/null
 
-echo
-echo "Open a new shell (or run: $path_line) to pick up the PATH change."
+if [ -n "$path_added" ]; then
+    echo
+    echo "Open a new shell (or run: $path_line) to pick up the PATH change."
+fi

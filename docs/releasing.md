@@ -165,3 +165,10 @@ but an unsigned installer may show a SmartScreen prompt on first run.
   per-user installer.
 - **The OAuth screen wants private repo access.** That is the `Winget-Create` app login.
   Cancel it and submit with `wingetcreate ... -t <PAT>` instead.
+- **"The forked repository could not be synced with the upstream commits."** The PAT
+  account's fork of `winget-pkgs` has fallen too far behind upstream for `wingetcreate` to
+  sync it (upstream moves thousands of commits between releases). The workflow now
+  fast-forwards the fork before submitting, but if it happens anyway: sync the fork by hand
+  (the **Sync fork** button on the fork's GitHub page, or
+  `gh repo sync <pat-account>/winget-pkgs --source microsoft/winget-pkgs` authenticated
+  as the PAT account), then re-run the failed job.

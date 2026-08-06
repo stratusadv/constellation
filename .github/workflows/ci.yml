@@ -13,9 +13,6 @@ jobs:
     name: Build, lint, test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
 
-    # Both platforms are developed on, and the parts that differ between them
-    # (the install directory, the agent entry points, the displaced-binary
-    # dance) are exactly the parts a single-platform run cannot check.
     strategy:
       fail-fast: false
       matrix:
@@ -51,30 +48,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets
 
-      # The style ratchets. Each is a count of known debt that must match the
-      # tree exactly: a change that adds an offender fails, and a change that
-      # removes one fails until the recorded count is lowered to match. Debt
-      # therefore only moves down, and progress is recorded when it happens.
       - name: Tidy
         run: cargo xtask tidy
 
-      # Serially, because the index crate's watcher tests each run a real
-      # filesystem watcher and poll a from-scratch re-index every 100 ms to
-      # decide convergence. Run alongside each other they starve one another
-      # until a convergence wait hits its timeout.
-      #
-      # This reduces the flake, it does not remove it. Measured on Linux:
-      # fuzz_file_operations fails roughly 3 runs in 4 in parallel and roughly
-      # 1 in 6 serially, for about 20 extra seconds of wall clock. The
-      # remaining failures are that one test, and the race behind them is not
-      # yet understood; a red CI run that names only this test is the known
-      # issue, not a regression.
       - name: Test
         run: cargo test --workspace
         env:
           RUST_TEST_THREADS: 1
-          # A snapshot mismatch on CI is a failure, never an update. insta
-          # already infers this from `CI`, but the inference is invisible at the
-          # point it matters, and a run that silently rewrote its own
-          # expectations would pass while proving nothing.
           INSTA_UPDATE: "no"
