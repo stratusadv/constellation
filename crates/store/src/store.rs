@@ -398,6 +398,25 @@ impl Store {
         Ok(())
     }
 
+    /// A project removed outright: its row, everything keyed by it (files, nodes,
+    /// edges, history, flows, all cascading through foreign keys with the FTS
+    /// triggers firing), and its metadata keys. For dropping a companion or
+    /// version copy the workspace config no longer names.
+    pub fn delete_project(&self, project: &ProjectId) -> Result<(), StoreError> {
+        let removed = self
+            .connection
+            .execute("DELETE FROM projects WHERE id = ?1", params![project.as_str()])?;
+
+        assert!(removed <= 1, "project ids are unique");
+
+        let key = format!("git_ingest:{}", project.as_str());
+
+        self.connection
+            .execute("DELETE FROM project_metadata WHERE key = ?1", params![key])?;
+
+        Ok(())
+    }
+
     /// The stamp recorded the last time `project`'s git history was ingested (its
     /// HEAD commit plus the extractor fingerprint), or `None` when never ingested.
     /// A caller compares it to the current state to skip re-ingesting unchanged

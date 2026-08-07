@@ -98,10 +98,18 @@ fn ingest_all_history(
             continue;
         }
 
-        // A companion with a configured repository (its `.venv` copy carries no
-        // `.git`) sources history from a full clone of that repo at the tag matching
-        // the installed version; everything else reads its own root.
-        let history_root = match workspace_root.zip(repositories.get(project.id.as_str())) {
+        // The workspace's own project always reads its local repository, even when
+        // its id appears in the repositories map (working on a library that is
+        // itself a named companion). A companion with a configured repository (its
+        // `.venv` copy carries no `.git`) sources history from a full clone of that
+        // repo at the installed version; everything else reads its own root.
+        let repository = if is_workspace_primary(&project.root_path, workspace_root) {
+            None
+        } else {
+            workspace_root.zip(repositories.get(project.id.as_str()))
+        };
+
+        let history_root = match repository {
             Some((root, url)) => match constellation_index::fetch_companion_history_repo(
                 root,
                 project.id.as_str(),

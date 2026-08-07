@@ -47,14 +47,14 @@ builds from source.
 
 | Command | Purpose |
 |---|---|
-| `constellation init [--no-hooks]` | Create and index `.constellation/index.db` in this repo, with a starter config and a Claude Code search hook ([docs](docs/hooks.md)) |
+| `constellation init [--no-hooks]` | Create and index `.constellation/index.db` in this repo, with a starter config, a Claude Code search hook, and the equivalent OpenCode plugin ([docs](docs/hooks.md)) |
 | `constellation sync [db]` | Re-index every project from disk and re-link, in one shot |
 | `constellation link <db> <repo>...` | Index several repos into one shared graph and link them |
 | `constellation serve [db] [--supervise]` | Serve the graph over MCP (stdio) and watch for changes; registered by `install` |
 | `constellation history [db] [--symbols]` | Ingest git history so the graph can be read over time |
 | `constellation flows [db] [--project id] [--depth n] [--include-tests]` | Trace and rank every Django execution flow |
 | `constellation tools` | List the MCP tools the server advertises, with their descriptions |
-| `constellation install [--no-hooks]` / `uninstall` | Register or unregister the MCP server and this repo's search hook |
+| `constellation install [--no-hooks]` / `uninstall` | Register or unregister the MCP server and this repo's search hook and OpenCode plugin |
 
 `serve` and `sync` find the database by walking up from the working directory, or
 from `CONSTELLATION_DB` when it is set. `sync` is the manual one-shot for when

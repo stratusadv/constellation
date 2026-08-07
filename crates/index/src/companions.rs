@@ -14,8 +14,13 @@
 //!
 //! Discovery is on by default and additive: a repository with no virtual
 //! environment, or none of these packages installed, registers nothing and indexes
-//! exactly as before. A `.constellation/config.toml` may disable it, override the
-//! package list, and name extra versions to index side by side for comparison:
+//! exactly as before. A workspace that is itself one of the named companions
+//! (working on the library rather than in a consumer) is never re-registered: a
+//! companion whose name matches the workspace's, or whose resolved directory is
+//! the workspace's own source tree (an editable self-install), is skipped, since
+//! indexing it would duplicate the workspace project under a second id. A
+//! `.constellation/config.toml` may disable it, override the package list, and
+//! name extra versions to index side by side for comparison:
 //!
 //! ```toml
 //! [profile]
@@ -299,10 +304,99 @@ pub fn discover_companions(
             continue;
         };
 
+        if companion_is_workspace(workspace_root, &roots, id, &package_root) {
+            continue;
+        }
+
         targets.push(CompanionTarget { project_id: id.clone(), package_root, reference_only: false });
     }
 
+    // The workspace's own id always sits in the store, so it does not count as an
+    // already-indexed companion when it is itself one of the named packages.
+    let workspace_name = workspace_root.file_name().and_then(|name| name.to_str());
+
+    let already_indexed = config.packages.iter().any(|id| {
+        existing.contains(id)
+            && workspace_name.is_none_or(|name| package_name_key(name) != package_name_key(id))
+    });
+
+    if roots.is_empty() && targets.is_empty() && !already_indexed && !config.packages.is_empty() {
+        eprintln!(
+            "constellation: no virtual environment found for this workspace (no .venv, and an \
+             activated one belonging to another project is ignored), so its companion libraries \
+             were not indexed. Create one and install this project's dependencies, or point \
+             [companions] venv at it in .constellation/config.toml.",
+        );
+    }
+
     Ok(targets)
+}
+
+/// The stored projects a re-index drops because the workspace config no longer
+/// names them: a version copy (`package@ref`) whose spec left `[companions]
+/// versions`, or a companion no longer in the configured package list (or now
+/// excluded). The workspace's own project is never pruned, and a disabled
+/// `[companions]` section prunes nothing, since disabled means hands-off.
+/// Returns the removed project ids so the caller can report them.
+pub fn prune_stale_projects(
+    store: &Store,
+    workspace_root: &Path,
+) -> Result<Vec<String>, IndexError> {
+    assert!(workspace_root.is_dir(), "workspace root must be a directory: {workspace_root:?}");
+
+    let config = load_config(workspace_root);
+
+    if !config.enabled {
+        return Ok(Vec::new());
+    }
+
+    let workspace = canonical_or_self(workspace_root);
+    let mut removed: Vec<String> = Vec::new();
+    let mut scanned: u32 = 0;
+
+    for project in store.all_projects()? {
+        scanned += 1;
+
+        assert!(scanned <= SCAN_ENTRIES_MAX, "project scan exceeded {SCAN_ENTRIES_MAX}");
+
+        let root = canonical_or_self(Path::new(project.root_path.as_str()));
+
+        if root == workspace {
+            continue;
+        }
+
+        let id = project.id.as_str();
+
+        let keep = match id.split_once('@') {
+            Some((package, reference)) => config
+                .versions
+                .get(package)
+                .is_some_and(|configured| configured == reference),
+            None => {
+                config.packages.iter().any(|package| package == id)
+                    && !config.exclude.iter().any(|package| package == id)
+            }
+        };
+
+        if keep {
+            continue;
+        }
+
+        store.delete_project(&project.id)?;
+
+        // A version copy also leaves its checkout under sources; remove it
+        // best-effort so a later re-add starts clean.
+        if id.contains('@') {
+            let checkout =
+                workspace_root.join(".constellation").join("sources").join(sanitize_segment(id));
+
+            let _ = std::fs::remove_dir_all(&checkout);
+        }
+
+        removed.push(id.to_string());
+    }
+
+    Ok(removed)
 }
 
 /// The `[companions]` section read from `.constellation/config.toml`, resolved
@@ -361,12 +455,14 @@ pub fn load_companion_repositories(workspace_root: &Path) -> BTreeMap<String, St
     load_config(workspace_root).repositories
 }
 
-/// The full-history checkout of `package`'s repository at the installed version,
-/// fetched from `url` into `.constellation/sources/` (cached after the first
-/// fetch), so its git history can be read without a local clone or a `.git` in the
-/// `.venv` install. `None` when the package is not installed, no tag matches the
-/// installed version, or the clone fails, in which case the companion's history is
-/// skipped rather than shown at a mismatched version.
+/// The full-history checkout of `package`'s repository backing its history read,
+/// fetched into `.constellation/sources/` (cached after the first fetch), so its
+/// git history can be read without a local clone or a `.git` in the `.venv`
+/// install. A git VCS install records its exact commit in `direct_url.json` and
+/// is cloned at that commit; anything else is cloned from `url` at the tag
+/// matching the installed `*.dist-info` version. `None` when the package is not
+/// installed, nothing matches, or the clone fails, in which case the companion's
+/// history is skipped rather than shown at a mismatched version.
 pub fn fetch_companion_history_repo(
     workspace_root: &Path,
     package: &str,
@@ -377,10 +473,87 @@ pub fn fetch_companion_history_repo(
 
     let config = load_config(workspace_root);
     let roots = site_packages_roots(workspace_root, &config);
+    let import = package.replace('-', "_");
+
+    if let Some((vcs_url, commit)) = vcs_install_commit(&roots, &import) {
+        return clone_full_at_commit(workspace_root, package, &vcs_url, &commit);
+    }
 
     let version = installed_version(&roots, package)?;
 
     clone_full_at_tag(workspace_root, package, url, &version)
+}
+
+/// The git url and exact commit a VCS install of `import` records in its
+/// `direct_url.json`, or `None` for an index or local install. History for such
+/// an install reads at that commit, since the version it reports rarely has a
+/// matching release tag.
+fn vcs_install_commit(roots: &[PathBuf], import: &str) -> Option<(String, String)> {
+    let dist_info = find_dist_info(roots, import)?;
+
+    let text = std::fs::read_to_string(dist_info.join("direct_url.json")).ok()?;
+    let parsed: DirectUrl = serde_json::from_str(&text).ok()?;
+
+    let info = parsed.vcs_info?;
+
+    if info.vcs != "git" {
+        return None;
+    }
+
+    let commit = info.commit_id?;
+
+    if commit.is_empty() {
+        return None;
+    }
+
+    let url = parsed.url.strip_prefix("git+").unwrap_or(&parsed.url).to_string();
+
+    Some((url, commit))
+}
+
+/// A full clone of `url` checked out detached at `commit` under
+/// `.constellation/sources/`, returning the checkout root so its whole history is
+/// readable. Reused when already present for that commit, so the network is hit
+/// only the first time. `None` when git is unavailable or the clone or checkout
+/// fails.
+fn clone_full_at_commit(
+    workspace_root: &Path,
+    package: &str,
+    url: &str,
+    commit: &str,
+) -> Option<PathBuf> {
+    assert!(!commit.is_empty(), "a vcs install always records a commit");
+
+    if !git_available() {
+        return None;
+    }
+
+    let sources = workspace_root.join(".constellation").join("sources");
+
+    std::fs::create_dir_all(&sources).ok()?;
+
+    let short = &commit[..commit.len().min(12)];
+    let dest = sources.join(sanitize_segment(&format!("{package}@{short}")));
+
+    if is_populated(&dest) {
+        return Some(dest);
+    }
+
+    let destination = dest.to_string_lossy().into_owned();
+
+    let cloned = run_git(None, &["clone", url, destination.as_str()]).is_some();
+
+    if cloned && run_git(Some(&dest), &["checkout", "--force", "--detach", commit]).is_some() {
+        return Some(dest);
+    }
+
+    let _ = std::fs::remove_dir_all(&dest);
+
+    eprintln!(
+        "constellation: could not clone {url} at {short} for '{package}'; skipping its history",
+    );
+
+    None
 }
 
 /// The installed version of `package` from its `*.dist-info` directory name among
@@ -452,8 +625,62 @@ fn existing_project_ids(store: &Store) -> Result<FxHashSet<String>, IndexError> 
     Ok(ids)
 }
 
+/// Whether a resolved companion is the workspace itself, which happens when the
+/// indexed repository IS one of the profile's libraries (working on the library
+/// rather than in a consumer). Two signals, either sufficient: the package name
+/// matches the workspace directory's name (hyphen/underscore and case
+/// insensitive), or the resolved package root sits inside the workspace but not
+/// inside a site-packages root, which is an editable self-install pointing back
+/// at the workspace's own source tree. Indexing such a target would duplicate
+/// the workspace project under a second id.
+fn companion_is_workspace(
+    workspace_root: &Path,
+    site_packages_roots: &[PathBuf],
+    package: &str,
+    package_root: &Path,
+) -> bool {
+    assert!(!package.is_empty(), "package name must not be empty");
+    assert!(workspace_root.is_dir(), "workspace root must be a directory: {workspace_root:?}");
+
+    let workspace_name = workspace_root.file_name().and_then(|name| name.to_str());
+
+    if let Some(name) = workspace_name
+        && package_name_key(name) == package_name_key(package)
+    {
+        return true;
+    }
+
+    let workspace = canonical_or_self(workspace_root);
+    let resolved = canonical_or_self(package_root);
+
+    if !resolved.starts_with(&workspace) {
+        return false;
+    }
+
+    // Inside the workspace but outside every site-packages root: the workspace's
+    // own source tree, already indexed as the workspace project.
+    !site_packages_roots.iter().any(|root| resolved.starts_with(canonical_or_self(root)))
+}
+
+/// A package name reduced to its import identity: ASCII lowercased with hyphens
+/// as underscores, so "Django-Spire", "django-spire", and "django_spire" all
+/// compare equal.
+fn package_name_key(name: &str) -> String {
+    name.to_ascii_lowercase().replace('-', "_")
+}
+
+/// The canonical form of `path`, or `path` itself when canonicalization fails
+/// (a vanished directory), so a containment comparison still runs best-effort.
+fn canonical_or_self(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// The candidate `site-packages` directories to search: the configured (or default
-/// `.venv`) virtual environment, plus an active `VIRTUAL_ENV` if one is set.
+/// `.venv`) virtual environment, plus an active `VIRTUAL_ENV` when it lives inside
+/// this workspace. An activated environment belonging to another project (a shell
+/// that ran `constellation init` here without deactivating first) is ignored, so
+/// that project's installed copies, pinned at its versions, are never indexed
+/// into this workspace's graph.
 fn site_packages_roots(workspace_root: &Path, config: &CompanionsConfig) -> Vec<PathBuf> {
     let mut venvs: Vec<PathBuf> = Vec::new();
 
@@ -469,7 +696,11 @@ fn site_packages_roots(workspace_root: &Path, config: &CompanionsConfig) -> Vec<
     if let Ok(active) = std::env::var("VIRTUAL_ENV")
         && !active.is_empty()
     {
-        venvs.push(PathBuf::from(active));
+        let active = PathBuf::from(active);
+
+        if canonical_or_self(&active).starts_with(canonical_or_self(workspace_root)) {
+            venvs.push(active);
+        }
     }
 
     let mut roots: Vec<PathBuf> = Vec::with_capacity(venvs.len());
@@ -731,6 +962,8 @@ struct DirectUrl {
 /// The VCS section of a `direct_url.json`, present only for a VCS install.
 #[derive(Debug, Deserialize)]
 struct VcsInfo {
+    #[serde(default)]
+    commit_id: Option<String>,
     vcs: String,
 }
 
@@ -1270,6 +1503,62 @@ packages = [\"robit\"]
     }
 
     #[test]
+    fn package_name_key_unifies_case_and_separators() {
+        assert_eq!(package_name_key("Django-Spire"), "django_spire");
+        assert_eq!(package_name_key("django_spire"), "django_spire");
+        assert_eq!(package_name_key("robit"), "robit", "a plain name passes through");
+    }
+
+    #[test]
+    fn companion_is_workspace_matches_the_directory_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("django_spire");
+
+        let site_packages = workspace.join(".venv").join("Lib").join("site-packages");
+        let venv_copy = site_packages.join("django_spire");
+
+        std::fs::create_dir_all(&venv_copy).unwrap();
+
+        assert!(
+            companion_is_workspace(&workspace, &[site_packages], "django-spire", &venv_copy),
+            "the underscore checkout of the library skips its own venv copy",
+        );
+    }
+
+    #[test]
+    fn companion_is_workspace_detects_an_editable_self_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("spire-checkout");
+
+        let site_packages = workspace.join(".venv").join("Lib").join("site-packages");
+        let source_tree = workspace.join("django_spire");
+
+        std::fs::create_dir_all(&site_packages).unwrap();
+        std::fs::create_dir_all(&source_tree).unwrap();
+
+        assert!(
+            companion_is_workspace(&workspace, &[site_packages], "django-spire", &source_tree),
+            "an editable install pointing back into the workspace is the workspace itself",
+        );
+    }
+
+    #[test]
+    fn companion_is_workspace_leaves_a_real_venv_companion_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("consumer-site");
+
+        let site_packages = workspace.join(".venv").join("Lib").join("site-packages");
+        let venv_copy = site_packages.join("django_spire");
+
+        std::fs::create_dir_all(&venv_copy).unwrap();
+
+        assert!(
+            !companion_is_workspace(&workspace, &[site_packages], "django-spire", &venv_copy),
+            "a consumer's installed companion is not the workspace",
+        );
+    }
+
+    #[test]
     fn installed_version_reads_the_dist_info_name() {
         let site = tempfile::tempdir().unwrap();
         std::fs::create_dir(site.path().join("django_spire-0.32.3.dist-info")).unwrap();
@@ -1374,6 +1663,153 @@ packages = [\"robit\"]
             }
             other => panic!("expected a remote repo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prune_drops_what_the_config_no_longer_names() {
+        use constellation_graph::ProjectId;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let root_text = root.to_string_lossy().into_owned();
+
+        std::fs::create_dir(root.join(".constellation")).unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+
+        let glue = ProjectId::new("django-glue");
+        let pinned = ProjectId::new("django-spire@v1");
+
+        store.upsert_project(&ProjectId::new("workspace"), "workspace", &root_text).unwrap();
+        store.upsert_project(&glue, "django-glue", "/elsewhere/glue").unwrap();
+        store.upsert_project(&pinned, "django-spire@v1", "/elsewhere/v1").unwrap();
+
+        let removed = prune_stale_projects(&store, root).expect("the prune runs");
+
+        assert_eq!(
+            removed,
+            vec!["django-spire@v1".to_string()],
+            "the unconfigured version copy goes; the profile-named companion stays",
+        );
+
+        let kept: Vec<String> = store
+            .all_projects()
+            .unwrap()
+            .into_iter()
+            .map(|project| project.id.as_str().to_string())
+            .collect();
+
+        assert!(kept.contains(&"workspace".to_string()), "the workspace is never pruned");
+        assert!(kept.contains(&"django-glue".to_string()), "a configured companion is kept");
+        assert!(!kept.contains(&"django-spire@v1".to_string()), "the version copy is gone");
+    }
+
+    #[test]
+    fn prune_drops_an_excluded_companion_and_respects_disabled() {
+        use constellation_graph::ProjectId;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let root_text = root.to_string_lossy().into_owned();
+
+        std::fs::create_dir(root.join(".constellation")).unwrap();
+        std::fs::write(
+            root.join(".constellation").join("config.toml"),
+            "[companions]\nexclude = [\"robit\"]\n",
+        )
+        .unwrap();
+
+        let store = Store::open_in_memory().unwrap();
+
+        store.upsert_project(&ProjectId::new("workspace"), "workspace", &root_text).unwrap();
+        store.upsert_project(&ProjectId::new("robit"), "robit", "/elsewhere/robit").unwrap();
+
+        let removed = prune_stale_projects(&store, root).expect("the prune runs");
+
+        assert_eq!(removed, vec!["robit".to_string()], "an excluded companion is dropped");
+
+        std::fs::write(
+            root.join(".constellation").join("config.toml"),
+            "[companions]\nenabled = false\n",
+        )
+        .unwrap();
+
+        store.upsert_project(&ProjectId::new("dandy"), "dandy", "/elsewhere/dandy").unwrap();
+
+        let removed = prune_stale_projects(&store, root).expect("the prune runs");
+
+        assert!(removed.is_empty(), "a disabled section prunes nothing, disabled means hands-off");
+    }
+
+    #[test]
+    fn vcs_install_commit_reads_the_recorded_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let roots = vec![directory.path().to_path_buf()];
+
+        let dist = directory.path().join("django_glue-1.0.0.dist-info");
+        std::fs::create_dir(&dist).unwrap();
+        std::fs::write(
+            dist.join("direct_url.json"),
+            "{\"url\": \"git+https://example.com/org/django-glue.git\", \
+             \"vcs_info\": {\"vcs\": \"git\", \"commit_id\": \"a82a33f\", \
+             \"requested_revision\": \"master\"}}",
+        )
+        .unwrap();
+
+        let (url, commit) = vcs_install_commit(&roots, "django_glue").expect("a vcs install");
+
+        assert_eq!(url, "https://example.com/org/django-glue.git", "the git+ prefix is stripped");
+        assert_eq!(commit, "a82a33f");
+    }
+
+    #[test]
+    fn vcs_install_commit_ignores_an_index_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let roots = vec![directory.path().to_path_buf()];
+
+        let dist = directory.path().join("robit-0.4.9.dist-info");
+        std::fs::create_dir(&dist).unwrap();
+
+        assert!(
+            vcs_install_commit(&roots, "robit").is_none(),
+            "a wheel from an index records no direct_url.json, so the tag path applies",
+        );
+    }
+
+    #[test]
+    fn clone_full_at_commit_checks_out_the_exact_commit() {
+        if !git_available() {
+            return;
+        }
+
+        let origin = tempfile::tempdir().unwrap();
+        let origin_root = origin.path();
+
+        assert!(run_git(Some(origin_root), &["init", "-q"]).is_some(), "git init");
+        assert!(run_git(Some(origin_root), &["config", "user.email", "t@t"]).is_some(), "email");
+        assert!(run_git(Some(origin_root), &["config", "user.name", "test"]).is_some(), "git name");
+
+        std::fs::write(origin_root.join("first.txt"), "one\n").unwrap();
+        assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add first");
+        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "one"]).is_some(), "commit one");
+
+        let head = run_git(Some(origin_root), &["rev-parse", "HEAD"]).expect("the first commit id");
+        let commit = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        std::fs::write(origin_root.join("second.txt"), "two\n").unwrap();
+        assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add second");
+        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "two"]).is_some(), "commit two");
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".constellation")).unwrap();
+
+        let url = origin_root.to_string_lossy().into_owned();
+
+        let checkout = clone_full_at_commit(workspace.path(), "django-glue", &url, &commit)
+            .expect("the clone lands at the recorded commit");
+
+        assert!(checkout.join("first.txt").is_file(), "the commit's content is present");
+        assert!(!checkout.join("second.txt").exists(), "later commits are not checked out");
     }
 
     #[test]

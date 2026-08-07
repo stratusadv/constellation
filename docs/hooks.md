@@ -8,6 +8,10 @@ break.
 Hooks are opt-in. A plain `constellation install` registers the MCP server and
 the bundled skills, and prints a line saying hooks were not installed.
 
+The same install writes an OpenCode plugin that calls the same subcommand with
+the same payload. [The OpenCode plugin](#the-opencode-plugin) records what
+differs there; everything above that section describes both.
+
 ## Why
 
 An instruction file can only ask an agent to prefer the graph over grep.
@@ -134,6 +138,57 @@ watches every indexed root and re-indexes after each debounced burst. A
 post-write re-index would duplicate that work and race it for the same SQLite
 writer, which is a worse outcome than the freshness it buys. The install prints
 a line saying so, so the absence reads as a decision rather than an oversight.
+
+## The OpenCode plugin
+
+OpenCode has no hooks. It has plugins: TypeScript modules loaded from
+`.opencode/plugins/` in a project or the global config directory, exporting
+named lifecycle functions that run inside OpenCode's own process.
+
+`install --hooks` writes `assets/opencode/constellation.ts` into each indexed
+project's `.opencode/plugins/`, project-scoped for the same reason the Claude
+Code hook is: a plugin in the global config directory loads into every session
+on the machine, including projects constellation has never indexed.
+
+The plugin does not reimplement anything. It renames OpenCode's tool call into
+the payload above and shells out to the same `hook pre-tool-use` subcommand, so
+pattern extraction, the latency budget, and the output bound stay in Rust with
+one implementation and one test table.
+
+| OpenCode | Claude Code |
+|---|---|
+| `grep`, arg `pattern` | `Grep`, `tool_input.pattern` |
+| `glob`, arg `pattern` | `Glob`, `tool_input.pattern` |
+| `read`, arg `filePath` | `Read`, `tool_input.file_path` |
+| `bash`, arg `command` | `Bash`, `tool_input.command` |
+
+### What differs, and why
+
+**It runs after the tool, not before.** OpenCode's `tool.execute.before` can
+only rewrite a call's arguments; it has no channel for injecting context. The
+plugin therefore uses `tool.execute.after` and appends the graph context to the
+tool result. The search runs either way. Appended rather than prepended so a
+`read` result cannot have the context mistaken for the first line of the file.
+
+**The blanket catch is load-bearing.** A Claude Code hook is a child process, so
+the operating system contains a crash. A plugin is not: a throw propagates into
+OpenCode's own tool handling. The `catch` in the handler is that containment,
+and it must stay wrapped around every fallible step including the JSON parse and
+the mutation itself. Narrowing it breaks constraint 1.
+
+**It fails safe twice more.** `CONSTELLATION_HOOK=0` disables it for a session
+without deleting the file, and three consecutive failures trip a circuit breaker
+that stops it for the rest of the session, so a missing or broken binary costs
+one spawn rather than one per search.
+
+### Installation and removal
+
+The file is written whole, not merged. A plugin of that name whose first line
+does not carry the `// constellation-plugin v` marker was written by someone
+else and is reported and left alone; one that does carry it is upgraded in
+place, and identical content is not rewritten at all so OpenCode's file watcher
+is not woken for nothing. `constellation uninstall` prints the path to delete,
+matching how it treats the project hook.
 
 ## Manual installation
 

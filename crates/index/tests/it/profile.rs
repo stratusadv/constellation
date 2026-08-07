@@ -44,9 +44,11 @@ fn the_default_profile_discovers_the_company_companions() {
 
     assert_eq!(load_profile(&root), Profile::default(), "no config file means the default profile");
 
-    // Only django-spire is asserted: an ambient VIRTUAL_ENV is also searched, so
-    // whichever other company packages the developer's own environment installs
-    // resolve too, and the test must not depend on which.
+    // An ambient VIRTUAL_ENV points outside this temporary workspace, so it is
+    // ignored and only the workspace's own .venv is searched: django-spire is
+    // the one companion installed there, and the one target discovered.
+    assert_eq!(targets.len(), 1, "another project's activated venv donates nothing");
+
     let spire = targets
         .iter()
         .find(|target| target.project_id == "django-spire")
@@ -61,6 +63,23 @@ fn the_default_profile_discovers_the_company_companions() {
     assert!(
         load_companion_repositories(&root).contains_key("django-spire"),
         "its history repository comes from the profile with no configuration",
+    );
+}
+
+#[test]
+fn a_workspace_without_a_virtual_environment_discovers_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+
+    std::fs::create_dir_all(root.join(".constellation")).expect("the index directory");
+
+    let store = Store::open_in_memory().unwrap();
+    let targets = discover_companions(&store, root).expect("discovery runs");
+
+    assert!(
+        targets.is_empty(),
+        "with no .venv, and any activated environment outside the workspace ignored, \
+         nothing resolves; a warning on stderr tells the user to create one",
     );
 }
 
@@ -109,6 +128,24 @@ fn a_generic_workspace_can_still_name_its_own_companions() {
     );
 
     assert_eq!(targets[0].project_id, "django-spire");
+}
+
+#[test]
+fn a_workspace_that_is_itself_a_companion_is_not_rediscovered() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkout = directory.path().join("django_spire");
+
+    std::fs::create_dir_all(&checkout).unwrap();
+
+    let root = workspace_with_a_companion(&checkout);
+
+    let store = Store::open_in_memory().unwrap();
+    let targets = discover_companions(&store, &root).expect("discovery runs");
+
+    assert!(
+        targets.iter().all(|target| target.project_id != "django-spire"),
+        "the library's own checkout never rediscovers itself from its venv copy",
+    );
 }
 
 #[test]

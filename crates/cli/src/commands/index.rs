@@ -65,12 +65,14 @@ pub(crate) fn init_command(rest: &[String]) -> Result<()> {
         trace_flows_for_every_project(&store)?;
     }
 
-    // The hook is registered beside the index it reads, not once per machine, so
-    // a project constellation has never indexed never spawns one.
+    // The Claude Code hook and the OpenCode plugin are registered beside the index
+    // they read, not once per machine, so a project constellation has never indexed
+    // never spawns one.
     if rest.iter().any(|argument| argument == "--no-hooks") {
         println!("  hook     skipped (--no-hooks)");
     } else {
         crate::bootstrap::install_project_hook(root);
+        crate::bootstrap::install_project_plugin(root);
     }
 
     index_history_if_enabled(&store, root)
@@ -149,6 +151,12 @@ fn index_and_report(store: &Store, project: &ProjectId, name: &str, root: &Path)
 /// as its own project (drawing a progress bar) and returned as a summary row. A
 /// version copy is marked reference-only in the store after indexing.
 pub(crate) fn index_companions(store: &Store, workspace_root: &Path) -> Result<Vec<SummaryRow>> {
+    // Config is the source of truth: a companion or version copy the file no
+    // longer names is dropped before discovery adds anything new.
+    for id in constellation_index::prune_stale_projects(store, workspace_root)? {
+        println!("  removed  {id} (no longer in .constellation/config.toml)");
+    }
+
     let mut targets = discover_companions(store, workspace_root)?;
     targets.extend(discover_versions(store, workspace_root)?);
 

@@ -116,6 +116,11 @@ CREATE TABLE IF NOT EXISTS resolved_refs (
 
 CREATE INDEX IF NOT EXISTS idx_resolved_refs_target ON resolved_refs(target_node_id);
 
+-- The from_node_id side backs the ON DELETE CASCADE from nodes: without it every
+-- node delete scans this whole table, turning a project prune (or any file
+-- re-index) quadratic. Measured 77s -> 0.6s deleting a 13k-node project.
+CREATE INDEX IF NOT EXISTS idx_resolved_refs_from ON resolved_refs(from_node_id);
+
 CREATE INDEX IF NOT EXISTS idx_nodes_project    ON nodes(project_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_kind       ON nodes(kind);
 CREATE INDEX IF NOT EXISTS idx_nodes_name       ON nodes(name);
@@ -128,9 +133,19 @@ CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_provenance  ON edges(provenance);
 
-CREATE INDEX IF NOT EXISTS idx_files_project     ON files(project_id);
+-- files needs no project_id index: the (project_id, path) primary key already
+-- serves any project_id-prefix lookup. The old redundant index is dropped from
+-- databases that still carry it.
+DROP INDEX IF EXISTS idx_files_project;
+
 CREATE INDEX IF NOT EXISTS idx_unresolved_from   ON unresolved_refs(from_node_id);
 CREATE INDEX IF NOT EXISTS idx_unresolved_name   ON unresolved_refs(reference_name);
+
+-- Backs the project-scoped scans over unresolved_refs: the per-kind delete and
+-- take on every resolve pass, and the pending-reference count in status. The
+-- table holds every reference still awaiting resolution, so without this each
+-- of those operations walks the whole table.
+CREATE INDEX IF NOT EXISTS idx_unresolved_project ON unresolved_refs(project_id, reference_kind);
 
 -- Full-text search over node names, qualified names, docstrings, signatures.
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
@@ -344,3 +359,6 @@ CREATE TABLE IF NOT EXISTS flow_membership (
 CREATE INDEX IF NOT EXISTS idx_flow_project     ON flow(project_id);
 CREATE INDEX IF NOT EXISTS idx_flow_criticality ON flow(project_id, criticality);
 CREATE INDEX IF NOT EXISTS idx_flow_membership_node ON flow_membership(node_id);
+
+-- Backs the ON DELETE CASCADE from nodes into flow, like idx_resolved_refs_from.
+CREATE INDEX IF NOT EXISTS idx_flow_entry ON flow(entry_node_id);

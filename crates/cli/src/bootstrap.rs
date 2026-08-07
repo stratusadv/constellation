@@ -14,6 +14,15 @@ const HOOK_MATCHER: &str = "Grep|Glob|Read|Bash";
 /// budgets itself far tighter; this is only the outer guard.
 const HOOK_TIMEOUT_SECS: u64 = 5;
 
+/// The OpenCode plugin source, embedded so an installed binary writes it without
+/// needing the repository it was built from.
+const OPENCODE_PLUGIN: &str = include_str!("../../../assets/opencode/constellation.ts");
+
+/// The first-line marker identifying a plugin file constellation wrote. Matched
+/// without its version, so an install upgrades a file an older version wrote
+/// while still leaving a hand-written plugin of the same name alone.
+const OPENCODE_PLUGIN_MARKER: &str = "// constellation-plugin v";
+
 /// The registration of `constellation serve` as an MCP server with every agent
 /// that needs it (Claude Code, Codex, and OpenCode; Grok Build discovers a
 /// configured server on its own). The registered command takes no database
@@ -25,19 +34,20 @@ const HOOK_TIMEOUT_SECS: u64 = 5;
 /// reconnecting. The flag costs a session nothing when constellation is not being
 /// worked on: the supervisor is a pipe until the binary underneath it changes.
 ///
-/// Deliberately no hook at user scope. A hook is a Claude Code feature, and
-/// registering one for the whole machine would fire it in every project there,
+/// Deliberately nothing per-tool at user scope. Claude Code matches a hook on
+/// the tool name alone and OpenCode loads a global plugin for every session, so
+/// either registered for the whole machine would fire in every project there,
 /// including the ones constellation has never indexed, where it can only spawn
-/// and exit. [`install_project_hook`] registers it per project instead, so a
-/// project without a `.constellation/` directory never pays for one. What every
-/// client gets regardless is the MCP server's own `instructions`, which carry
-/// the same "ask the graph before you grep" message over the protocol they all
-/// speak rather than through one client's settings file.
+/// and exit. [`install_project_hook`] and [`install_project_plugin`] register
+/// them per project instead, so a project without a `.constellation/` directory
+/// never pays for one. What every client gets regardless is the MCP server's own
+/// `instructions`, which carry the same "ask the graph before you grep" message
+/// over the protocol they all speak rather than through one client's settings.
 ///
-/// The project hook is registered for the directory this ran inside, when that
-/// directory holds an index, and skipped by `--no-hooks`. `init` is what normally
-/// writes it; this covers the project indexed before the binary knew how, which
-/// otherwise needs a re-index to gain one.
+/// Both are registered for the directory this ran inside, when that directory
+/// holds an index, and skipped by `--no-hooks`. `init` is what normally writes
+/// them; this covers the project indexed before the binary knew how, which
+/// otherwise needs a re-index to gain them.
 pub fn install(rest: &[String]) -> Result<()> {
     let hooks = !rest.iter().any(|argument| argument == "--no-hooks");
 
@@ -47,16 +57,17 @@ pub fn install(rest: &[String]) -> Result<()> {
 
     println!("Grok Build: discovers constellation automatically; no registration needed");
 
-    install_hook_here(hooks);
+    install_hooks_here(hooks);
 
     println!("Then, in each project: `constellation init`");
 
     Ok(())
 }
 
-/// The project hook registered for the working directory's own project, unless
-/// `--no-hooks` was passed or the directory sits in no indexed project.
-fn install_hook_here(hooks: bool) {
+/// The Claude Code hook and the OpenCode plugin registered for the working
+/// directory's own project, unless `--no-hooks` was passed or the directory sits
+/// in no indexed project.
+fn install_hooks_here(hooks: bool) {
     if !hooks {
         println!("  hook     skipped (--no-hooks)");
 
@@ -68,6 +79,7 @@ fn install_hook_here(hooks: bool) {
     };
 
     install_project_hook(&root);
+    install_project_plugin(&root);
 }
 
 /// The root of the indexed project the working directory sits in, or `None` when
@@ -94,6 +106,7 @@ pub fn uninstall() -> Result<()> {
 
     println!("Project indexes are kept; delete each `.constellation/` to remove them");
     println!("Project hooks: delete `.claude/settings.local.json` in each indexed project");
+    println!("Project plugins: delete `.opencode/plugins/constellation.ts` in each project");
 
     Ok(())
 }
@@ -129,6 +142,96 @@ pub fn install_project_hook(root: &Path) {
             print_hooks_manual(root);
         }
     }
+}
+
+/// The OpenCode plugin written into one project's `.opencode/plugins/`, the
+/// counterpart to [`install_project_hook`] for the other client.
+///
+/// Project scope for the same reason the hook uses it: OpenCode loads a plugin
+/// from its global config directory into every session on the machine, including
+/// the ones constellation has never indexed. Writing it beside the index means
+/// the two appear and disappear together.
+///
+/// The plugin runs on `tool.execute.after` rather than before, because OpenCode's
+/// `tool.execute.before` can only rewrite a call's arguments and has no channel
+/// for injecting context. The search therefore still runs and the graph context
+/// is appended to its result. docs/hooks.md records the divergence.
+///
+/// The file is written whole rather than merged, so a plugin of the same name
+/// that constellation did not write is reported and left alone.
+pub fn install_project_plugin(root: &Path) {
+    match register_project_plugin(root) {
+        Ok(Some(path)) => println!("  plugin   written to {}", path.display()),
+        Ok(None) => {
+            let path = project_plugin_path(root);
+
+            println!("  plugin   kept {}: not written by constellation", path.display());
+        }
+        Err(error) => {
+            eprintln!("  plugin   not written: {error}");
+
+            print_plugin_manual(root);
+        }
+    }
+}
+
+/// The plugin file written into one project, returning its path. Returns `None`
+/// when a file is already there that constellation did not write, which is left
+/// untouched rather than overwritten.
+fn register_project_plugin(root: &Path) -> Result<Option<PathBuf>> {
+    let path = project_plugin_path(root);
+
+    if path.exists() {
+        let existing = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+
+        if !is_constellation_plugin(&existing) {
+            return Ok(None);
+        }
+
+        // Rewriting identical bytes would touch the file's modification time and
+        // wake OpenCode's own watcher for nothing.
+        if existing == OPENCODE_PLUGIN {
+            return Ok(Some(path));
+        }
+    }
+
+    write_plugin(&path, OPENCODE_PLUGIN)?;
+
+    Ok(Some(path))
+}
+
+/// Whether a plugin file is one constellation wrote, identified by the marker on
+/// its first line.
+fn is_constellation_plugin(source: &str) -> bool {
+    source
+        .lines()
+        .next()
+        .is_some_and(|line| line.starts_with(OPENCODE_PLUGIN_MARKER))
+}
+
+/// A project's OpenCode plugin file. OpenCode loads both `.opencode/plugin/` and
+/// `.opencode/plugins/`; the plural is the one its documentation names.
+fn project_plugin_path(root: &Path) -> PathBuf {
+    root.join(".opencode").join("plugins").join("constellation.ts")
+}
+
+/// The manual instruction printed when the plugin file cannot be written.
+fn print_plugin_manual(root: &Path) {
+    println!(
+        "  plugin   write the OpenCode plugin to {} by hand (see docs/hooks.md)",
+        project_plugin_path(root).display(),
+    );
+}
+
+/// A plugin file written to disk, creating parent directories as needed.
+fn write_plugin(path: &Path, source: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    std::fs::write(path, source).with_context(|| format!("writing {}", path.display()))
 }
 
 /// The hook entry merged into one project's `.claude/settings.local.json`,
@@ -589,8 +692,9 @@ fn write_config(path: &Path, config: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_command, opencode_config_path, read_config, resolve_opencode_dir, server_command,
-        write_config,
+        OPENCODE_PLUGIN, agent_command, is_constellation_plugin, opencode_config_path,
+        project_plugin_path, read_config, register_project_plugin, resolve_opencode_dir,
+        server_command, write_config,
     };
 
     use std::path::Path;
@@ -721,6 +825,64 @@ mod tests {
                 .and_then(|name| name.to_str()),
             Some("opencode"),
             "it lives under the opencode config directory",
+        );
+    }
+
+    #[test]
+    fn the_embedded_plugin_carries_its_own_marker() {
+        assert!(
+            is_constellation_plugin(OPENCODE_PLUGIN),
+            "the embedded plugin is recognised as constellation's own, so an install upgrades it",
+        );
+    }
+
+    #[test]
+    fn a_plugin_without_the_marker_is_not_mistaken_for_constellations() {
+        assert!(
+            !is_constellation_plugin("export const MyPlugin = async () => ({})\n"),
+            "a plugin constellation did not write is left alone rather than overwritten",
+        );
+    }
+
+    #[test]
+    fn project_plugin_path_sits_inside_the_project() {
+        let path = project_plugin_path(Path::new("/repo"));
+
+        assert_eq!(
+            path,
+            Path::new("/repo")
+                .join(".opencode")
+                .join("plugins")
+                .join("constellation.ts"),
+            "the plugin is written into the project, not the global config directory",
+        );
+    }
+
+    #[test]
+    fn registering_the_plugin_writes_it_and_then_leaves_a_foreign_file_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+
+        let written = register_project_plugin(root).unwrap().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap(),
+            OPENCODE_PLUGIN,
+            "a first install writes the embedded plugin"
+        );
+
+        let foreign = "export const MyPlugin = async () => ({})\n";
+        std::fs::write(&written, foreign).unwrap();
+
+        assert_eq!(
+            register_project_plugin(root).unwrap(),
+            None,
+            "a plugin constellation did not write is reported rather than replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&written).unwrap(),
+            foreign,
+            "and its contents survive the install"
         );
     }
 

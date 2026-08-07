@@ -16,6 +16,7 @@ assets/Output/
 .idea/
 .vscode/
 .claude/
+.opencode/
 .codegraph/
 CLAUDE.md
 AGENTS.md

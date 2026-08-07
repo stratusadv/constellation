@@ -66,7 +66,36 @@ pub(crate) fn create_index_directory(root: &Path) -> Result<PathBuf> {
     let index_directory = root.join(".constellation");
     std::fs::create_dir_all(&index_directory)?;
 
+    scaffold_ignore_file(&index_directory);
+
     Ok(index_directory.join("index.db"))
+}
+
+/// A self-ignoring `.gitignore` written into `.constellation/`, so the database,
+/// its write-ahead log, and the companion clones under `sources/` stay out of git
+/// without every indexed repository having to edit a `.gitignore` it owns. Cargo
+/// writes the same one-line file into `target/` for the same reason.
+///
+/// Ignoring the directory this way cannot hide anything from our own walk. The
+/// indexing walk drops `.constellation` by name through `SKIP_DIRECTORIES` before
+/// a gitignore is ever consulted, and a companion project rooted under `sources/`
+/// walks with `parents(false)`, so a file above its root is never read.
+///
+/// Written here rather than beside [`scaffold_config`] because both callers of
+/// [`create_index_directory`] need it: an ignore file that appears only on the
+/// path that also scaffolds a config leaves the other path committing the index.
+/// Best-effort and never clobbering, matching [`scaffold_config`]: an existing
+/// file is left alone, and a write failure is reported but not fatal.
+fn scaffold_ignore_file(index_directory: &Path) {
+    let path = index_directory.join(".gitignore");
+
+    if path.exists() {
+        return;
+    }
+
+    if let Err(error) = std::fs::write(&path, "*\n") {
+        eprintln!("constellation: could not write ignore file: {error}");
+    }
 }
 
 /// A project name from a repository root directory. Resolves `.`, `..`, and a
@@ -250,9 +279,44 @@ fn toml_string_array(values: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROFILE_NAME_DEFAULT, Profile, project_name, resolve_root, starter_config};
+    use super::{
+        PROFILE_NAME_DEFAULT, Profile, create_index_directory, project_name, resolve_root,
+        starter_config,
+    };
 
     use std::path::Path;
+
+    #[test]
+    fn creating_the_index_directory_ignores_it_from_git() {
+        let workspace = tempfile::tempdir().expect("a temporary workspace");
+        create_index_directory(workspace.path()).expect("the index directory");
+
+        let path = workspace.path().join(".constellation").join(".gitignore");
+        let text = std::fs::read_to_string(&path).expect("the ignore file is written");
+
+        assert_eq!(
+            text, "*\n",
+            "the directory ignores itself whole, so sources/ and the WAL need no listing",
+        );
+    }
+
+    #[test]
+    fn creating_the_index_directory_keeps_an_existing_ignore_file() {
+        let workspace = tempfile::tempdir().expect("a temporary workspace");
+        let index_directory = workspace.path().join(".constellation");
+        std::fs::create_dir_all(&index_directory).expect("the index directory");
+
+        let path = index_directory.join(".gitignore");
+        std::fs::write(&path, "*\n!config.toml\n").expect("a hand-edited ignore file");
+
+        create_index_directory(workspace.path()).expect("the index directory");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the ignore file survives"),
+            "*\n!config.toml\n",
+            "a developer's own negation is never clobbered by a reindex",
+        );
+    }
 
     #[test]
     fn the_starter_config_parses_and_states_only_its_defaults() {

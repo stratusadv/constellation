@@ -39,7 +39,7 @@ mod watch;
 pub use companions::{
     CompanionTarget, HistoryConfig, discover_companions, discover_versions,
     fetch_companion_history_repo, load_companion_repositories, load_history_config, load_profile,
-    load_profile_for_database,
+    load_profile_for_database, prune_stale_projects,
 };
 pub use extract::{index_paths_tracked, index_project_tracked};
 pub use fingerprint::{extractor_fingerprint, git_head};
