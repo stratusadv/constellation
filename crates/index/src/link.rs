@@ -5,12 +5,13 @@
 //! reversed in another project, a method inherited from a third-party base.
 
 
-use constellation_graph::{Edge, EdgeKind, Node, NodeId, NodeKind, ProjectId};
+use constellation_graph::{Edge, EdgeKind, Language, Node, NodeId, NodeKind, ProjectId};
 use constellation_linking::{ImportLinker, LinkContext, PendingImport, is_linkable, module_matches};
 use constellation_resolution::{
     ImportMapping,
     MANAGER_SUFFIXES, QUERYSET_DISPATCH, RECEIVER_ROOT, RETURNS_OF, SENTINEL_PREFIX,
     SERVICE_DISPATCH, SERVICE_SUFFIXES, SUPER_DISPATCH, TYPED_RECEIVER, UnresolvedRef,
+    is_store_member, source_language_family, store_dispatch_name,
 };
 use constellation_store::Store;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -22,6 +23,9 @@ use crate::limits::REFERENCE_COUNT_MAX;
 use crate::paths::{class_name_of, file_stem_is, package_root_name, project_prefix, template_owner};
 use crate::synthesize::external::EXTERNAL_TEMPLATE_MARKER;
 use crate::synthesize::overrides::method_owner_id;
+
+/// The provenance on an inherited-method call bound within one project.
+const INHERITED_PROVENANCE: &str = "resolution:inherited-method";
 
 /// The whole constellation, linked: match every project's still-pending imports
 /// against symbols exported by other projects, persist the matches as
@@ -90,6 +94,7 @@ pub fn link_constellation(store: &Store) -> Result<u32, IndexError> {
                 cross_project_relation(reference, &context)
             }
             EdgeKind::Handles | EdgeKind::UsesTag => cross_project_handler(reference, &context),
+            EdgeKind::Instantiates => cross_project_instantiation(reference, &context),
             EdgeKind::Resolves => cross_project_reverse(reference, &reverse_index),
             _ => None,
         };
@@ -203,13 +208,12 @@ fn link_inherited_methods(
             continue;
         }
 
-        let edge = Edge::new(
-            reference.from_node_id.clone(),
-            NodeId::from_raw(target.to_string()),
-            EdgeKind::Calls,
-        )
-        .at(reference.line, reference.column)
-        .with_provenance("resolution:inherited-method");
+        let target_id = NodeId::from_raw(target.to_string());
+        let provenance = call_provenance(reference.from_node_id.project_prefix(), &target_id);
+
+        let edge = Edge::new(reference.from_node_id.clone(), target_id, EdgeKind::Calls)
+            .at(reference.line, reference.column)
+            .with_provenance(provenance);
 
         bound.push((*reference_id, edge));
     }
@@ -217,6 +221,26 @@ fn link_inherited_methods(
     assert!(bound.len() <= pending.len(), "no more edges than pending references");
 
     Ok(store.commit_resolved(&bound)?)
+}
+
+/// The provenance for a call the inheritance/receiver pass bound: the linker's
+/// `link:<from>-><to>` tag when the target lives in another project, and the
+/// plain [`INHERITED_PROVENANCE`] otherwise.
+///
+/// This pass binds calls across a repository boundary too (`dg.glue_model_object()`
+/// through an aliased package, a method inherited from a companion's base), and
+/// those are cross-project links by every measure the `links` tool applies. Tagging
+/// them as within-project resolution hid them from it.
+fn call_provenance(source_project: &str, target: &NodeId) -> String {
+    assert!(!source_project.is_empty(), "a bound call carries its source project");
+
+    let target_project = target.project_prefix();
+
+    if source_project == target_project {
+        return INHERITED_PROVENANCE.to_string();
+    }
+
+    format!("link:{source_project}->{target_project}")
 }
 
 /// The target a call whose receiver is a bare imported name resolves to, or
@@ -269,9 +293,11 @@ fn receiver_typed_target<'graph>(
 
     assert!(!binding.source.is_empty(), "an import binding names its source module");
 
+    let family = source_language_family(reference.language);
+
     // The receiver names a class the constellation indexes: the method is its own
     // or a single ancestor's.
-    if let Some(class) = sole_class_named(receiver, graph) {
+    if let Some(class) = sole_class_named(receiver, family, graph) {
         return graph
             .by_owner
             .get(&(class, name))
@@ -364,8 +390,9 @@ fn relation_call_target<'graph>(
     } else {
         // The annotated type of the root, carried past the receiver text.
         let model = reference.candidates.get(2).map(String::as_str)?;
+        let family = source_language_family(reference.language);
 
-        (sole_class_named(model, graph)?, model)
+        (sole_class_named(model, family, graph)?, model)
     };
 
     let related = graph
@@ -486,16 +513,29 @@ fn inherited_call_target<'graph>(
             // method is that class's own, a single ancestor's, or, when the type is
             // a model, one on the queryset its manager dispatches through. The
             // own-class case is the resolver's, but only within the class's *own*
-            // project, so a type defined in a companion still arrives here.
-            let class = graph.receiver_class(trailing)?;
+            // project, so a type defined in a companion still arrives here. The
+            // reference's language family scopes the class lookup, so an x-data
+            // property built with `new QuerySetGlue(...)` types as the JavaScript
+            // class even though django-glue's Python side shares the name.
+            let family = source_language_family(reference.language);
+            let class = graph.receiver_class(trailing, family)?;
 
-            by_owner
+            let direct = by_owner
                 .get(&(class, name))
                 .copied()
-                .or_else(|| sole_inherited_method(class, name, bases, by_owner))
-                .or_else(|| {
-                    sole_companion_method(class_name_of(class), name, MANAGER_SUFFIXES, graph)
-                })
+                .or_else(|| sole_inherited_method(class, name, bases, by_owner));
+
+            if direct.is_some() {
+                return direct;
+            }
+
+            // Manager dispatch is a Django convention, so only a Python-side
+            // receiver falls through to the model's queryset companions.
+            if family == Some(Language::JavaScript) {
+                return None;
+            }
+
+            sole_companion_method(class_name_of(class), name, MANAGER_SUFFIXES, graph)
         }
         Some(candidate) if !candidate.starts_with(SENTINEL_PREFIX) => {
             let class = by_qualified.get(candidate)?;
@@ -613,8 +653,17 @@ fn cross_project_relation(reference: &UnresolvedRef, context: &dyn LinkContext) 
 /// (django-spire's modal component), which per-project resolution cannot see across
 /// the boundary. An ambiguous name (defined in more than one other project) stays
 /// unlinked, the same no-false-edge discipline the import and relation links keep.
+///
+/// The candidate pool is held to the language the kind names: a `Handles`
+/// reference is an Alpine expression and binds only JavaScript (before this
+/// filter, a glue template's `@click="remove_file(...)"` with no JavaScript
+/// definition anywhere bound the sole *Python* `remove_file` another project
+/// defines), and a `UsesTag` names the Python function a `@register` decorator
+/// exposes. A store dispatch (`$store.theme.families()`) binds only within the
+/// registration its store name pins.
 fn cross_project_handler(reference: &UnresolvedRef, context: &dyn LinkContext) -> Option<Edge> {
     let project = reference.from_node_id.project_prefix();
+    let language = handler_target_language(reference.reference_kind);
 
     let mut matched = context
         .exports_by_name(&reference.reference_name)
@@ -622,6 +671,69 @@ fn cross_project_handler(reference: &UnresolvedRef, context: &dyn LinkContext) -
         .filter(|node| {
             node.project_id.as_str() != project
                 && matches!(node.kind, NodeKind::Function | NodeKind::Method)
+                && node.language == language
+                && store_scope_matches(reference, node)
+        });
+
+    let (Some(target), None) = (matched.next(), matched.next()) else {
+        return None;
+    };
+
+    let provenance = format!("link:{}->{}", project, target.project_id);
+
+    Some(
+        Edge::new(reference.from_node_id.clone(), target.id.clone(), reference.reference_kind)
+            .at(reference.line, reference.column)
+            .with_provenance(provenance),
+    )
+}
+
+/// The language a cross-project handler link must land in: an Alpine `Handles`
+/// reference names JavaScript, and a template `UsesTag` names the Python
+/// function a `@register` decorator exposes. Only those two kinds route here.
+fn handler_target_language(kind: EdgeKind) -> Language {
+    match kind {
+        EdgeKind::Handles => Language::JavaScript,
+        EdgeKind::UsesTag => Language::Python,
+        _ => unreachable!("only handler kinds reach the cross-project handler link"),
+    }
+}
+
+/// Whether a handler candidate satisfies a reference's store scope: a plain
+/// handler reference accepts any candidate, and a store dispatch only a member
+/// of the Alpine registration its store name pins.
+fn store_scope_matches(reference: &UnresolvedRef, node: &Node) -> bool {
+    match store_dispatch_name(reference) {
+        Some(store) => is_store_member(node, store, &reference.reference_name),
+        None => true,
+    }
+}
+
+/// A leftover JavaScript instantiation linked to the sole JavaScript class of
+/// that name in another project: a template's
+/// `x-data="{ contract: new ModelObjectGlue('contract') }"` (or a script's
+/// `new QuerySetGlue(...)`) whose class an installed app defines. Only a
+/// JavaScript-side reference links (a pending Python instantiation is the
+/// external-stub synthesis's concern), and only to a JavaScript class, so the
+/// Python class django-glue names identically is never the target. An ambiguous
+/// name stays unlinked, the same no-false-edge discipline as every link here.
+fn cross_project_instantiation(
+    reference: &UnresolvedRef,
+    context: &dyn LinkContext,
+) -> Option<Edge> {
+    if !matches!(reference.language, Language::JavaScript | Language::HtmlDjango) {
+        return None;
+    }
+
+    let project = reference.from_node_id.project_prefix();
+
+    let mut matched = context
+        .exports_by_name(&reference.reference_name)
+        .into_iter()
+        .filter(|node| {
+            node.project_id.as_str() != project
+                && node.kind == NodeKind::Class
+                && node.language == Language::JavaScript
         });
 
     let (Some(target), None) = (matched.next(), matched.next()) else {

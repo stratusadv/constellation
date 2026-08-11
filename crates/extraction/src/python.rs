@@ -240,13 +240,24 @@ const CHAIN_DEPTH_MAX: u32 = 32;
 /// is its legacy alias.
 const QUERYSET_SOURCE_METHODS: &[&str] = &["get_queryset", "get_query_set"];
 
-/// The object-fetch helper that binds a single model instance; its first
-/// argument names the model.
-const INSTANCE_GET_FUNCTION: &str = "get_object_or_404";
+/// The object-fetch helpers that bind a single model instance; the first
+/// argument of each names the model.
+///
+/// Django ships `get_object_or_404`; the rest are this stack's shortcuts with the
+/// same shape and return, and they are the dominant spelling in the portals
+/// (`get_object_or_null_obj` alone accounts for a third of the instance fetches).
+/// Leaving them out left the local untyped, which broke every downstream
+/// consumer of that type: the `{{ var.attr }}` member synthesis, and with it the
+/// django-glue `glue_*field='name.field'` bindings that key off the same name.
+const INSTANCE_GET_FUNCTIONS: &[&str] = &[
+    "get_object_or_404",
+    "get_object_or_none",
+    "get_object_or_null_obj",
+];
 
-/// The object-fetch helper that binds a list of a model; its first argument
-/// names the model and the local is a collection.
-const COLLECTION_GET_FUNCTION: &str = "get_list_or_404";
+/// The object-fetch helpers that bind a list of a model; the first argument of
+/// each names the model and the local is a collection.
+const COLLECTION_GET_FUNCTIONS: &[&str] = &["get_list_or_404"];
 
 /// The queryset terminal methods that return a single model instance rather than a
 /// queryset, so `x = Model.objects.get(...)` types `x` as an instance, not a
@@ -2175,10 +2186,13 @@ fn context_call_type<'bytes>(bytes: &'bytes [u8], call: TsNode<'_>) -> Option<(&
 
     if function.kind() == "identifier" {
         let name = node_text(bytes, function);
-        let collection = match name {
-            INSTANCE_GET_FUNCTION => false,
-            COLLECTION_GET_FUNCTION => true,
-            _ => return None,
+
+        let collection = if INSTANCE_GET_FUNCTIONS.contains(&name) {
+            false
+        } else if COLLECTION_GET_FUNCTIONS.contains(&name) {
+            true
+        } else {
+            return None;
         };
 
         let model = positional_args(call).first().and_then(|node| type_name_of(bytes, *node))?;

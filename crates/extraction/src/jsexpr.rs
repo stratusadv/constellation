@@ -13,6 +13,7 @@ use std::cell::RefCell;
 
 use tree_sitter::{Node as TsNode, Parser};
 
+use crate::jsobject::{AlpineObject, first_object, method_member, typed_property};
 use crate::tsutil::{node_text, to_u32};
 
 /// The JavaScript global functions called from Alpine expressions that are not
@@ -49,15 +50,68 @@ const JS_CALL_BUILTINS: &[&str] = &[
 /// Whether a called name is a non-handler JavaScript global: an Alpine magic
 /// (`$`-prefixed) or a builtin in [`JS_CALL_BUILTINS`]. Such a call is never a
 /// project-defined handler, so it must not become a `Handles` reference.
-fn is_js_non_handler(name: &str) -> bool {
+pub(crate) fn is_js_non_handler(name: &str) -> bool {
     name.starts_with('$') || JS_CALL_BUILTINS.contains(&name)
 }
 
+/// The JavaScript global constructors instantiated from Alpine expressions that
+/// are never project-defined classes, so an `Instantiates` reference to one
+/// never resolves and is pure noise. Skipped when collecting instantiations,
+/// the constructor analogue of [`JS_CALL_BUILTINS`].
+const JS_NEW_BUILTINS: &[&str] = &[
+    "AbortController",
+    "Array",
+    "Audio",
+    "Blob",
+    "CustomEvent",
+    "DOMParser",
+    "Date",
+    "Error",
+    "Event",
+    "File",
+    "FileReader",
+    "FormData",
+    "Image",
+    "IntersectionObserver",
+    "Map",
+    "MutationObserver",
+    "Object",
+    "Promise",
+    "Proxy",
+    "RegExp",
+    "ResizeObserver",
+    "Set",
+    "URL",
+    "URLSearchParams",
+    "WeakMap",
+    "WeakSet",
+    "WebSocket",
+    "XMLHttpRequest",
+];
+
+/// Whether an instantiated name is a non-project JavaScript constructor: an
+/// Alpine magic (`$`-prefixed) or a builtin in [`JS_NEW_BUILTINS`]. Such a
+/// `new` never names a project-defined class, so it must not become an
+/// `Instantiates` reference or type a component property.
+pub(crate) fn is_js_builtin_constructor(name: &str) -> bool {
+    name.starts_with('$') || JS_NEW_BUILTINS.contains(&name)
+}
+
 /// A fail-fast bound on the node-walk loop.
-const WALK_ITERATIONS_MAX: u32 = 5_000_000;
+pub(crate) const WALK_ITERATIONS_MAX: u32 = 5_000_000;
 
 /// A fail-fast bound on the fan-out examined at a single node.
-const CHILDREN_MAX: u32 = 1_000_000;
+pub(crate) const CHILDREN_MAX: u32 = 1_000_000;
+
+/// A fail-fast bound on the descent through an expression's single-child levels,
+/// far past the nesting a wrapped Alpine attribute value can produce.
+const EXPRESSION_DEPTH_MAX: u32 = 1_000;
+
+/// The property a glue object exposes its field map under, in each django-glue
+/// version this indexes: `glue_fields` in 0.x, `$fields` in 1.x. Both spell the
+/// same access, `<glue_name>.<map>.<field>`, and both versions are installed
+/// across the projects here, so both are read.
+pub(crate) const GLUE_FIELD_MAPS: &[&str] = &["$fields", "glue_fields"];
 
 /// A fail-fast bound on the Django-tag scan: far past the number of `{% %}`/`{{ }}`
 /// tags any single Alpine attribute value could hold.
@@ -247,6 +301,36 @@ impl AlpineExpr {
         names
     }
 
+    /// The single bare identifier the expression consists of (`printQrCode`), or
+    /// `None` when it is anything more: a call, an assignment, a member access, a
+    /// literal, a comparison.
+    ///
+    /// Alpine invokes a listener expression whose value is a function, so
+    /// `@click="printQrCode"` binds the same handler `@click="printQrCode()"`
+    /// does. A bare identifier naming state rather than a method
+    /// (`@click="open"`) has no function of that name to bind to and stays
+    /// pending, so reading one can add no false edge.
+    pub(crate) fn bare_identifier(&mut self, value: &str) -> Option<String> {
+        let sanitized = blank_django_tags(value);
+        let trimmed = sanitized.trim();
+
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let wrapped = format!("({trimmed})");
+        let tree = PARSER.with(|parser| parser.borrow_mut().parse(&wrapped, None))?;
+
+        let identifier = sole_identifier(tree.root_node())?;
+        let name = node_text(wrapped.as_bytes(), identifier);
+
+        if name.is_empty() || is_js_non_handler(name) {
+            return None;
+        }
+
+        Some(name.to_string())
+    }
+
     /// The event names dispatched by `$dispatch('event')` calls in the
     /// expression.
     pub(crate) fn dispatched_events(&mut self, value: &str) -> Vec<String> {
@@ -272,13 +356,14 @@ impl AlpineExpr {
         events
     }
 
-    /// The django-glue field accesses in the expression: `Glue.model.task.title`
-    /// / `Glue.form.contact.email` -> `(glue_name, field)` pairs, where
-    /// `glue_name` is the unique name the proxy was registered under and `field`
-    /// is the first field read on it. Only the field-bearing proxy kinds (`model`,
-    /// `form`) match; `querySet`, `template`, and `function` are skipped.
-    /// Deduplicated, source order preserved. Drives the rewrite's frontend
-    /// `AccessesMember` edges (template -> model member).
+    /// The django-glue field accesses in the expression, in either version's
+    /// spelling: the 1.x proxy (`Glue.model.task.title`, `Glue.form.contact.email`)
+    /// and the field map both versions expose on a glue object
+    /// (`record.glue_fields.quantity` in 0.x, `record.$fields.quantity` in 1.x).
+    /// Each yields a `(glue_name, field)` pair, where `glue_name` is the unique
+    /// name the object was registered under and `field` is the field read on it.
+    /// Deduplicated, source order preserved. Drives the `AccessesMember` edges
+    /// (template -> model member).
     pub(crate) fn glue_member_accesses(&mut self, value: &str) -> Vec<(String, String)> {
         let mut accesses: Vec<(String, String)> = Vec::new();
 
@@ -318,29 +403,32 @@ impl AlpineExpr {
         classes
     }
 
-    /// The methods of an Alpine `x-data` object literal, each with its 1-based
-    /// line, so `@event` handlers resolve to a real node. Covers method
+    /// The members of an Alpine `x-data` object literal: its methods, each with
+    /// its 1-based line (so `@event` handlers resolve to a real node) and the
+    /// calls its body makes, plus its `new`-initialized data properties
+    /// (`rows: new QuerySetGlue('rows')`), whose classes type the
+    /// `this.<property>.<method>()` calls the method bodies make. Covers method
     /// shorthand (`save() {}`) and function-valued properties
     /// (`save: () => {}`). A non-object value yields nothing.
-    pub(crate) fn object_methods(&mut self, value: &str, base_line: u32) -> Vec<(String, u32)> {
+    pub(crate) fn x_data_object(&mut self, value: &str, base_line: u32) -> AlpineObject {
         if !value.trim_start().starts_with('{') {
-            return Vec::new();
+            return AlpineObject::empty();
         }
 
         let sanitized = blank_django_tags(value);
         let wrapped = format!("({sanitized})");
 
         let Some(tree) = PARSER.with(|parser| parser.borrow_mut().parse(&wrapped, None)) else {
-            return Vec::new();
+            return AlpineObject::empty();
         };
 
         let bytes = wrapped.as_bytes();
 
         let Some(object) = first_object(tree.root_node()) else {
-            return Vec::new();
+            return AlpineObject::empty();
         };
 
-        let mut methods: Vec<(String, u32)> = Vec::new();
+        let mut component = AlpineObject::empty();
         let mut cursor = object.walk();
         let mut count: u32 = 0;
 
@@ -349,14 +437,85 @@ impl AlpineExpr {
 
             assert!(count <= CHILDREN_MAX, "object fan-out exceeded {CHILDREN_MAX}");
 
-            if let Some((name, name_node)) = method_member(bytes, child) {
-                let line = base_line.saturating_add(to_u32(name_node.start_position().row));
-
-                methods.push((name.to_string(), line));
+            if let Some(method) = method_member(bytes, child, base_line) {
+                component.methods.push(method);
+            } else if let Some(property) = typed_property(bytes, child) {
+                component.typed_properties.push(property);
             }
         }
 
-        methods
+        component
+    }
+
+    /// The class names instantiated in the expression (`new QuerySetGlue('x')`
+    /// -> `QuerySetGlue`), each with the 1-based line of its first
+    /// instantiation. Covers the bare constructor and the trailing property of
+    /// a member access (`new glue.QuerySetGlue()`); builtin constructors are
+    /// skipped. Deduplicated, ordered by line. Drives the `Instantiates`
+    /// references from a template's Alpine attributes to the JavaScript
+    /// classes its component state is built from.
+    pub(crate) fn instantiations(&mut self, value: &str, base_line: u32) -> Vec<(String, u32)> {
+        let mut classes: Vec<(String, u32)> = Vec::new();
+
+        self.with_tree(value, |bytes, node| {
+            if node.kind() != "new_expression" {
+                return;
+            }
+
+            let Some(constructor) = node.child_by_field_name("constructor") else {
+                return;
+            };
+
+            let Some(name) = callee_name(bytes, constructor) else {
+                return;
+            };
+
+            if name.is_empty() || is_js_builtin_constructor(name) {
+                return;
+            }
+
+            let line = base_line.saturating_add(to_u32(node.start_position().row));
+
+            // The walk visits nodes in reverse source order, so an already-seen
+            // name keeps the smallest line rather than the first visited.
+            match classes.iter_mut().find(|(seen, _)| seen == name) {
+                Some((_, seen_line)) => *seen_line = (*seen_line).min(line),
+                None => classes.push((name.to_string(), line)),
+            }
+        });
+
+        classes.sort_by_key(|(_, line)| *line);
+
+        classes
+    }
+
+    /// The `(store, member)` Alpine store method calls in the expression
+    /// (`$store.theme.families()` -> `("theme", "families")`). Only the exact
+    /// three-link chain rooted at the `$store` magic matches, so a deeper
+    /// `$store.theme.config.load()` contributes nothing rather than a wrong
+    /// pair. Deduplicated, source order preserved.
+    pub(crate) fn store_calls(&mut self, value: &str) -> Vec<(String, String)> {
+        let mut calls: Vec<(String, String)> = Vec::new();
+
+        self.with_tree(value, |bytes, node| {
+            if node.kind() != "call_expression" {
+                return;
+            }
+
+            let Some(function) = node.child_by_field_name("function") else {
+                return;
+            };
+
+            if let Some((store, member)) = store_member(bytes, function)
+                && !calls.iter().any(|(seen_store, seen_member)| {
+                    seen_store == store && seen_member == member
+                })
+            {
+                calls.push((store.to_string(), member.to_string()));
+            }
+        });
+
+        calls
     }
 
     /// The walk that parses `value` as a parenthesized expression and invokes
@@ -394,72 +553,65 @@ impl AlpineExpr {
     }
 }
 
-/// The first `object` node in a tree, depth-first: the outermost object of a
-/// wrapped `({ ... })` value.
-fn first_object(root: TsNode<'_>) -> Option<TsNode<'_>> {
-    let mut stack: Vec<TsNode> = vec![root];
-    let mut iterations: u32 = 0;
+/// The lone `identifier` an expression tree reduces to, following the single
+/// named child down from the wrapped root. `None` the moment a level holds
+/// anything other than exactly one named child, or the descent ends on a node
+/// that is not an identifier: either means the expression is more than a name.
+fn sole_identifier(root: TsNode<'_>) -> Option<TsNode<'_>> {
+    let mut node = root;
+    let mut depth: u32 = 0;
 
-    while let Some(node) = stack.pop() {
-        iterations += 1;
+    loop {
+        depth += 1;
 
-        assert!(iterations <= WALK_ITERATIONS_MAX, "object search exceeded {WALK_ITERATIONS_MAX}");
+        assert!(depth <= EXPRESSION_DEPTH_MAX, "descent exceeded {EXPRESSION_DEPTH_MAX} levels");
 
-        if node.kind() == "object" {
+        if node.kind() == "identifier" {
             return Some(node);
         }
 
-        let mut cursor = node.walk();
-        let mut count: u32 = 0;
+        let only = {
+            let mut cursor = node.walk();
+            let mut children = node.named_children(&mut cursor);
 
-        for child in node.named_children(&mut cursor) {
-            count += 1;
+            match (children.next(), children.next()) {
+                (Some(only), None) => only,
+                _ => return None,
+            }
+        };
 
-            assert!(count <= CHILDREN_MAX, "object-search child fan-out exceeded {CHILDREN_MAX}");
-
-            stack.push(child);
-        }
+        node = only;
     }
-
-    None
 }
 
-/// The name and name-node of a direct child of an object literal that defines a
-/// method: a `method_definition` (`save() {}`) or a `pair` whose value is
-/// a function or arrow (`save: () => {}`). `None` for a non-method child.
-fn method_member<'bytes, 'tree>(
+/// The `(store, member)` of a `$store.<store>.<member>` chain. The chain is
+/// exactly three links (the `$store` magic, the store name, and the member),
+/// so a deeper access does not match.
+fn store_member<'bytes>(
     bytes: &'bytes [u8],
-    child: TsNode<'tree>,
-) -> Option<(&'bytes str, TsNode<'tree>)> {
-    match child.kind() {
-        "method_definition" => {
-            let name_node = child.child_by_field_name("name")?;
-
-            Some((node_text(bytes, name_node), name_node))
-        }
-        "pair" => {
-            let value = child.child_by_field_name("value")?;
-
-            if !matches!(value.kind(), "function" | "function_expression" | "arrow_function" | "generator_function") {
-                return None;
-            }
-
-            let name_node = child.child_by_field_name("key")?;
-
-            let name = match name_node.kind() {
-                "property_identifier" => node_text(bytes, name_node),
-                "string" => string_literal(bytes, name_node)?,
-                _ => return None,
-            };
-
-            if name.is_empty() {
-                return None;
-            }
-
-            Some((name, name_node))
-        }
-        _ => None,
+    node: TsNode<'_>,
+) -> Option<(&'bytes str, &'bytes str)> {
+    if node.kind() != "member_expression" {
+        return None;
     }
+
+    let member = node_text(bytes, node.child_by_field_name("property")?);
+
+    let store_node = node.child_by_field_name("object")?;
+
+    if store_node.kind() != "member_expression" {
+        return None;
+    }
+
+    let store = node_text(bytes, store_node.child_by_field_name("property")?);
+
+    let magic = store_node.child_by_field_name("object")?;
+
+    if magic.kind() != "identifier" || node_text(bytes, magic) != "$store" {
+        return None;
+    }
+
+    Some((store, member))
 }
 
 /// The `(glue_name, field)` of a `Glue.<kind>.<name>.<field>` member access on a
@@ -468,6 +620,18 @@ fn method_member<'bytes, 'tree>(
 /// field), so a deeper `Glue.model.task.address.city` matches only at `.address`
 /// (its first field), whose own type the synthesis does not track.
 fn glue_field_access<'bytes>(bytes: &'bytes [u8], node: TsNode<'_>) -> Option<(&'bytes str, &'bytes str)> {
+    proxy_field_access(bytes, node).or_else(|| field_map_access(bytes, node))
+}
+
+/// The `(glue_name, field)` of a 1.x proxy access, `Glue.model.task.title` /
+/// `Glue.form.contact.email`. Only the field-bearing proxy kinds (`model`,
+/// `form`) match; `querySet`, `template`, `function`, and `json` are skipped,
+/// the first because its fields belong to the elements rather than the
+/// collection and the rest because they carry no model fields at all.
+fn proxy_field_access<'bytes>(
+    bytes: &'bytes [u8],
+    node: TsNode<'_>,
+) -> Option<(&'bytes str, &'bytes str)> {
     let field = node_text(bytes, node.child_by_field_name("property")?);
 
     let name_node = node.child_by_field_name("object")?;
@@ -495,6 +659,42 @@ fn glue_field_access<'bytes>(bytes: &'bytes [u8], node: TsNode<'_>) -> Option<(&
     if glue.kind() != "identifier" || node_text(bytes, glue) != "Glue" {
         return None;
     }
+
+    Some((name, field))
+}
+
+/// The `(glue_name, field)` of a field-map access, `record.glue_fields.quantity`
+/// (0.x) or `record.$fields.quantity` (1.x), which is how a template reads a
+/// field off a glue object it was handed rather than off the `Glue` root. The
+/// dominant spelling in the 0.x portals, where the proxy API does not exist.
+///
+/// The owner may itself be a member expression (`this.record.$fields.quantity`
+/// inside an `x-data` method), in which case its trailing property is the glue
+/// unique name.
+fn field_map_access<'bytes>(
+    bytes: &'bytes [u8],
+    node: TsNode<'_>,
+) -> Option<(&'bytes str, &'bytes str)> {
+    let field = node_text(bytes, node.child_by_field_name("property")?);
+
+    let map_node = node.child_by_field_name("object")?;
+
+    if map_node.kind() != "member_expression" {
+        return None;
+    }
+
+    let map = node_text(bytes, map_node.child_by_field_name("property")?);
+
+    if !GLUE_FIELD_MAPS.contains(&map) {
+        return None;
+    }
+
+    let owner = map_node.child_by_field_name("object")?;
+    let name = match owner.kind() {
+        "identifier" => node_text(bytes, owner),
+        "member_expression" => node_text(bytes, owner.child_by_field_name("property")?),
+        _ => return None,
+    };
 
     Some((name, field))
 }
@@ -540,6 +740,40 @@ mod tests {
     #[test]
     fn blank_django_tags_blanks_an_unterminated_tag_through_the_end() {
         assert_eq!(blank_django_tags("{{ x"), "    ", "an unclosed tag is blanked to the end of input");
+    }
+
+    #[test]
+    fn bare_identifier_reads_a_lone_name_and_refuses_anything_more() {
+        let mut expressions = AlpineExpr::new().expect("the javascript grammar loads");
+
+        assert_eq!(
+            expressions.bare_identifier("printQrCode"),
+            Some("printQrCode".to_string()),
+            "a lone name is the handler Alpine would invoke",
+        );
+        assert_eq!(
+            expressions.bare_identifier("  close_modal  "),
+            Some("close_modal".to_string()),
+            "surrounding whitespace does not change the name",
+        );
+
+        let not_handlers = [
+            "save()",
+            "open = !open",
+            "obj.method",
+            "$dispatch",
+            "a && b",
+            "'text'",
+            "",
+        ];
+
+        for expression in not_handlers {
+            assert_eq!(
+                expressions.bare_identifier(expression),
+                None,
+                "{expression:?} is more than a bare name, or is not a handler",
+            );
+        }
     }
 
     #[test]
@@ -617,34 +851,37 @@ mod tests {
     }
 
     #[test]
-    fn object_methods_finds_shorthand_and_function_valued_properties() {
+    fn instantiations_reads_project_constructors_and_skips_builtins() {
         let mut expressions = AlpineExpr::new().expect("the javascript grammar loads");
 
+        let value = "{\n  contract: new ModelObjectGlue('contract'),\n  rows: new QuerySetGlue('rows'),\n  \
+                     again: new ModelObjectGlue('again'),\n  when: new Date(),\n}";
+
         assert_eq!(
-            expressions.object_methods("{ save() {}, count: 0, load: () => {} }", 1),
-            vec![("save".to_string(), 1), ("load".to_string(), 1)],
-            "method shorthand and arrow-valued properties are methods; a data field is not",
+            expressions.instantiations(value, 5),
+            vec![("ModelObjectGlue".to_string(), 6), ("QuerySetGlue".to_string(), 7)],
+            "each project class appears once at its first line; a builtin (Date) is skipped",
         );
     }
 
     #[test]
-    fn object_methods_offsets_each_method_line_by_the_base() {
+    fn store_calls_reads_the_exact_store_chain_only() {
         let mut expressions = AlpineExpr::new().expect("the javascript grammar loads");
 
         assert_eq!(
-            expressions.object_methods("{\n  alpha() {},\n  beta() {}\n}", 10),
-            vec![("alpha".to_string(), 11), ("beta".to_string(), 12)],
-            "each method's line is the base line plus its row within the value",
+            expressions.store_calls("$store.theme.families().then(f => families = f)"),
+            vec![("theme".to_string(), "families".to_string())],
+            "a $store.<name>.<member>() call yields (store, member)",
         );
-    }
-
-    #[test]
-    fn object_methods_ignores_a_non_object_value() {
-        let mut expressions = AlpineExpr::new().expect("the javascript grammar loads");
 
         assert!(
-            expressions.object_methods("save()", 1).is_empty(),
-            "an expression that is not an object literal has no methods",
+            expressions.store_calls("$store.theme.config.load()").is_empty(),
+            "a deeper chain does not guess at a (store, member) pair",
+        );
+
+        assert!(
+            expressions.store_calls("store.theme.families()").is_empty(),
+            "a chain not rooted at the $store magic is not a store call",
         );
     }
 }

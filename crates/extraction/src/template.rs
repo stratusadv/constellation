@@ -3,11 +3,15 @@ use std::cell::RefCell;
 use constellation_graph::{
     Edge, EdgeKind, Language, Node, NodeId, NodeIdentity, NodeKind, ProjectId, Span,
 };
-use constellation_resolution::{EventRecord, EventRole, UnresolvedRef};
+use constellation_resolution::{
+    EventRecord, EventRole, STORE_DISPATCH, TYPED_RECEIVER, UnresolvedRef,
+};
 use tree_sitter::{Node as TsNode, Parser};
 
+use crate::builtins::{TEMPLATE_BUILTIN_FILTERS, TEMPLATE_BUILTIN_TAGS};
 use crate::django::{self, AstNode};
-use crate::jsexpr::AlpineExpr;
+use crate::jsexpr::{AlpineExpr, GLUE_FIELD_MAPS};
+use crate::jsobject::{AlpineCall, AlpineMethod, AlpineObject, AlpineReceiver};
 use crate::tsutil::{line_1based, node_text};
 use crate::{ExtractionOutput, Extractor};
 
@@ -19,128 +23,6 @@ const CHILDREN_MAX: u32 = 1_000_000;
 
 /// The provenance tag on edges this extractor produces for Alpine component methods.
 const ALPINE_PROVENANCE: &str = "alpine";
-
-/// The built-in Django template tags (and the `{% end... %}` closers and clause
-/// words a leaf/block tag node can surface), none of which a project defines, so a
-/// `UsesTag` reference to one would only be permanent noise. A tag not listed is a
-/// custom `{% my_tag %}` from a `{% load %}`-ed library, resolved to its
-/// `@register.simple_tag`/`inclusion_tag` function by name.
-const TEMPLATE_BUILTIN_TAGS: &[&str] = &[
-    "autoescape",
-    "block",
-    "blocktrans",
-    "blocktranslate",
-    "comment",
-    "csrf_token",
-    "cycle",
-    "debug",
-    "elif",
-    "else",
-    "empty",
-    "endautoescape",
-    "endblock",
-    "endblocktrans",
-    "endblocktranslate",
-    "endcomment",
-    "endfilter",
-    "endfor",
-    "endif",
-    "endifchanged",
-    "endspaceless",
-    "endverbatim",
-    "endwith",
-    "extends",
-    "filter",
-    "firstof",
-    "for",
-    "if",
-    "ifchanged",
-    "include",
-    "load",
-    "lorem",
-    "now",
-    "plural",
-    "regroup",
-    "resetcycle",
-    "spaceless",
-    "static",
-    "templatetag",
-    "trans",
-    "translate",
-    "url",
-    "verbatim",
-    "widthratio",
-    "with",
-];
-
-/// The built-in Django template filters plus the `humanize` contrib set, excluded
-/// from `UsesTag` references for the same reason as the built-in tags. A filter not
-/// listed is a custom `@register.filter`.
-const TEMPLATE_BUILTIN_FILTERS: &[&str] = &[
-    "add",
-    "addslashes",
-    "apnumber",
-    "capfirst",
-    "center",
-    "cut",
-    "date",
-    "default",
-    "default_if_none",
-    "dictsort",
-    "dictsortreversed",
-    "divisibleby",
-    "escape",
-    "escapejs",
-    "filesizeformat",
-    "first",
-    "floatformat",
-    "force_escape",
-    "get_digit",
-    "intcomma",
-    "intword",
-    "iriencode",
-    "join",
-    "json_script",
-    "last",
-    "length",
-    "length_is",
-    "linebreaks",
-    "linebreaksbr",
-    "linenumbers",
-    "ljust",
-    "lower",
-    "make_list",
-    "naturalday",
-    "naturaltime",
-    "ordinal",
-    "phone2numeric",
-    "pluralize",
-    "pprint",
-    "random",
-    "rjust",
-    "safe",
-    "safeseq",
-    "slice",
-    "slugify",
-    "stringformat",
-    "striptags",
-    "time",
-    "timesince",
-    "timeuntil",
-    "title",
-    "truncatechars",
-    "truncatechars_html",
-    "truncatewords",
-    "truncatewords_html",
-    "unordered_list",
-    "upper",
-    "urlencode",
-    "urlize",
-    "urlizetrunc",
-    "wordcount",
-    "wordwrap",
-    "yesno",
-];
 
 /// An extractor of Django templates across three proper parsers, replacing the former
 /// hand-rolled byte scanners: the `django` front end reads `{% extends %}` /
@@ -544,19 +426,45 @@ fn process_attribute(
 
     assert!(!name.is_empty(), "attribute name must not be empty");
 
-    // The rewrite's frontend reads model fields as `Glue.model.<name>.<field>` /
-    // `Glue.form.<name>.<field>` in any Alpine attribute value (an x-data object
-    // included), so extract those accesses up front. The cheap substring gate
-    // keeps non-glue attributes (the common case) from being parsed.
-    if value.contains("Glue.") {
+    // A django-glue frontend reads model fields out of any Alpine attribute value
+    // (an x-data object included), so extract those accesses up front. The cheap
+    // substring gate keeps non-glue attributes (the common case) from being parsed.
+    if is_possible_glue_access(value) {
         for (glue_name, field) in glue_member_accesses(alpine, value) {
             push_glue_access(context, &glue_name, &field, value_line, output);
         }
     }
 
+    // An Alpine attribute may also build component state from project classes
+    // (`x-data="{ contract: new ModelObjectGlue('contract') }"`) and call into
+    // registered stores (`$store.theme.families()`); both live in the value as a
+    // whole rather than in any one method body, so they are read up front too,
+    // behind the same style of substring gate.
+    if is_alpine(name) {
+        if value.contains("new ") {
+            for (class, line) in instantiations(alpine, value, value_line) {
+                push_attribute_ref(context, EdgeKind::Instantiates, &class, line, output);
+            }
+        }
+
+        if value.contains("$store.") {
+            for (store, member) in store_calls(alpine, value) {
+                push_store_call(context, &store, &member, value_line, output);
+            }
+        }
+    }
+
     if name == "x-data" {
-        for (method, line) in object_methods(alpine, value, value_line) {
-            emit_alpine_method(context, &method, line, output);
+        let component = x_data_object(alpine, value, value_line);
+
+        for method in &component.methods {
+            emit_alpine_method(context, &method.name, method.line, output);
+        }
+
+        for method in &component.methods {
+            for call in &method.calls {
+                emit_alpine_body_call(context, &component, method, call, output);
+            }
         }
 
         if !value.trim_start().starts_with('{') {
@@ -615,7 +523,17 @@ fn emit_alpine_directive(
     line: u32,
     output: &mut ExtractionOutput,
 ) {
-    let callees = call_identifiers(alpine, value);
+    let mut callees = call_identifiers(alpine, value);
+
+    // Alpine calls a listener expression that evaluates to a function, so a bare
+    // `@click="printQrCode"` names the same handler `@click="printQrCode()"` does.
+    // Only listeners get this reading: nowhere else does Alpine invoke a value.
+    if callees.is_empty()
+        && listener_event(name).is_some()
+        && let Some(handler) = bare_identifier(alpine, value)
+    {
+        callees.push(handler);
+    }
 
     for callee in &callees {
         push_attribute_ref(context, EdgeKind::Handles, callee, line, output);
@@ -659,6 +577,16 @@ fn emit_asset(context: &HtmlContext<'_>, value: &str, line: u32, output: &mut Ex
     }
 }
 
+/// The node id of one Alpine `x-data` method, mirroring an `Alpine.data`
+/// component's member id (`<template>::alpine::<method>`).
+fn alpine_method_id(context: &HtmlContext<'_>, method: &str) -> NodeId {
+    assert!(!method.is_empty(), "alpine method name must not be empty");
+
+    let raw = format!("{}::alpine::{method}", context.logical);
+
+    NodeId::new(context.project, &raw)
+}
+
 /// A function node for one Alpine `x-data` method plus its containment edge
 /// from the template, so an `@event` handler resolves to it. The node id mirrors
 /// an `Alpine.data` component (`<template>::alpine::<method>`).
@@ -670,9 +598,8 @@ fn emit_alpine_method(
 ) {
     assert!(!method.is_empty(), "alpine method name must not be empty");
 
-    let raw = format!("{}::alpine::{method}", context.logical);
     let qualified = format!("{}::{method}", context.logical);
-    let method_id = NodeId::new(context.project, &raw);
+    let method_id = alpine_method_id(context, method);
 
     output.nodes.push(Node::new(
         method_id.clone(),
@@ -695,6 +622,84 @@ fn emit_alpine_method(
     );
 }
 
+/// The edge or reference one call in an `x-data` method's body becomes,
+/// decided by its receiver. A `this.` call binds within the component: a
+/// sibling method gets a direct `Calls` edge, and anything else (a data
+/// property, a spread-in mixin) is dropped rather than bound by bare name. A
+/// `this.<property>.` call whose property the component constructed with `new`
+/// leaves a typed-receiver reference, so `this.rows.filter()` binds to the
+/// `filter` of the class `rows` was built from and nothing else; an untyped
+/// property is dropped. A bare call leaves an unresolved reference for call
+/// resolution's script-global scoping to bind, in this file first and a shared
+/// script failing that.
+fn emit_alpine_body_call(
+    context: &HtmlContext<'_>,
+    component: &AlpineObject,
+    caller: &AlpineMethod,
+    call: &AlpineCall,
+    output: &mut ExtractionOutput,
+) {
+    assert!(!call.name.is_empty(), "a body call names its callee");
+
+    let caller_id = alpine_method_id(context, &caller.name);
+
+    match &call.receiver {
+        AlpineReceiver::This => {
+            let sibling = component
+                .methods
+                .iter()
+                .find(|method| method.name == call.name && method.name != caller.name);
+
+            let Some(callee) = sibling else {
+                return;
+            };
+
+            output.edges.push(
+                Edge::new(caller_id, alpine_method_id(context, &callee.name), EdgeKind::Calls)
+                    .at(call.line, 0)
+                    .with_provenance(ALPINE_PROVENANCE),
+            );
+        }
+        AlpineReceiver::Property(property) => {
+            let class = component
+                .typed_properties
+                .iter()
+                .find(|(name, _)| name == property)
+                .map(|(_, class)| class);
+
+            let Some(class) = class else {
+                return;
+            };
+
+            let mut reference = UnresolvedRef::new(
+                caller_id,
+                call.name.clone(),
+                EdgeKind::Calls,
+                call.line,
+                0,
+                context.file_path,
+                Language::JavaScript,
+            );
+
+            reference.candidates.push(TYPED_RECEIVER.to_string());
+            reference.candidates.push(class.clone());
+
+            output.unresolved_refs.push(reference);
+        }
+        AlpineReceiver::Bare => {
+            output.unresolved_refs.push(UnresolvedRef::new(
+                caller_id,
+                call.name.clone(),
+                EdgeKind::Calls,
+                call.line,
+                0,
+                context.file_path,
+                Language::JavaScript,
+            ));
+        }
+    }
+}
+
 /// The push of one cross-layer attribute reference from the template.
 fn push_attribute_ref(
     context: &HtmlContext<'_>,
@@ -714,6 +719,37 @@ fn push_attribute_ref(
         context.file_path,
         Language::HtmlDjango,
     ));
+}
+
+/// The push of an Alpine store method call (`$store.theme.families()`) as a
+/// `Handles` reference carrying the store-dispatch sentinel and the store name,
+/// so resolution binds the member only within the `Alpine.store` registration
+/// of that name, in this project or across the constellation.
+fn push_store_call(
+    context: &HtmlContext<'_>,
+    store: &str,
+    member: &str,
+    line: u32,
+    output: &mut ExtractionOutput,
+) {
+    if store.is_empty() || member.is_empty() {
+        return;
+    }
+
+    let mut reference = UnresolvedRef::new(
+        context.template_id.clone(),
+        member,
+        EdgeKind::Handles,
+        line,
+        0,
+        context.file_path,
+        Language::HtmlDjango,
+    );
+
+    reference.candidates.push(STORE_DISPATCH.to_string());
+    reference.candidates.push(store.to_string());
+
+    output.unresolved_refs.push(reference);
 }
 
 /// The push of a django-glue field access (`Glue.model.<glue_name>.<field>`) as an
@@ -752,8 +788,15 @@ fn call_identifiers(alpine: &mut Option<AlpineExpr>, value: &str) -> Vec<String>
     alpine.as_mut().map(|parser| parser.call_identifiers(value)).unwrap_or_default()
 }
 
+/// The single bare identifier an Alpine expression consists of, if it is one;
+/// `None` when the parser is unavailable.
+fn bare_identifier(alpine: &mut Option<AlpineExpr>, value: &str) -> Option<String> {
+    alpine.as_mut().and_then(|parser| parser.bare_identifier(value))
+}
+
 /// The `(glue_name, field)` django-glue member accesses in an Alpine expression
-/// (`Glue.model.task.title`); empty when the parser is unavailable.
+/// (`Glue.model.task.title`, `record.glue_fields.quantity`, `record.$fields.quantity`);
+/// empty when the parser is unavailable.
 fn glue_member_accesses(alpine: &mut Option<AlpineExpr>, value: &str) -> Vec<(String, String)> {
     alpine.as_mut().map(|parser| parser.glue_member_accesses(value)).unwrap_or_default()
 }
@@ -768,9 +811,24 @@ fn quoted_classes(alpine: &mut Option<AlpineExpr>, value: &str) -> Vec<String> {
     alpine.as_mut().map(|parser| parser.quoted_classes(value)).unwrap_or_default()
 }
 
-/// The methods of an Alpine `x-data` object literal with their 1-based lines.
-fn object_methods(alpine: &mut Option<AlpineExpr>, value: &str, base_line: u32) -> Vec<(String, u32)> {
-    alpine.as_mut().map(|parser| parser.object_methods(value, base_line)).unwrap_or_default()
+/// The members of an Alpine `x-data` object literal: its methods with their
+/// 1-based lines and body calls, and its `new`-initialized data properties.
+fn x_data_object(alpine: &mut Option<AlpineExpr>, value: &str, base_line: u32) -> AlpineObject {
+    alpine
+        .as_mut()
+        .map(|parser| parser.x_data_object(value, base_line))
+        .unwrap_or_else(AlpineObject::empty)
+}
+
+/// The project classes instantiated in an Alpine expression with their 1-based
+/// lines.
+fn instantiations(alpine: &mut Option<AlpineExpr>, value: &str, base_line: u32) -> Vec<(String, u32)> {
+    alpine.as_mut().map(|parser| parser.instantiations(value, base_line)).unwrap_or_default()
+}
+
+/// The `(store, member)` Alpine store method calls in an Alpine expression.
+fn store_calls(alpine: &mut Option<AlpineExpr>, value: &str) -> Vec<(String, String)> {
+    alpine.as_mut().map(|parser| parser.store_calls(value)).unwrap_or_default()
 }
 
 /// The event name an Alpine listener attribute binds: `@click.prevent` ->
@@ -863,13 +921,22 @@ fn loop_binding<'source>(
 }
 
 /// The `(glue_name, field)` a django-glue form-field include binds via a
-/// `glue_*field='glue_name.field'` value (e.g.,
-/// `glue_model_field='inventory.estimate_cost'` -> `("inventory", "estimate_cost")`).
-/// django-glue binds a registered model instance to a form widget by a
-/// `glue_name.field` string; the glue unique name before the dot is the rendering
-/// view's typed local (the same name it was registered under), so it resolves
-/// like a `{{ glue_name.field }}` member access. `None` for a non-glue binding
-/// name or a non-dotted value.
+/// `glue_*field='...'` value. django-glue binds a registered object to a form
+/// widget by a path string, and the glue unique name it starts with is the
+/// rendering view's typed local (the same name it was registered under), so it
+/// resolves like a `{{ glue_name.field }}` member access.
+///
+/// Both versions' path spellings are read, since both are installed across these
+/// projects:
+///
+/// - 0.x: `glue_model_field='inventory.estimate_cost'`
+/// - 1.x: `glue_field='gorilla.name'`, and the field-map form
+///   `glue_field='glue_form.$fields.purpose'`
+///
+/// The field-map segment is dropped rather than counted, which is what
+/// django-glue's own `glue_field_value_path` filter does to the same string.
+/// `None` for a non-glue binding name, or a value that is not exactly one glue
+/// name and one field once that segment is out.
 fn glue_field_binding<'source>(name: &str, value: &'source str) -> Option<(&'source str, &'source str)> {
     if !name.starts_with("glue") || !name.ends_with("field") {
         return None;
@@ -877,7 +944,28 @@ fn glue_field_binding<'source>(name: &str, value: &'source str) -> Option<(&'sou
 
     let inner = value.trim().trim_matches(['\'', '"']);
 
-    variable_member(inner)
+    let mut segments = inner.split('.').filter(|segment| !GLUE_FIELD_MAPS.contains(segment));
+
+    let glue_name = segments.next()?;
+    let field = segments.next()?;
+
+    if segments.next().is_some() {
+        return None;
+    }
+
+    if !is_template_identifier(glue_name) || !is_template_identifier(field) {
+        return None;
+    }
+
+    Some((glue_name, field))
+}
+
+/// Whether an attribute value could hold a django-glue field access at all: the
+/// cheap substring gate that keeps the JavaScript parser off the overwhelming
+/// majority of attributes, which carry no glue at all. Names the 1.x proxy root
+/// and both versions' field-map property.
+fn is_possible_glue_access(value: &str) -> bool {
+    value.contains("Glue.") || GLUE_FIELD_MAPS.iter().any(|map| value.contains(map))
 }
 
 /// Whether a string is a plain template identifier: a non-empty run of ASCII

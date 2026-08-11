@@ -7,6 +7,7 @@
 //! branches disagree. A dropped edge is recoverable; a confidently wrong one is
 //! not.
 
+use constellation_graph::Language;
 use constellation_resolution::{MANAGER_SUFFIXES, RETURNS_OF};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -18,8 +19,11 @@ use crate::synthesize::overrides::method_owner_id;
 pub(crate) struct ClassIndex<'graph> {
     /// The base class ids of each subclass id.
     pub(crate) bases: FxHashMap<&'graph str, Vec<&'graph str>>,
-    /// The class ids for each class simple name.
-    pub(crate) by_name: FxHashMap<&'graph str, Vec<&'graph str>>,
+    /// The `(id, language)` of the classes bearing each simple name. The
+    /// language rides along so a receiver types only within its own language
+    /// family: django-glue defines a Python and a JavaScript `QuerySetGlue`,
+    /// and without it every lookup of the shared name reads as ambiguous.
+    pub(crate) by_name: FxHashMap<&'graph str, Vec<(&'graph str, Language)>>,
     /// The method id for each (owning class id, method name) pair.
     pub(crate) by_owner: FxHashMap<(&'graph str, &'graph str), &'graph str>,
     /// The class id for each class qualified name.
@@ -36,16 +40,23 @@ pub(crate) struct ClassIndex<'graph> {
     pub(crate) returns: FxHashMap<&'graph str, &'graph str>,
 }
 
-/// The id of the sole class named `name`, or `None` when the constellation holds
-/// none or several: an ambiguous class name types no receiver.
+/// The id of the sole class named `name` within `family`, or `None` when the
+/// constellation holds none or several there: an ambiguous class name types no
+/// receiver. `None` as the family considers every language, the reading a
+/// caller with no origin to go by keeps.
 pub(crate) fn sole_class_named<'graph>(
     name: &str,
+    family: Option<Language>,
     graph: &ClassIndex<'graph>,
 ) -> Option<&'graph str> {
     let classes = graph.by_name.get(name)?;
 
-    match classes.as_slice() {
-        [only] => Some(only),
+    let mut matched = classes
+        .iter()
+        .filter(|(_, language)| family.is_none_or(|family| *language == family));
+
+    match (matched.next(), matched.next()) {
+        (Some((only, _)), None) => Some(only),
         _ => None,
     }
 }
@@ -77,7 +88,14 @@ pub(crate) fn sole_companion_method<'graph>(
         owner_name.push_str(model);
         owner_name.push_str(suffix);
 
-        for owner in by_name.get(owner_name.as_str()).into_iter().flatten() {
+        for (owner, language) in by_name.get(owner_name.as_str()).into_iter().flatten() {
+            // The manager and service naming conventions are Django's, so a
+            // JavaScript class that happens to wear the suffix is never the
+            // companion a model dispatches through.
+            if *language != Language::Python {
+                continue;
+            }
+
             let target = by_owner
                 .get(&(*owner, name))
                 .copied()
@@ -155,7 +173,7 @@ impl<'graph> ClassIndex<'graph> {
     pub(crate) fn build(
         extends_edges: &'graph [(String, String)],
         class_methods: &'graph [(String, String)],
-        class_identities: &'graph [(String, String, String)],
+        class_identities: &'graph [(String, String, String, Language)],
         callable_identities: &'graph [(String, String, String)],
         field_relations: &'graph [(String, String)],
         returns_edges: &'graph [(String, String)],
@@ -175,12 +193,12 @@ impl<'graph> ClassIndex<'graph> {
         }
 
         let mut by_qualified: FxHashMap<&str, &str> = FxHashMap::default();
-        let mut by_name: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
+        let mut by_name: FxHashMap<&str, Vec<(&str, Language)>> = FxHashMap::default();
         let mut class_ids: FxHashSet<&str> = FxHashSet::default();
 
-        for (id, qualified_name, name) in class_identities {
+        for (id, qualified_name, name, language) in class_identities {
             by_qualified.insert(qualified_name.as_str(), id.as_str());
-            by_name.entry(name.as_str()).or_default().push(id.as_str());
+            by_name.entry(name.as_str()).or_default().push((id.as_str(), *language));
             class_ids.insert(id.as_str());
         }
 
@@ -216,27 +234,31 @@ impl<'graph> ClassIndex<'graph> {
         }
     }
 
-    /// The class id a typed receiver stands for. A plain type name is the class of
-    /// that name, when the constellation holds exactly one. A [`RETURNS_OF`]
-    /// candidate instead names the callee that produced the receiver
-    /// (`demo = Demo.start(...)`, `crumbs = build_crumbs()`), so the class is
-    /// whatever that callee's `returns` edge points at: the annotation is on the
-    /// callee, which usually sits in another file, and this is the one pass that
-    /// can read across.
+    /// The class id a typed receiver stands for, within the referencing side's
+    /// language `family`. A plain type name is the class of that name, when the
+    /// family holds exactly one. A [`RETURNS_OF`] candidate instead names the
+    /// callee that produced the receiver (`demo = Demo.start(...)`,
+    /// `crumbs = build_crumbs()`), so the class is whatever that callee's
+    /// `returns` edge points at: the annotation is on the callee, which usually
+    /// sits in another file, and this is the one pass that can read across.
     ///
     /// `None` at every ambiguity, as everywhere else in this pass: an owner naming
     /// several classes, a callee defined more than once, or a callee with no
     /// annotated return all bind nothing rather than pick.
-    pub(crate) fn receiver_class(&self, receiver: &str) -> Option<&'graph str> {
+    pub(crate) fn receiver_class(
+        &self,
+        receiver: &str,
+        family: Option<Language>,
+    ) -> Option<&'graph str> {
         assert!(!receiver.is_empty(), "a typed receiver names its type");
 
         let Some(callee) = receiver.strip_prefix(RETURNS_OF) else {
-            return sole_class_named(receiver, self);
+            return sole_class_named(receiver, family, self);
         };
 
         let callable = match callee.split_once('.') {
             Some((owner, method)) => {
-                let class = sole_class_named(owner, self)?;
+                let class = sole_class_named(owner, family, self)?;
 
                 self.by_owner.get(&(class, method)).copied()?
             }
@@ -264,12 +286,13 @@ impl<'graph> ClassIndex<'graph> {
     /// The sole method named `name` callable on `model`: the model's own method,
     /// or one on the single queryset or manager class Django's naming convention
     /// gives it (its own or inherited). `None` when nothing or more than one
-    /// definition answers.
+    /// definition answers. A Django model is Python by definition, so the class
+    /// lookup stays in that family.
     pub(crate) fn model_method(&self, model: &str, name: &str) -> Option<&'graph str> {
         assert!(!model.is_empty(), "a model method lookup names a model");
         assert!(!name.is_empty(), "a model method lookup names a method");
 
-        let class = sole_class_named(model, self)?;
+        let class = sole_class_named(model, Some(Language::Python), self)?;
 
         if let Some(method) = self.by_owner.get(&(class, name)) {
             return Some(method);
@@ -280,5 +303,84 @@ impl<'graph> ClassIndex<'graph> {
         }
 
         sole_companion_method(model, name, MANAGER_SUFFIXES, self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use constellation_graph::Language;
+
+    use super::{ClassIndex, sole_class_named};
+
+    /// An index over django-glue's shape: one Python and one JavaScript class
+    /// sharing the name `QuerySetGlue`, each owning a method.
+    fn glue_index() -> (
+        Vec<(String, String)>,
+        Vec<(String, String, String, Language)>,
+    ) {
+        let python_method = "glue::glue/query_set/glue.py::QuerySetGlue.to_choices";
+        let script_method = "glue::static/js/query_set.js::QuerySetGlue.to_choices";
+
+        let methods = vec![
+            (python_method.to_string(), "to_choices".to_string()),
+            (script_method.to_string(), "to_choices".to_string()),
+        ];
+
+        let classes = vec![
+            (
+                "glue::glue/query_set/glue.py::QuerySetGlue".to_string(),
+                "glue/query_set/glue.py::QuerySetGlue".to_string(),
+                "QuerySetGlue".to_string(),
+                Language::Python,
+            ),
+            (
+                "glue::static/js/query_set.js::QuerySetGlue".to_string(),
+                "static/js/query_set.js::QuerySetGlue".to_string(),
+                "QuerySetGlue".to_string(),
+                Language::JavaScript,
+            ),
+        ];
+
+        (methods, classes)
+    }
+
+    #[test]
+    fn a_language_family_disambiguates_a_shared_class_name() {
+        let (methods, classes) = glue_index();
+        let graph = ClassIndex::build(&[], &methods, &classes, &[], &[], &[]);
+
+        assert_eq!(
+            sole_class_named("QuerySetGlue", None, &graph),
+            None,
+            "with no family the shared name stays ambiguous",
+        );
+
+        assert_eq!(
+            sole_class_named("QuerySetGlue", Some(Language::JavaScript), &graph),
+            Some("glue::static/js/query_set.js::QuerySetGlue"),
+            "the JavaScript family picks the JavaScript class",
+        );
+
+        assert_eq!(
+            sole_class_named("QuerySetGlue", Some(Language::Python), &graph),
+            Some("glue::glue/query_set/glue.py::QuerySetGlue"),
+            "the Python family picks the Python class",
+        );
+    }
+
+    #[test]
+    fn a_family_scoped_receiver_reaches_its_own_languages_method() {
+        let (methods, classes) = glue_index();
+        let graph = ClassIndex::build(&[], &methods, &classes, &[], &[], &[]);
+
+        let class = graph
+            .receiver_class("QuerySetGlue", Some(Language::JavaScript))
+            .expect("the JavaScript family types the receiver");
+
+        assert_eq!(
+            graph.by_owner.get(&(class, "to_choices")).copied(),
+            Some("glue::static/js/query_set.js::QuerySetGlue.to_choices"),
+            "the typed receiver's method is the JavaScript one",
+        );
     }
 }

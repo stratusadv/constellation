@@ -11,7 +11,7 @@ use constellation_extraction::{
     CssExtractor, ExtractionOutput, Extractor, JavaScriptExtractor, PythonExtractor,
     SOURCE_BYTES_MAX, TemplateExtractor,
 };
-use constellation_graph::{Edge, EdgeKind, Language, NodeId, ProjectId};
+use constellation_graph::{Edge, EdgeKind, Language, NodeId, ProjectId, is_minified_source};
 use constellation_resolution::{
     DjangoResolver, FrameworkResolver,
 };
@@ -378,6 +378,20 @@ fn extract_one(
     };
 
     if source.len() > SOURCE_BYTES_MAX {
+        return ExtractOutcome::Ignored;
+    }
+
+    // The same exclusion as `is_minified`, decided from the content instead of the
+    // name, because a vendored bundle is routinely shipped under an ordinary one
+    // (`robit/html/alpine.js`). Left in, one such file contributes more mangled
+    // one-letter "symbols" than the library it sits beside contributes real ones.
+    //
+    // JavaScript only: minification mangles identifiers, so nothing readable
+    // survives, while a minified stylesheet keeps its selector names intact and a
+    // template's `class="btn-primary"` still resolves into it. Minified CSS is
+    // dropped by name (`.min.css`) where that is the author's own labelling, and
+    // left alone otherwise.
+    if language == Language::JavaScript && is_minified_source(&source) {
         return ExtractOutcome::Ignored;
     }
 

@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "constellation-graph",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-eval"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "constellation-graph",
  "constellation-index",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-extraction"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "constellation-graph",
  "constellation-resolution",
@@ -256,11 +256,11 @@ dependencies = [
 
 [[package]]
 name = "constellation-graph"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "constellation-index"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "constellation-extraction",
  "constellation-graph",
@@ -282,14 +282,14 @@ dependencies = [
 
 [[package]]
 name = "constellation-linking"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "constellation-graph",
 ]
 
 [[package]]
 name = "constellation-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "constellation-graph",
  "constellation-index",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-resolution"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "constellation-graph",
  "divan",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "constellation-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "constellation-graph",
  "constellation-resolution",
@@ -2350,7 +2350,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde",

@@ -65,6 +65,36 @@ pub const RETURNS_OF: &str = "\u{1}returns-of:";
 /// mistaken for model members.
 pub const COLLECTION_CONTEXT: &str = "\u{1}collection-context";
 
+/// The sentinel candidate the template extractor tags onto an Alpine
+/// `$store.<name>.<member>()` call, with the store name following it. The
+/// member may only bind within the `Alpine.store`/`Alpine.data` registration of
+/// that name, wherever its file lives, so both the per-project scoping and the
+/// cross-project handler link match the registration's qualified name instead
+/// of binding any same-named function.
+pub const STORE_DISPATCH: &str = "\u{1}store-dispatch";
+
+/// The store name a `Handles` reference carries when it is a store dispatch
+/// (`$store.<name>.<member>()`), else `None`.
+pub fn store_dispatch_name(reference: &UnresolvedRef) -> Option<&str> {
+    if reference.candidates.first().map(String::as_str) != Some(STORE_DISPATCH) {
+        return None;
+    }
+
+    reference.candidates.get(1).map(String::as_str)
+}
+
+/// Whether a node is the `member` of the Alpine registration named `store`: its
+/// qualified name ends with the `::alpine::<store>.<member>` the JavaScript
+/// extractor writes for a registration's members.
+pub fn is_store_member(node: &Node, store: &str, member: &str) -> bool {
+    assert!(!store.is_empty(), "a store dispatch names its store");
+    assert!(!member.is_empty(), "a store dispatch names its member");
+
+    let suffix = format!("::alpine::{store}.{member}");
+
+    node.qualified_name.ends_with(&suffix)
+}
+
 /// The base service method names dispatched on every model through the external base
 /// service (`obj.services.save_model_obj()`). The base defines them, so binding by
 /// a sole local override would false-attribute every model's call to whichever app
@@ -235,11 +265,14 @@ fn resolve_by_name(
     }
 
     let preferred = preferred_kinds(reference.reference_kind);
-    let target = target_language(reference.reference_kind);
+    let target = target_language(reference);
+    let strict = language_is_strict(reference.reference_kind);
 
     assert!(!preferred.is_empty(), "preferred_kinds yields at least one kind");
 
-    let mut exact = filter_language(context.nodes_by_name(&reference.reference_name), target);
+    let mut exact =
+        filter_language(context.nodes_by_name(&reference.reference_name), target, strict);
+
     scope_target(&mut exact, reference, context);
 
     if let Some(resolved) = match_candidates(reference, exact, preferred, ResolvedBy::ExactMatch, 0.9, 0.6) {
@@ -251,7 +284,7 @@ fn resolve_by_name(
     }
 
     let lowered = reference.reference_name.to_lowercase();
-    let mut fuzzy = filter_language(context.nodes_by_lower_name(&lowered), target);
+    let mut fuzzy = filter_language(context.nodes_by_lower_name(&lowered), target, strict);
     scope_target(&mut fuzzy, reference, context);
 
     match_candidates(reference, fuzzy, preferred, ResolvedBy::Fuzzy, 0.5, 0.4)
@@ -276,17 +309,69 @@ fn scope_target(
     }
 }
 
-/// The restriction of an Alpine `Handles` reference to a handler defined in the
-/// same template. An inline `x-data` method is scoped to its own component, so two
-/// templates that each define a same-named method (`submitOrder()`) must each
-/// resolve to their own, not collapse onto whichever the global name lookup
-/// returns first. When no candidate shares the template's file, the handler lives
-/// in a shared `.js` file (a different file); leave every candidate so the global
-/// match still resolves that cross-file handler.
+/// The restriction of an Alpine `Handles` reference to a handler it can actually
+/// reach. An inline `x-data` method is scoped to its own component, so a
+/// same-named method in an unrelated template is never the target.
+///
+/// Three cases, tried in order:
+///
+/// - A candidate in the reference's own template: the component defines the
+///   handler itself, so keep only those. Two templates that each define
+///   `submitOrder()` each resolve to their own.
+/// - Otherwise a candidate in a `.js` file: a shared handler
+///   (`toggleLoadingSpinner` in `ui.js`) that any template loading the script can
+///   call. Keep those and drop the templates.
+/// - Otherwise the handler is an `x-data` method in *another* template, in scope
+///   only where that template renders this one. Nothing available here proves it
+///   does, so bind only when exactly one template defines the name, and drop the
+///   reference when several do. This is the no-false-edge discipline the
+///   cross-project handler link keeps, applied within one project: before it, an
+///   `@click="select(...)"` in an asset tab bound to an unrelated production
+///   picker's `select()` purely because the name matched.
 fn scope_handles(candidates: &mut Vec<Arc<Node>>, reference: &UnresolvedRef) {
+    // A store call names its component outright: `$store.theme.families()`
+    // binds only a member of the `Alpine.store('theme', ...)` registration,
+    // wherever its file lives, so the template-and-script cases below do not
+    // apply to it.
+    if let Some(store) = store_dispatch_name(reference) {
+        candidates.retain(|node| is_store_member(node, store, &reference.reference_name));
+
+        return;
+    }
+
     if candidates.iter().any(|node| node.file_path == reference.file_path) {
         candidates.retain(|node| node.file_path == reference.file_path);
+
+        return;
     }
+
+    if candidates.iter().any(|node| is_script_file(&node.file_path)) {
+        candidates.retain(|node| is_script_file(&node.file_path));
+
+        return;
+    }
+
+    let ambiguous = {
+        let mut paths = candidates.iter().map(|node| node.file_path.as_str());
+
+        match paths.next() {
+            Some(first) => paths.any(|path| path != first),
+            None => false,
+        }
+    };
+
+    if ambiguous {
+        candidates.clear();
+    }
+}
+
+/// Whether a path is a JavaScript source file, as opposed to a template carrying
+/// an inline `x-data` component. Both hold nodes of [`Language::JavaScript`], so
+/// the extension is what separates them.
+fn is_script_file(path: &str) -> bool {
+    let extension = path.rsplit_once('.').map(|(_, extension)| extension);
+
+    extension.and_then(Language::from_extension) == Some(Language::JavaScript)
 }
 
 /// The restriction of candidates to those in scope of the referencing file:
@@ -301,7 +386,72 @@ fn scope_to_imports(
     context: &dyn ResolutionContext,
 ) {
     let imports = context.import_mappings(&reference.file_path, reference.language);
+
+    if reference.language == Language::JavaScript && imports.is_empty() {
+        scope_script_globals(candidates, reference);
+
+        return;
+    }
+
     candidates.retain(|node| imported_or_local(node, &reference.file_path, &imports));
+}
+
+/// The scoping of a call in a JavaScript file that declares no ES imports, where
+/// the import rule above does not hold: classic `<script src>` files share one
+/// global scope, so a top-level `function django_glue_ajax_request()` in one file
+/// is callable from every other the page loads, with nothing to import.
+///
+/// Applying the Python rule here bound JavaScript calls only within their own
+/// file. In a script-global codebase, which is what this stack ships, that is
+/// almost the whole call graph: django-glue's `event.js` defines
+/// `django_glue_dispatch_response_event`, four sibling files call it, and not one
+/// of those calls could resolve.
+///
+/// A same-file definition still wins, since a local declaration shadows the
+/// global. Failing that, only file-scope definitions in other script files are
+/// reachable: a method belongs to its class, and a template's inline `x-data`
+/// method to its component. If two files define the same name at global scope,
+/// the call binds to neither, the no-false-edge discipline every other
+/// cross-file rule here keeps.
+fn scope_script_globals(candidates: &mut Vec<Arc<Node>>, reference: &UnresolvedRef) {
+    if candidates.iter().any(|node| node.file_path == reference.file_path) {
+        candidates.retain(|node| node.file_path == reference.file_path);
+
+        return;
+    }
+
+    candidates.retain(|node| is_script_global(node));
+
+    let ambiguous = {
+        let mut paths = candidates.iter().map(|node| node.file_path.as_str());
+
+        match paths.next() {
+            Some(first) => paths.any(|path| path != first),
+            None => false,
+        }
+    };
+
+    if ambiguous {
+        candidates.clear();
+    }
+}
+
+/// Whether a node is a JavaScript definition at file scope, and so reachable
+/// from any other script the page loads.
+///
+/// The extractor qualifies a file-scope name as `<file>::<name>` and anything
+/// nested below one as `<owner>.<name>`, so a tail that is still the bare name is
+/// exactly the file-scope case. A template's inline `x-data` method carries
+/// [`Language::JavaScript`] too but is scoped to its component, and the file
+/// extension is what tells the two apart.
+fn is_script_global(node: &Node) -> bool {
+    if !is_script_file(&node.file_path) {
+        return false;
+    }
+
+    let tail = node.qualified_name.rsplit("::").next().unwrap_or(&node.qualified_name);
+
+    tail == node.name
 }
 
 /// Whether a candidate is defined in the referencing file, or imported into it
@@ -402,11 +552,26 @@ fn top_owner(qualified_name: &str) -> &str {
     tail.split('.').next().unwrap_or(tail)
 }
 
-/// The language a reference of this kind must resolve into, when the kind
-/// pins one. Keeps a Python route from binding to a same-named JavaScript
-/// symbol, and an Alpine handler from binding to a same-named Python view.
-fn target_language(kind: EdgeKind) -> Option<Language> {
-    match kind {
+/// The language family a reference's own language binds into: Python code
+/// names Python, JavaScript and the Alpine expressions embedded in templates
+/// name JavaScript, and CSS pins nothing. The filter that keeps a typed
+/// receiver or an instantiation from crossing languages (the JavaScript
+/// `QuerySetGlue` and the Python class django-glue gives the same name are
+/// different symbols).
+pub fn source_language_family(language: Language) -> Option<Language> {
+    match language {
+        Language::Python => Some(Language::Python),
+        Language::JavaScript | Language::HtmlDjango => Some(Language::JavaScript),
+        Language::Css => None,
+    }
+}
+
+/// The language a reference must resolve into, when its kind or origin pins
+/// one. Keeps a Python route from binding to a same-named JavaScript symbol, an
+/// Alpine handler from binding to a same-named Python view, and an
+/// instantiation from crossing languages in either direction.
+fn target_language(reference: &UnresolvedRef) -> Option<Language> {
+    match reference.reference_kind {
         EdgeKind::RoutesTo
         | EdgeKind::RelatesTo
         | EdgeKind::Receives
@@ -416,15 +581,28 @@ fn target_language(kind: EdgeKind) -> Option<Language> {
         EdgeKind::Returns | EdgeKind::TypeOf => Some(Language::Python),
         EdgeKind::UsesTag => Some(Language::Python),
         EdgeKind::Handles => Some(Language::JavaScript),
+        EdgeKind::Instantiates => source_language_family(reference.language),
         _ => None,
     }
 }
 
-/// The candidates kept in the target language, unless none match; then all are
-/// kept, so a missing same-language definition still resolves best-effort.
+/// Whether a reference of this kind must never bind outside its target
+/// language. A `Handles` reference and a JavaScript-side `Instantiates` name
+/// JavaScript by construction, so a candidate pool with no JavaScript in it
+/// holds only same-name collisions (the Python `remove_file` a template's
+/// `@click` must not reach); the best-effort fallback other kinds keep would
+/// only ever produce a false edge here.
+fn language_is_strict(kind: EdgeKind) -> bool {
+    matches!(kind, EdgeKind::Handles | EdgeKind::Instantiates)
+}
+
+/// The candidates kept in the target language. When none match, a strict kind
+/// drops them all and everything else keeps them, so a missing same-language
+/// definition still resolves best-effort.
 fn filter_language(
     mut candidates: Vec<Arc<Node>>,
     target: Option<Language>,
+    strict: bool,
 ) -> Vec<Arc<Node>> {
     let Some(target) = target else {
         return candidates;
@@ -441,6 +619,8 @@ fn filter_language(
             candidates.iter().all(|node| node.language == target),
             "language filter retains only the target language",
         );
+    } else if strict {
+        candidates.clear();
     }
 
     candidates
@@ -846,12 +1026,15 @@ fn resolve_service_method(
     Some(ResolvedRef::new(reference, node.id.clone(), 0.8, ResolvedBy::Framework))
 }
 
-/// The method of the exact class a call on a type-annotated receiver resolves to
-/// (`order.recalculate()` where `order: Order`). Binds only
+/// The method of the exact class a call on a typed receiver resolves to
+/// (`order.recalculate()` where `order: Order`; an x-data method's
+/// `this.rows.filter()` where `rows: new QuerySetGlue(...)`). Binds only
 /// when a single method/function of that name is owned by a class whose name
-/// equals the annotated type, so it never guesses across same-named methods on
-/// other classes. The annotated type name is carried as the candidate following
-/// the [`TYPED_RECEIVER`] sentinel.
+/// equals the receiver's type, so it never guesses across same-named methods on
+/// other classes. The type name is carried as the candidate following the
+/// [`TYPED_RECEIVER`] sentinel, and the target stays in the reference's own
+/// language family, so a JavaScript receiver never binds a Python method that
+/// shares both names.
 fn resolve_typed_receiver(
     reference: &UnresolvedRef,
     context: &dyn ResolutionContext,
@@ -863,11 +1046,13 @@ fn resolve_typed_receiver(
         .iter()
         .find(|candidate| candidate.as_str() != TYPED_RECEIVER && !candidate.is_empty())?;
 
+    let family = source_language_family(reference.language);
     let mut candidates = context.nodes_by_name(&reference.reference_name);
 
     candidates.retain(|node| {
         matches!(node.kind, NodeKind::Method | NodeKind::Function)
             && top_owner(&node.qualified_name) == type_name.as_str()
+            && family.is_none_or(|family| node.language == family)
     });
 
     if candidates.len() == 1 {
@@ -1278,4 +1463,241 @@ fn is_init_file(path: &str) -> bool {
     assert!(!path.is_empty(), "path must not be empty");
 
     path.rsplit(['/', '\\']).next() == Some("__init__.py")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use constellation_graph::{
+        EdgeKind, Language, Node, NodeId, NodeIdentity, NodeKind, ProjectId, Span,
+    };
+
+    use super::{
+        STORE_DISPATCH, filter_language, is_script_file, is_script_global, scope_handles,
+        scope_script_globals,
+    };
+    use crate::refs::UnresolvedRef;
+
+    fn symbol(name: &str, qualified_name: &str, file_path: &str) -> Arc<Node> {
+        let project = ProjectId::new("portal");
+
+        Arc::new(Node::new(
+            NodeId::new(&project, qualified_name),
+            project.clone(),
+            NodeKind::Function,
+            NodeIdentity {
+                name: name.to_string(),
+                qualified_name: qualified_name.to_string(),
+                file_path: file_path.to_string(),
+                language: Language::JavaScript,
+            },
+            Span::new(1, 1, 0, 0),
+            0,
+        ))
+    }
+
+    fn handler(file_path: &str) -> Arc<Node> {
+        symbol("select", &format!("{file_path}::select"), file_path)
+    }
+
+    fn global(file_path: &str) -> Arc<Node> {
+        symbol("dispatch_response", &format!("{file_path}::dispatch_response"), file_path)
+    }
+
+    fn reference(file_path: &str) -> UnresolvedRef {
+        UnresolvedRef::new(
+            NodeId::new(&ProjectId::new("portal"), file_path),
+            "select",
+            EdgeKind::Handles,
+            1,
+            0,
+            file_path,
+            Language::HtmlDjango,
+        )
+    }
+
+    fn call(file_path: &str) -> UnresolvedRef {
+        UnresolvedRef::new(
+            NodeId::new(&ProjectId::new("portal"), file_path),
+            "dispatch_response",
+            EdgeKind::Calls,
+            1,
+            0,
+            file_path,
+            Language::JavaScript,
+        )
+    }
+
+    #[test]
+    fn a_handler_in_the_referencing_template_wins_over_every_other() {
+        let mut candidates = vec![handler("tab/other.html"), handler("tab/list.html")];
+
+        scope_handles(&mut candidates, &reference("tab/list.html"));
+
+        assert_eq!(candidates.len(), 1, "only the template's own x-data method survives");
+        assert_eq!(candidates[0].file_path, "tab/list.html", "and it is the local one");
+    }
+
+    #[test]
+    fn a_shared_script_handler_wins_over_another_templates_x_data() {
+        let mut candidates = vec![handler("production/picker.html"), handler("static/js/ui.js")];
+
+        scope_handles(&mut candidates, &reference("asset/list_tabs.html"));
+
+        assert_eq!(candidates.len(), 1, "the script is reachable, the other template is not");
+        assert_eq!(candidates[0].file_path, "static/js/ui.js", "and it is the script");
+    }
+
+    #[test]
+    fn a_name_defined_by_several_other_templates_binds_to_none_of_them() {
+        let mut candidates = vec![handler("production/bin_picker.html"), handler("tab/tab.html")];
+
+        scope_handles(&mut candidates, &reference("asset/list_tabs.html"));
+
+        assert!(candidates.is_empty(), "an ambiguous cross-template name drops, never guesses");
+    }
+
+    #[test]
+    fn a_name_defined_by_exactly_one_other_template_still_binds() {
+        let mut candidates = vec![handler("django_spire/modal/modal.html")];
+
+        scope_handles(&mut candidates, &reference("inventory/dump_modal.html"));
+
+        assert_eq!(candidates.len(), 1, "a modal shell's close_modal is the only candidate");
+    }
+
+    #[test]
+    fn a_script_global_binds_across_files() {
+        let mut candidates = vec![global("static/js/response/event.js")];
+
+        scope_script_globals(&mut candidates, &call("static/js/glue/query_set.js"));
+
+        assert_eq!(candidates.len(), 1, "one global definition is reachable from every script");
+        assert_eq!(candidates[0].file_path, "static/js/response/event.js", "and it is that one");
+    }
+
+    #[test]
+    fn a_same_file_definition_shadows_the_global() {
+        let mut candidates =
+            vec![global("static/js/response/event.js"), global("static/js/glue/query_set.js")];
+
+        scope_script_globals(&mut candidates, &call("static/js/glue/query_set.js"));
+
+        assert_eq!(candidates.len(), 1, "a local declaration shadows the global one");
+        assert_eq!(candidates[0].file_path, "static/js/glue/query_set.js", "and it is the local");
+    }
+
+    #[test]
+    fn two_files_defining_one_global_bind_to_neither() {
+        let mut candidates = vec![global("static/js/a.js"), global("static/js/b.js")];
+
+        scope_script_globals(&mut candidates, &call("static/js/caller.js"));
+
+        assert!(candidates.is_empty(), "an ambiguous global is dropped, never guessed");
+    }
+
+    #[test]
+    fn only_file_scope_definitions_in_script_files_are_global() {
+        let method = symbol("save", "static/js/widget.js::Widget.save", "static/js/widget.js");
+        let inline = symbol("save", "asset/card.html::alpine::save", "asset/card.html");
+        let free = symbol("save", "static/js/widget.js::save", "static/js/widget.js");
+
+        assert!(is_script_global(&free), "a file-scope function is global");
+        assert!(!is_script_global(&method), "a method belongs to its class");
+        assert!(!is_script_global(&inline), "an x-data method belongs to its component");
+    }
+
+    #[test]
+    fn script_files_are_told_apart_from_templates_by_extension() {
+        assert!(is_script_file("static/js/ui.js"), "a .js file is a script");
+        assert!(is_script_file("static/js/ui.mjs"), "so is a module");
+        assert!(!is_script_file("asset/card.html"), "a template is not");
+        assert!(!is_script_file("noextension"), "neither is a name with no extension");
+    }
+
+    fn store_reference() -> UnresolvedRef {
+        let mut reference = UnresolvedRef::new(
+            NodeId::new(&ProjectId::new("portal"), "theme/selector.html"),
+            "families",
+            EdgeKind::Handles,
+            1,
+            0,
+            "theme/selector.html",
+            Language::HtmlDjango,
+        );
+
+        reference.candidates.push(STORE_DISPATCH.to_string());
+        reference.candidates.push("theme".to_string());
+
+        reference
+    }
+
+    #[test]
+    fn a_store_dispatch_binds_only_within_its_registration() {
+        let mut candidates = vec![
+            symbol("families", "static/js/other.js::families", "static/js/other.js"),
+            symbol("families", "static/js/theme.js::alpine::theme.families", "static/js/theme.js"),
+        ];
+
+        scope_handles(&mut candidates, &store_reference());
+
+        assert_eq!(candidates.len(), 1, "only the named registration's member survives");
+
+        assert_eq!(
+            candidates[0].qualified_name,
+            "static/js/theme.js::alpine::theme.families",
+            "and it is the store member",
+        );
+    }
+
+    #[test]
+    fn a_store_dispatch_with_no_registration_binds_nothing() {
+        let mut candidates =
+            vec![symbol("families", "static/js/other.js::families", "static/js/other.js")];
+
+        scope_handles(&mut candidates, &store_reference());
+
+        assert!(candidates.is_empty(), "a stray same-named function is never the store member");
+    }
+
+    fn python_symbol(name: &str) -> Arc<Node> {
+        let project = ProjectId::new("dandy");
+
+        Arc::new(Node::new(
+            NodeId::new(&project, name),
+            project.clone(),
+            NodeKind::Function,
+            NodeIdentity {
+                name: name.to_string(),
+                qualified_name: format!("file/utils.py::{name}"),
+                file_path: "file/utils.py".to_string(),
+                language: Language::Python,
+            },
+            Span::new(1, 1, 0, 0),
+            0,
+        ))
+    }
+
+    #[test]
+    fn a_strict_kind_drops_candidates_outside_its_language() {
+        let strict = filter_language(
+            vec![python_symbol("remove_file")],
+            Some(Language::JavaScript),
+            true,
+        );
+
+        assert!(
+            strict.is_empty(),
+            "a Handles pool with no JavaScript holds only collisions and must empty",
+        );
+
+        let loose = filter_language(
+            vec![python_symbol("remove_file")],
+            Some(Language::JavaScript),
+            false,
+        );
+
+        assert_eq!(loose.len(), 1, "a non-strict kind keeps its best-effort fallback");
+    }
 }

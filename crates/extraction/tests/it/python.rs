@@ -603,6 +603,45 @@ fn emits_context_type_ref_for_get_object_or_404() {
 }
 
 #[test]
+fn emits_context_type_ref_for_this_stacks_instance_shortcuts() {
+    let extractor = PythonExtractor::new();
+    let project = ProjectId::new("blog");
+
+    for shortcut in ["get_object_or_null_obj", "get_object_or_none"] {
+        let source = format!(
+            "def form_view(request, pk):\n    \
+                widget = {shortcut}(models.Widget, pk=pk)\n    \
+                return widget\n"
+        );
+
+        let output = extractor.extract(&project, "blog/views.py", &source);
+
+        let context = output
+            .unresolved_refs
+            .iter()
+            .find(|reference| reference.reference_kind == EdgeKind::ContextType)
+            .unwrap_or_else(|| panic!("a ContextType ref for the {shortcut} local"));
+
+        assert_eq!(
+            context.reference_name,
+            "Widget",
+            "{shortcut} names the model in its first argument",
+        );
+
+        assert_eq!(
+            context.candidates.first().map(String::as_str),
+            Some("widget"),
+            "{shortcut} types the local the same way get_object_or_404 does",
+        );
+
+        assert!(
+            !context.candidates.iter().any(|candidate| candidate == "\u{1}collection-context"),
+            "{shortcut} returns one instance, never a collection",
+        );
+    }
+}
+
+#[test]
 fn emits_collection_context_type_for_queryset() {
     let extractor = PythonExtractor::new();
     let project = ProjectId::new("blog");

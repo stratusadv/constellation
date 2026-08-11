@@ -1,7 +1,7 @@
 //! Reading edges: callers and callees, the structural relations the
 //! synthesis passes need, and the cross-project links.
 
-use constellation_graph::{Edge, EdgeKind, Node, NodeId, ProjectId, relation_field_target};
+use constellation_graph::{Edge, EdgeKind, Language, Node, NodeId, ProjectId, relation_field_target};
 use rusqlite::params;
 
 use crate::error::{StoreError, charge};
@@ -270,26 +270,40 @@ impl Store {
         Ok(callables)
     }
 
-    /// The `(id, qualified_name, name)` of every class and model node across the
-    /// constellation, the lookup that turns a reference's candidate class (a
-    /// qualified name, or a Django manager named by convention) into the node id
-    /// an inheritance walk starts from.
-    pub fn class_identities(&self) -> Result<Vec<(String, String, String)>, StoreError> {
+    /// The `(id, qualified_name, name, language)` of every class and model node
+    /// across the constellation, the lookup that turns a reference's candidate
+    /// class (a qualified name, or a Django manager named by convention) into
+    /// the node id an inheritance walk starts from. The language rides along so
+    /// a receiver types only within its own language family (the JavaScript
+    /// `QuerySetGlue` and the Python class sharing its name are different
+    /// symbols).
+    pub fn class_identities(&self) -> Result<Vec<(String, String, String, Language)>, StoreError> {
         let mut statement = self.connection.prepare_cached(
-            "SELECT id, qualified_name, name FROM nodes WHERE kind IN ('class', 'model')",
+            "SELECT id, qualified_name, name, language FROM nodes WHERE kind IN ('class', 'model')",
         )?;
 
         let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })?;
 
-        let mut classes: Vec<(String, String, String)> = Vec::new();
+        let mut classes: Vec<(String, String, String, Language)> = Vec::new();
         let mut count: u32 = 0;
 
         for row in rows {
             charge(&mut count, ROWS_LOADED_MAX, "class load")?;
 
-            classes.push(row?);
+            let (id, qualified_name, name, label) = row?;
+
+            let Some(language) = Language::from_str_label(&label) else {
+                continue;
+            };
+
+            classes.push((id, qualified_name, name, language));
         }
 
         Ok(classes)

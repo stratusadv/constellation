@@ -17,8 +17,9 @@ pub use frameworks::DjangoResolver;
 pub use refs::{ResolvedBy, ResolvedRef, UnresolvedRef};
 pub use resolver::{
     COLLECTION_CONTEXT, MANAGER_SUFFIXES, QUERYSET_BUILTINS, QUERYSET_DISPATCH, RECEIVER_ROOT,
-    RETURNS_OF, SENTINEL_PREFIX, SERVICE_DISPATCH, SERVICE_SUFFIXES, SUPER_DISPATCH,
-    TYPED_RECEIVER, edge_from_resolved, resolve_reference,
+    RETURNS_OF, SENTINEL_PREFIX, SERVICE_DISPATCH, SERVICE_SUFFIXES, STORE_DISPATCH,
+    SUPER_DISPATCH, TYPED_RECEIVER, edge_from_resolved, is_store_member, resolve_reference,
+    source_language_family, store_dispatch_name,
 };
 
 #[doc(hidden)]

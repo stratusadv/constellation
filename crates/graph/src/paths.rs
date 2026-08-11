@@ -32,6 +32,20 @@ const MINIFIED_SUFFIXES: [&str; 3] = [".bundle.js", ".min.css", ".min.js"];
 /// The file-name suffixes of a generated source file that is not minified.
 const GENERATED_SUFFIXES: [&str; 1] = ["_pb2.py"];
 
+/// The longest line, in bytes, that hand-written source plausibly carries.
+///
+/// Measured across the Django trees this indexes: the longest hand-written line
+/// of any language is a 630-byte template, the longest JavaScript is 550, the
+/// longest CSS is 127. The vendored bundles in the same trees start at 36,987
+/// and run to 194,626. Any threshold between those two populations separates
+/// them; this one sits three times above the first and eighteen times below the
+/// second, so neither ordinary source nor an unusually dense line trips it.
+const SOURCE_LINE_BYTES_MAX: usize = 2_000;
+
+/// A fail-fast bound on the line scan, far past the line count of any file that
+/// survives the parse cap.
+const LINE_SCAN_MAX: u32 = 10_000_000;
+
 /// Whether `text` begins with `prefix`, ASCII case-insensitive, without allocating.
 fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
     text.len() >= prefix.len()
@@ -109,6 +123,35 @@ pub fn is_minified_path(path: &str) -> bool {
     MINIFIED_SUFFIXES.iter().any(|suffix| ends_with_ignore_ascii_case(base, suffix))
 }
 
+/// Whether source text is minified or bundled, judged by its longest line rather
+/// than its name, so a vendored `alpine.js` that was never given a `.min` suffix
+/// is still recognized.
+///
+/// Deleting newlines is the one thing every minifier does, so a bundle is a
+/// handful of enormous lines while hand-written source wraps. That single
+/// property separates the two populations cleanly, and it needs no per-language
+/// knowledge. [`is_minified_path`] asks the same question of the name alone;
+/// this catches what a name cannot say.
+///
+/// Whether being minified should exclude a file is the caller's decision, not
+/// this predicate's: mangling makes minified JavaScript worthless to read, while
+/// a minified stylesheet keeps every selector name it started with.
+pub fn is_minified_source(source: &str) -> bool {
+    let mut scanned: u32 = 0;
+
+    for line in source.lines() {
+        scanned += 1;
+
+        assert!(scanned <= LINE_SCAN_MAX, "line scan exceeded {LINE_SCAN_MAX} lines");
+
+        if line.len() > SOURCE_LINE_BYTES_MAX {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Whether a path is machine-generated or minified: Django migrations, vendored
 /// or collected static assets, minified and bundled JavaScript or CSS, generated
 /// protobuf stubs, packages under `node_modules`. Such files are real graph nodes
@@ -156,8 +199,9 @@ pub fn is_management_command_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        SOURCE_LINE_BYTES_MAX,
         app_segment, base_name, is_generated_path, is_management_command_path, is_migration_path,
-        is_minified_path, is_test_path,
+        is_minified_path, is_minified_source, is_test_path,
     };
 
     #[test]
@@ -228,6 +272,27 @@ mod tests {
 
         assert!(!is_minified_path("app/migrations/0001_initial.py"), "a migration is readable");
         assert!(!is_minified_path("app/models.py"), "source is not minified");
+    }
+
+    #[test]
+    fn minified_source_is_judged_by_line_length_not_by_name() {
+        let bundle = format!("(()=>{{{}}})();", "var a=1;".repeat(400));
+
+        assert!(bundle.len() > SOURCE_LINE_BYTES_MAX, "the fixture is one long line");
+        assert!(is_minified_source(&bundle), "a bundle under an ordinary name is still minified");
+
+        let source = "function save() {\n    return fetch('/api/save');\n}\n";
+
+        assert!(!is_minified_source(source), "wrapped source is not minified");
+        assert!(!is_minified_source(""), "an empty file is not minified");
+    }
+
+    #[test]
+    fn a_long_file_of_short_lines_is_not_minified() {
+        let wrapped = "let value = compute(argument);\n".repeat(5_000);
+
+        assert!(wrapped.len() > SOURCE_LINE_BYTES_MAX, "the fixture is long overall");
+        assert!(!is_minified_source(&wrapped), "size alone never makes a file minified");
     }
 
     #[test]

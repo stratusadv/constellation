@@ -8,10 +8,12 @@
 use constellation_graph::{Edge, Language, Node, ProjectId};
 use constellation_resolution::{EventRecord, ImportMapping, UnresolvedRef};
 
+mod builtins;
 mod css;
 mod django;
 mod javascript;
 mod jsexpr;
+mod jsobject;
 mod python;
 mod template;
 mod tsutil;
