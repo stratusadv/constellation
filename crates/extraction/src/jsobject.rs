@@ -368,7 +368,7 @@ mod tests {
             .calls
             .iter()
             .map(|call| match &call.receiver {
-                AlpineReceiver::Bare => format!("{}", call.name),
+                AlpineReceiver::Bare => call.name.clone(),
                 AlpineReceiver::This => format!("this.{}", call.name),
                 AlpineReceiver::Property(property) => format!("this.{property}.{}", call.name),
             })

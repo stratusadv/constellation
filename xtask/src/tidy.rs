@@ -24,7 +24,7 @@ const LINE_COLUMNS_MAX: usize = 100;
 const MODULE_LINES_MAX: usize = 1_000;
 
 /// The number of lines currently wider than [`LINE_COLUMNS_MAX`].
-const LINES_OVER_COLUMNS_RATCHET: usize = 426;
+const LINES_OVER_COLUMNS_RATCHET: usize = 423;
 
 /// The number of modules currently longer than [`MODULE_LINES_MAX`].
 const MODULES_OVER_LINES_RATCHET: usize = 5;

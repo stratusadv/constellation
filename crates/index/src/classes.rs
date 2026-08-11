@@ -312,12 +312,16 @@ mod tests {
 
     use super::{ClassIndex, sole_class_named};
 
+    /// The `class_methods` argument of [`ClassIndex::build`]: method id, method name.
+    type ClassMethods = Vec<(String, String)>;
+
+    /// The `class_identities` argument of [`ClassIndex::build`]: class id, qualified
+    /// name, bare name, language.
+    type ClassIdentities = Vec<(String, String, String, Language)>;
+
     /// An index over django-glue's shape: one Python and one JavaScript class
     /// sharing the name `QuerySetGlue`, each owning a method.
-    fn glue_index() -> (
-        Vec<(String, String)>,
-        Vec<(String, String, String, Language)>,
-    ) {
+    fn glue_index() -> (ClassMethods, ClassIdentities) {
         let python_method = "glue::glue/query_set/glue.py::QuerySetGlue.to_choices";
         let script_method = "glue::static/js/query_set.js::QuerySetGlue.to_choices";
 

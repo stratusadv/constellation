@@ -1363,6 +1363,14 @@ mod tests {
         toml::from_str::<ConfigFile>(text).expect("the fixture config parses").companions()
     }
 
+    /// Whether everything staged in `root` commits as `message`. The commit is
+    /// unsigned so a global `commit.gpgsign` cannot fail it.
+    fn git_commit(root: &Path, message: &str) -> bool {
+        assert!(!message.is_empty(), "a commit needs a message");
+
+        run_git(Some(root), &["commit", "-q", "--no-gpg-sign", "-m", message]).is_some()
+    }
+
     #[test]
     fn config_defaults_when_the_file_is_empty() {
         let config: ConfigFile = toml::from_str("").unwrap();
@@ -1791,14 +1799,14 @@ packages = [\"robit\"]
 
         std::fs::write(origin_root.join("first.txt"), "one\n").unwrap();
         assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add first");
-        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "one"]).is_some(), "commit one");
+        assert!(git_commit(origin_root, "one"), "commit one");
 
         let head = run_git(Some(origin_root), &["rev-parse", "HEAD"]).expect("the first commit id");
         let commit = String::from_utf8_lossy(&head.stdout).trim().to_string();
 
         std::fs::write(origin_root.join("second.txt"), "two\n").unwrap();
         assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add second");
-        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "two"]).is_some(), "commit two");
+        assert!(git_commit(origin_root, "two"), "commit two");
 
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir(workspace.path().join(".constellation")).unwrap();
@@ -1856,8 +1864,8 @@ packages = [\"robit\"]
         std::fs::write(origin_root.join("django_spire").join("__init__.py"), "value = 1\n").unwrap();
 
         assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add");
-        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "init"]).is_some(), "git commit");
-        assert!(run_git(Some(origin_root), &["tag", "v1"]).is_some(), "git tag");
+        assert!(git_commit(origin_root, "init"), "git commit");
+        assert!(run_git(Some(origin_root), &["tag", "--no-sign", "v1"]).is_some(), "git tag");
 
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir(workspace.path().join(".constellation")).unwrap();
@@ -1948,14 +1956,14 @@ packages = [\"robit\"]
 
         std::fs::write(origin_root.join("seed.txt"), "seed\n").unwrap();
         assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add seed");
-        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "seed"]).is_some(), "git commit seed");
+        assert!(git_commit(origin_root, "seed"), "git commit seed");
 
         // A slash-named branch with its own commit, then back to the default
         // branch so a clone leaves v1/base only on origin.
         assert!(run_git(Some(origin_root), &["checkout", "-q", "-b", "v1/base"]).is_some(), "branch v1/base");
         std::fs::write(origin_root.join("base.txt"), "base\n").unwrap();
         assert!(run_git(Some(origin_root), &["add", "-A"]).is_some(), "git add base");
-        assert!(run_git(Some(origin_root), &["commit", "-q", "-m", "base"]).is_some(), "git commit base");
+        assert!(git_commit(origin_root, "base"), "git commit base");
         assert!(run_git(Some(origin_root), &["checkout", "-q", "-"]).is_some(), "back to the default branch");
 
         let workspace = tempfile::tempdir().unwrap();
